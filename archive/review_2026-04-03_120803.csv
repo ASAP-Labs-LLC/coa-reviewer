@@ -1,0 +1,23 @@
+# ── Due Out (20 reviewed) ──
+lab_id,sample_id,tab,outcome,reason,date
+033126-32119,35833,Due Out,Good,,2026-04-03
+033126-32118,35832,Due Out,Good,,2026-04-03
+033126-32117,35831,Due Out,Good,,2026-04-03
+033126-32116,35830,Due Out,Good,,2026-04-03
+033126-32135,35829,Due Out,Bad,missing distill and sulfur,2026-04-03
+033126-32134,35828,Due Out,Bad,missing distill and sulfur,2026-04-03
+033126-32128,35827,Due Out,Bad,missing petro,2026-04-03
+033126-32127,35826,Due Out,Bad,missing petro,2026-04-03
+033126-32126,35825,Due Out,Bad,missing petros,2026-04-03
+033126-32125,35824,Due Out,Bad,missing petros,2026-04-03
+033126-32124,35823,Due Out,Bad,missing petros,2026-04-03
+033126-32123,35822,Due Out,Bad,"missing GC graoh flashed at 19, diseil #2 and gas mix",2026-04-03
+033126-32122,35821,Due Out,Good,,2026-04-03
+033126-32121,35820,Due Out,Good,,2026-04-03
+033126-32120,35819,Due Out,Good,,2026-04-03
+033126-32133,35335,Due Out,Good,,2026-04-03
+033126-32132,35334,Due Out,Good,,2026-04-03
+033126-32131,35081,Due Out,Good,,2026-04-03
+033126-32130,35080,Due Out,Good,,2026-04-03
+033126-32129,35079,Due Out,Good,,2026-04-03
+# QBench Good Samples (Due Out): https://asaplabs.qbench.net/tests?sample_ids=35833&sample_ids=35832&sample_ids=35831&sample_ids=35830&sample_ids=35821&sample_ids=35820&sample_ids=35819&sample_ids=35335&sample_ids=35334&sample_ids=35081&sample_ids=35080&sample_ids=35079&sort_order=DESC&view_config_id=17&page_size=700

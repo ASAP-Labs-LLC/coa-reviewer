@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# Node
+node_modules/
+.npm/
+
+# Secrets - NEVER COMMIT
+credentials.json
+client_secret*.json
+service_account*.json
+.secret_key
+.env
+.env.*
+*.pem
+*.key
+
+# Instrument / lab data
+*.cdf
+*.CDF
+*.ifg
+*.IFG
+*.rifg
+*.RIFG
+*.spc
+*.SPC
+
+# Logs, databases, archives
+*.log
+*.log.*
+*.sqlite
+*.sqlite3
+*.db
+*.tar.gz
+*.tgz
+*.zip
+
+# Binaries
+*.exe
+*.EXE
+*.dll
+*.msi
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

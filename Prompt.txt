@@ -1,0 +1,14 @@
+tests:
+    Same screena s it is now
+    COA only will be the default viewer choice
+
+Info:
+    A fork of the test's page. with some notible changes.
+    Replace the top 3 buttons on the side bar with
+        - Intaked: Samples that were intaked the business day prior
+        - Yesturday: Same as Test's yesturday
+        - Due out: Same as test's due out.
+    leave search and Custom Day the same as well
+
+    On the right side of the screen instead of the tests values that are editable, have it be all the sample level feilds (have those be editable) AND the overall testing package. if none, put a "-"
+    split will be the default choice

@@ -1,0 +1,2622 @@
+/* ══════════════════════════════════════════════════════════════════
+   COA Reviewer — Stylesheet
+   ──────────────────────────────────────────────────────────────────
+   Design system:
+     · Type:    Inter / SF / system stack, tight scale 11→18px
+     · Color:   neutral surfaces, refined teal accent, semantic
+                good/bad with consistent saturation
+     · Radii:   6 (control) / 10 (card) / 14 (modal) / 999 (pill)
+     · Shadow:  layered elevation (e1 … e3) using rgba blacks
+     · Easing:  cubic-bezier(.16,1,.3,1)  — smooth ease-out
+                cubic-bezier(.4,0,.2,1)   — material standard
+     · Motion:  150ms fast / 200ms base / 320ms slow
+                everything gated by prefers-reduced-motion at EOF
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ── Design tokens ───────────────────────────────────────────────── */
+:root {
+    color-scheme: light;
+
+    /* Surfaces */
+    --bg:            #ffffff;
+    --bg-elevated:   #ffffff;
+    --bg-sunken:     #f4f4f5;
+    --bg-card:       #ffffff;
+    --bg-hover:      rgba(15, 23, 42, 0.04);
+    --bg-active:     rgba(15, 23, 42, 0.06);
+
+    /* Text */
+    --text:          #0f172a;
+    --text-muted:    #64748b;
+    --text-subtle:   #94a3b8;
+    --text-inverse:  #ffffff;
+
+    /* Brand / accent — light mode keeps a refined teal */
+    --accent:        #0e7490;   /* cyan-700 */
+    --accent-hover:  #0a5d75;
+    --accent-soft:   rgba(14, 116, 144, 0.10);
+    --accent-glow:   rgba(14, 116, 144, 0.28);
+
+    /* Pane / editor header treatment (themed per mode) */
+    --header-bg:     linear-gradient(180deg, var(--accent), var(--accent-hover));
+    --header-fg:     var(--text-inverse);
+
+    /* Semantic */
+    --good:          #16a34a;
+    --good-hover:    #15803d;
+    --good-soft:     rgba(22, 163, 74, 0.12);
+    --bad:           #dc2626;
+    --bad-hover:     #b91c1c;
+    --bad-soft:      rgba(220, 38, 38, 0.10);
+    --warn:          #d97706;
+    --warn-soft:     #fef3c7;
+    --info:          #2563eb;
+
+    /* Status icons */
+    --status-pending: #94a3b8;
+    --status-loading: #d97706;
+    --status-ready:   #2563eb;
+    --status-good:    #16a34a;
+    --status-bad:     #dc2626;
+    --status-error:   #ea580c;
+
+    /* Borders */
+    --border:        #d4d8dd;
+    --border-light:  #e4e7eb;
+    --border-strong: #94a3b8;
+    --border-focus:  var(--accent);
+
+    /* Editor */
+    --editor-bg:      #fafbfc;
+    --editor-changed: #d1fae5;
+    --editor-na:      #f1f5f9;
+
+    /* Elevation */
+    --e1: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
+    --e2: 0 2px 6px rgba(15, 23, 42, 0.06), 0 8px 20px rgba(15, 23, 42, 0.08);
+    --e3: 0 12px 24px rgba(15, 23, 42, 0.10), 0 24px 56px rgba(15, 23, 42, 0.14);
+
+    /* Focus ring */
+    --ring:          0 0 0 3px var(--accent-glow);
+
+    /* Motion */
+    --ease-out:      cubic-bezier(.16, 1, .3, 1);
+    --ease-std:      cubic-bezier(.4, 0, .2, 1);
+    --t-fast:        120ms;
+    --t-base:        180ms;
+    --t-slow:        320ms;
+
+    /* Layout */
+    --topbar-h:      58px;
+    --radius-sm:     6px;
+    --radius-md:     10px;
+    --radius-lg:     14px;
+    --radius-pill:   999px;
+    /* Buttons / tabs default to pills. Themes can override per-pack. */
+    --btn-radius:    999px;
+    --tab-radius:    999px;
+}
+
+/* ── Reset / base ────────────────────────────────────────────────── */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body { height: 100%; }
+
+body {
+    /* True system stack — SF Pro on macOS/iOS, Segoe UI Variable on W11,
+       Roboto on Android/Linux/ChromeOS. No web font download. */
+    font-family: -apple-system, BlinkMacSystemFont,
+                 'Segoe UI Variable Text', 'Segoe UI Variable', 'Segoe UI',
+                 Roboto, 'Helvetica Neue', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.45;
+    overflow: hidden;
+    text-rendering: optimizeLegibility;
+
+    transition: background-color var(--t-slow) var(--ease-out),
+                color var(--t-slow) var(--ease-out);
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+input, button, textarea, select {
+    font-family: inherit;
+    color: inherit;
+}
+
+button { background: none; border: none; cursor: pointer; }
+
+/* Native focus styles → custom ring (accessible, also looks better) */
+:focus-visible {
+    outline: none;
+    box-shadow: var(--ring);
+    border-radius: var(--radius-sm);
+}
+
+/* ── Utility ─────────────────────────────────────────────────────── */
+.hidden { display: none !important; }
+
+.error-text {
+    color: var(--bad);
+    margin-top: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+/* ── Spinner ─────────────────────────────────────────────────────── */
+.spinner {
+    width: 40px;
+    height: 40px;
+    margin: 18px auto;
+    border-radius: 50%;
+    border: 3px solid var(--border-light);
+    border-top-color: var(--accent);
+    border-right-color: var(--accent);
+    animation: spin 720ms linear infinite;
+    will-change: transform;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Modal ───────────────────────────────────────────────────────── */
+.modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.55);
+    backdrop-filter: blur(8px) saturate(120%);
+    -webkit-backdrop-filter: blur(8px) saturate(120%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 20px;
+    /* Entrance — the .hidden → visible transition triggers this */
+    animation: modal-fade 220ms var(--ease-out) both;
+}
+
+.modal-content {
+    background: var(--bg-card);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-lg);
+    padding: 28px 32px;
+    min-width: 380px;
+    max-width: 480px;
+    box-shadow: var(--e3);
+    /* Slight upward pop on entrance */
+    animation: modal-pop 320ms var(--ease-out) both;
+    transform-origin: center 40%;
+}
+
+.modal-content h2 {
+    margin-bottom: 14px;
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+.modal-content label {
+    display: block;
+    margin: 12px 0 5px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+.modal-content input[type="text"],
+.modal-content input[type="email"],
+.modal-content input[type="password"],
+.modal-content input[type="date"],
+.modal-content textarea {
+    width: 100%;
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    transition: border-color var(--t-fast) var(--ease-std),
+                box-shadow var(--t-fast) var(--ease-std),
+                background-color var(--t-fast) var(--ease-std);
+}
+.modal-content input:focus,
+.modal-content textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: var(--ring);
+}
+
+.modal-content textarea { resize: vertical; line-height: 1.5; }
+
+.modal-buttons {
+    margin-top: 20px;
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.checkbox-label {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    margin-top: 12px !important;
+    text-transform: none !important;
+    letter-spacing: normal !important;
+    font-size: 12px !important;
+    font-weight: 500 !important;
+}
+.checkbox-label input { cursor: pointer; accent-color: var(--accent); }
+
+@keyframes modal-fade {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+@keyframes modal-pop {
+    from {
+        opacity: 0;
+        transform: translateY(6px) scale(.97);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+/* ── Boot status log ─────────────────────────────────────────────── */
+.boot-status-log {
+    margin-top: 14px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+    max-height: 140px;
+    overflow-y: auto;
+    text-align: left;
+    font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', 'Segoe UI Mono',
+                 Menlo, Consolas, 'Courier New', monospace;
+    font-size: 11px;
+    line-height: 1.55;
+}
+.boot-status-line {
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    animation: line-in 280ms var(--ease-out) both;
+}
+.boot-status-line:last-child {
+    color: var(--text);
+    font-weight: 500;
+}
+@keyframes line-in {
+    from { opacity: 0; transform: translateY(2px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Timeout overlay ─────────────────────────────────────────────── */
+.timeout-msg {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    line-height: 1.5;
+}
+.timeout-user {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Buttons
+   ══════════════════════════════════════════════════════════════════ */
+.btn {
+    --btn-bg:   var(--bg-elevated);
+    --btn-fg:   var(--text);
+    --btn-bd:   var(--border);
+    --btn-bg-hover: var(--bg-sunken);
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 34px;
+    border: 1px solid var(--btn-bd);
+    border-radius: var(--btn-radius);
+    padding: 0 16px;
+    background: var(--btn-bg);
+    color: var(--btn-fg);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+    box-shadow: var(--e1);
+    transition: background-color var(--t-fast) var(--ease-std),
+                border-color var(--t-fast) var(--ease-std),
+                color var(--t-fast) var(--ease-std),
+                box-shadow var(--t-fast) var(--ease-std),
+                transform var(--t-fast) var(--ease-std);
+}
+.btn:hover   { background: var(--btn-bg-hover); box-shadow: var(--e2); }
+.btn:active  { transform: translateY(1px); box-shadow: var(--e1); }
+.btn:disabled,
+.btn[disabled] {
+    opacity: 0.48;
+    cursor: not-allowed;
+    transform: none !important;
+    box-shadow: none !important;
+}
+
+.btn-sm  { height: 28px; padding: 0 12px; font-size: 12px; gap: 4px; }
+.btn-lg  { height: 40px; padding: 0 22px; font-size: 13px; font-weight: 600; }
+
+.btn-icon {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    font-size: 14px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-muted);
+    box-shadow: none;
+    border-radius: var(--radius-pill);
+}
+.btn-icon:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+    box-shadow: none;
+}
+
+.btn-primary {
+    --btn-bg: var(--accent);
+    --btn-fg: var(--text-inverse);
+    --btn-bd: var(--accent);
+    --btn-bg-hover: var(--accent-hover);
+    box-shadow: var(--e1), 0 0 0 0 var(--accent-glow);
+}
+.btn-primary:hover {
+    box-shadow: var(--e2), 0 0 0 4px var(--accent-glow);
+    border-color: var(--accent-hover);
+}
+
+.btn-good {
+    --btn-bg: var(--good);
+    --btn-fg: var(--text-inverse);
+    --btn-bd: var(--good);
+    --btn-bg-hover: var(--good-hover);
+    font-size: 14px;
+    font-weight: 700;
+    flex: 1;
+    height: 40px;
+    letter-spacing: 0.01em;
+}
+.btn-good:hover { border-color: var(--good-hover); }
+.btn-good:disabled { background: var(--border); border-color: var(--border); color: var(--text-muted); }
+
+.btn-bad {
+    --btn-bg: var(--bad);
+    --btn-fg: var(--text-inverse);
+    --btn-bd: var(--bad);
+    --btn-bg-hover: var(--bad-hover);
+    font-size: 14px;
+    font-weight: 700;
+    flex: 1;
+    height: 40px;
+    letter-spacing: 0.01em;
+}
+.btn-bad:hover { border-color: var(--bad-hover); }
+.btn-bad:disabled { background: var(--border); border-color: var(--border); color: var(--text-muted); }
+
+.btn-danger {
+    --btn-bg: var(--bad);
+    --btn-fg: var(--text-inverse);
+    --btn-bd: var(--bad);
+    --btn-bg-hover: var(--bad-hover);
+}
+
+.btn-good-links {
+    --btn-bg: var(--good);
+    --btn-fg: var(--text-inverse);
+    --btn-bd: var(--good);
+    --btn-bg-hover: var(--good-hover);
+}
+.btn-good-links:disabled { background: var(--border); border-color: var(--border); color: var(--text-muted); }
+
+/* Restart / sign-out — restrained, only color on hover */
+.btn-restart, .btn-signout {
+    background: transparent;
+    border-color: var(--border);
+    color: var(--text-muted);
+    box-shadow: none;
+}
+.btn-restart:hover {
+    background: var(--warn);
+    border-color: var(--warn);
+    color: var(--text-inverse);
+}
+.btn-signout:hover {
+    background: var(--bad);
+    border-color: var(--bad);
+    color: var(--text-inverse);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Top bar — three logical groups (primary / actions / utility) with a
+   hairline divider. Every button in the bar is the same 34px height for
+   visual uniformity; only the primary action gets a colored fill.
+   ══════════════════════════════════════════════════════════════════ */
+.top-bar {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 20px;
+    height: var(--topbar-h);
+    background: rgba(255, 255, 255, 0.72);
+    backdrop-filter: blur(14px) saturate(180%);
+    -webkit-backdrop-filter: blur(14px) saturate(180%);
+    border-bottom: 1px solid var(--border-light);
+    position: relative;
+    z-index: 10;
+}
+.top-bar::after {
+    /* Hairline accent line under the bar */
+    content: '';
+    position: absolute;
+    left: 0; right: 0; bottom: -1px;
+    height: 1px;
+    background: linear-gradient(90deg,
+        transparent 0%,
+        var(--accent-soft) 20%,
+        var(--accent-soft) 80%,
+        transparent 100%);
+    pointer-events: none;
+}
+
+.tb-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;            /* enable flexbox text truncation inside */
+}
+.tb-group--primary { flex: 1 1 0; }     /* status label eats free space */
+.tb-group--actions { flex: 0 0 auto; }
+.tb-group--utility { flex: 0 0 auto; gap: 6px; }
+
+.tb-divider {
+    width: 1px;
+    height: 22px;
+    background: var(--border);
+    flex-shrink: 0;
+    opacity: 0.7;
+}
+
+.status-label {
+    flex: 1 1 0;
+    min-width: 0;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-left: 4px;
+    /* setStatus() in JS replays this animation on each text change */
+    animation: status-flash 720ms var(--ease-out);
+}
+@keyframes status-flash {
+    0%   { color: var(--accent); }
+    100% { color: var(--text-muted); }
+}
+
+.user-display {
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    padding: 0 12px;
+    background: var(--bg-hover);
+    border-radius: var(--radius-pill);
+    white-space: nowrap;
+}
+.user-display:empty { display: none; }
+
+/* View toggle — segmented pill control matched to the .btn height */
+.view-toggle {
+    display: inline-flex;
+    align-items: center;
+    height: 34px;
+    background: var(--bg-sunken);
+    border-radius: 999px;
+    padding: 3px;
+    gap: 2px;
+    border: 1px solid var(--border-light);
+    box-shadow: var(--e1);
+}
+.view-btn {
+    height: 26px;
+    padding: 0 14px;
+    font-size: 12px;
+    font-weight: 500;
+    font-family: inherit;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background-color var(--t-fast) var(--ease-std),
+                color var(--t-fast) var(--ease-std),
+                box-shadow var(--t-fast) var(--ease-std);
+}
+.view-btn:hover { color: var(--text); }
+.view-btn.active {
+    background: var(--bg-elevated);
+    color: var(--text);
+    box-shadow: var(--e1);
+    font-weight: 600;
+}
+
+/* Restart button when it has no text (just the ↻ glyph) — make it square-ish */
+#restart-btn {
+    width: 34px;
+    padding: 0;
+    font-size: 16px;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Main content layout
+   ══════════════════════════════════════════════════════════════════ */
+.main-content {
+    display: flex;
+    height: calc(100vh - var(--topbar-h));
+    overflow: hidden;
+}
+
+#app {
+    /* Subtle fade-in when the app reveals after boot */
+    animation: app-in 360ms var(--ease-out) both;
+}
+@keyframes app-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Left panel ──────────────────────────────────────────────────── */
+.left-panel {
+    width: 280px;
+    min-width: 240px;
+    max-width: 320px;
+    display: flex;
+    flex-direction: column;
+    padding: 10px;
+    gap: 8px;
+    border-right: 1px solid var(--border-light);
+    background: var(--bg);
+}
+
+.tab-row { display: flex; gap: 4px; }
+
+.tab-btn {
+    flex: 1;
+    height: 32px;
+    border: 1px solid var(--border-light);
+    border-radius: var(--tab-radius);
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    box-shadow: var(--e1);
+    position: relative;
+    overflow: hidden;
+    transition: background-color var(--t-fast) var(--ease-std),
+                color var(--t-fast) var(--ease-std),
+                border-color var(--t-fast) var(--ease-std),
+                box-shadow var(--t-fast) var(--ease-std),
+                transform var(--t-fast) var(--ease-std);
+}
+.tab-btn:hover {
+    color: var(--text);
+    background: var(--bg-sunken);
+}
+.tab-btn:active { transform: translateY(1px); }
+.tab-btn.active {
+    background: var(--accent);
+    color: var(--text-inverse);
+    border-color: var(--accent);
+    box-shadow: var(--e2), 0 0 0 3px var(--accent-soft);
+}
+
+.input-bar {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+.input-bar input {
+    flex: 1;
+    height: 28px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    font-size: 12px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font-family: inherit;
+    transition: border-color var(--t-fast) var(--ease-std),
+                box-shadow var(--t-fast) var(--ease-std);
+}
+.input-bar input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: var(--ring);
+}
+
+.sample-count {
+    text-align: center;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+    padding: 2px 0;
+    letter-spacing: 0.01em;
+}
+
+.sample-list {
+    flex: 1;
+    overflow-y: auto;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-md);
+    box-shadow: var(--e1);
+    /* Smoothly settle scroll position */
+    scroll-behavior: smooth;
+}
+
+.sample-item {
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border-light);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    position: relative;
+    /* Asymmetric hover: enter is snappy, leave is 2x slower so the row
+       lingers as the cursor moves off. Base transition governs the OUT
+       state (when :hover no longer applies); :hover overrides for IN. */
+    transition: background-color 240ms var(--ease-out),
+                color var(--t-fast) var(--ease-std),
+                padding-left 240ms var(--ease-out);
+    /* Stagger-friendly: each row fades in if rendered as a fresh batch */
+    animation: row-in 280ms var(--ease-out) both;
+}
+.sample-item:last-child { border-bottom: none; }
+.sample-item:hover {
+    background: var(--accent-soft);
+    padding-left: 16px;
+    transition: background-color var(--t-fast) var(--ease-std),
+                color var(--t-fast) var(--ease-std),
+                padding-left var(--t-fast) var(--ease-std);
+}
+.sample-item.selected {
+    background: var(--accent);
+    color: var(--text-inverse);
+}
+.sample-item.selected::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 3px;
+    background: var(--accent-hover);
+    border-radius: 0 2px 2px 0;
+}
+.sample-item .status-icon {
+    min-width: 18px;
+    text-align: center;
+    font-size: 14px;
+    transition: color var(--t-base) var(--ease-out),
+                transform var(--t-base) var(--ease-out);
+}
+.sample-item:hover .status-icon { transform: scale(1.12); }
+
+.sample-item[data-status="pending"] .status-icon { color: var(--status-pending); }
+.sample-item[data-status="loading"] .status-icon {
+    color: var(--status-loading);
+    animation: pulse 1.4s var(--ease-std) infinite;
+}
+.sample-item[data-status="ready"]   .status-icon { color: var(--status-ready); }
+.sample-item[data-status="good"]    .status-icon { color: var(--status-good); }
+.sample-item[data-status="bad"]     .status-icon { color: var(--status-bad); }
+.sample-item[data-status="error"]   .status-icon { color: var(--status-error); }
+
+.sample-item.selected .status-icon { color: var(--text-inverse) !important; }
+
+@keyframes row-in {
+    from { opacity: 0; transform: translateX(-6px); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.4; }
+}
+
+.action-buttons {
+    display: flex;
+    gap: 8px;
+}
+
+.hotkey-legend {
+    text-align: center;
+    font-size: 10px;
+    color: var(--text-subtle);
+    padding: 4px 0 2px;
+    letter-spacing: 0.02em;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Center panel — PDF viewer
+   ══════════════════════════════════════════════════════════════════ */
+.center-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 0 4px;
+}
+
+.rr-info {
+    background: var(--warn-soft);
+    border: 1px solid #fcd34d;
+    border-left: 4px solid var(--warn);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    margin: 8px 6px 4px;
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-line;
+    color: #78350f;
+    box-shadow: var(--e1);
+    animation: row-in 320ms var(--ease-out) both;
+}
+
+.pdf-area {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    overflow: hidden;
+    background: var(--bg-sunken);
+    margin: 6px;
+    border-radius: var(--radius-md);
+    min-height: 200px;
+    position: relative;
+    box-shadow: var(--e1);
+    border: 1px solid var(--border-light);
+}
+.pdf-area .placeholder {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-subtle);
+    font-size: 15px;
+    font-weight: 500;
+    padding: 40px;
+    text-align: center;
+    z-index: 1;
+}
+
+/* Split PDF panes */
+.pdf-pane {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+    background: var(--bg-elevated);
+    /* Crossfade when shown/hidden */
+    animation: pane-in 240ms var(--ease-out) both;
+}
+.pdf-pane:first-child { border-radius: var(--radius-md) 0 0 var(--radius-md); }
+.pdf-pane:last-child  { border-radius: 0 var(--radius-md) var(--radius-md) 0; }
+.pdf-pane:only-child  { border-radius: var(--radius-md); }
+.pdf-pane + .pdf-pane { border-left: 1px solid var(--border); }
+
+.pdf-pane iframe {
+    flex: 1;
+    width: 100%;
+    border: none;
+    background: var(--bg-elevated);
+    /* color-scheme tells the browser's native PDF viewer (notably Safari's
+       QuickLook) which chrome variant to render. Without this, Safari draws
+       a white frame around the PDF page even in dark mode. */
+    color-scheme: light;
+    /* Soft fade when src swaps to about:blank and back */
+    transition: opacity var(--t-base) var(--ease-out);
+}
+
+.pane-label {
+    padding: 6px 14px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: var(--header-bg);
+    color: var(--header-fg);
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border-light);
+}
+.sif-badge {
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: var(--radius-pill);
+    background: rgba(255, 255, 255, 0.18);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: none;
+}
+.sif-placeholder {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-subtle);
+    font-size: 13px;
+    background: var(--bg-sunken);
+    font-style: italic;
+}
+
+@keyframes pane-in {
+    from { opacity: 0; transform: scale(.99); }
+    to   { opacity: 1; transform: scale(1); }
+}
+
+.bottom-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 14px;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-light);
+    background: var(--bg);
+    min-height: 44px;
+}
+.bottom-bar > span {
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.bottom-bar div { display: flex; gap: 6px; flex-shrink: 0; }
+
+/* ══════════════════════════════════════════════════════════════════
+   Right panel — attachments, comments, tests
+   ══════════════════════════════════════════════════════════════════ */
+.right-panel {
+    width: 320px;
+    min-width: 270px;
+    max-width: 400px;
+    display: flex;
+    flex-direction: column;
+    padding: 10px;
+    gap: 10px;
+    border-left: 1px solid var(--border-light);
+    background: var(--bg);
+    overflow: hidden;
+}
+
+.panel-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex-shrink: 0;
+}
+.panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    padding: 0 2px;
+}
+
+.item-list {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    min-height: 44px;
+    max-height: 140px;
+    overflow-y: auto;
+    font-size: 11px;
+    box-shadow: var(--e1);
+}
+.item-list .att-item {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border-light);
+    cursor: pointer;
+    transition: background-color var(--t-fast) var(--ease-std),
+                color var(--t-fast) var(--ease-std),
+                padding-left var(--t-fast) var(--ease-std);
+}
+.item-list .att-item:last-child { border-bottom: none; }
+.item-list .att-item:hover {
+    background: var(--accent-soft);
+    padding-left: 14px;
+}
+.item-list .att-item.selected {
+    background: var(--accent);
+    color: var(--text-inverse);
+}
+
+.placeholder-item {
+    color: var(--text-subtle);
+    padding: 12px;
+    text-align: center;
+    font-style: italic;
+    font-size: 11px;
+}
+
+.divider {
+    border: none;
+    border-top: 1px solid var(--border-light);
+    margin: 4px 0;
+    flex-shrink: 0;
+}
+
+.comments-area {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    min-height: 44px;
+    max-height: 120px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    box-shadow: var(--e1);
+}
+
+.comments-editor {
+    width: 100%;
+    min-height: 70px;
+    max-height: 120px;
+    padding: 8px 10px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    line-height: 1.55;
+    resize: vertical;
+    background: var(--bg-elevated);
+    color: var(--text);
+    box-shadow: var(--ring);
+    transition: box-shadow var(--t-fast) var(--ease-std),
+                border-color var(--t-fast) var(--ease-std);
+}
+.comments-editor:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+/* ── Test editor ─────────────────────────────────────────────────── */
+.test-editor {
+    background: var(--editor-bg);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 0;
+    min-height: 140px;
+    overflow: hidden;
+    box-shadow: var(--e1);
+}
+.test-editor-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 12px;
+    background: var(--header-bg);
+    color: var(--header-fg);
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--border-light);
+}
+.test-editor-title {
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+.test-editor-status {
+    font-size: 11px;
+    opacity: 0.85;
+    font-weight: 500;
+    transition: opacity var(--t-base) var(--ease-out);
+}
+
+.test-table-wrapper {
+    flex: 1 1 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+#test-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    table-layout: fixed;
+}
+#test-table th {
+    background: var(--bg-sunken);
+    padding: 7px 10px;
+    text-align: left;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+#test-table th:first-child { width: 60%; }
+#test-table th:last-child  { width: 40%; }
+#test-table td {
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--border-light);
+}
+#test-table tr {
+    transition: background-color var(--t-fast) var(--ease-std);
+}
+#test-table tr:hover td { background: var(--accent-soft); }
+
+.placeholder-cell {
+    color: var(--text-subtle);
+    text-align: center;
+    padding: 24px !important;
+    font-style: italic;
+}
+
+.test-name-cell {
+    font-weight: 600;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text);
+}
+
+.test-result-cell {
+    position: relative;
+}
+.test-result-input {
+    width: 100%;
+    border: 1px solid transparent;
+    background: transparent;
+    padding: 3px 8px;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    transition: border-color var(--t-fast) var(--ease-std),
+                background-color var(--t-fast) var(--ease-std),
+                box-shadow var(--t-fast) var(--ease-std);
+}
+.test-result-input:hover { border-color: var(--border); background: var(--bg-elevated); }
+.test-result-input:focus {
+    border-color: var(--accent);
+    background: var(--bg-elevated);
+    outline: none;
+    box-shadow: var(--ring);
+}
+.test-result-input.changed {
+    background: var(--editor-changed);
+    border-color: var(--good);
+}
+.test-result-input.na-value {
+    color: var(--text-subtle);
+    font-style: italic;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Scrollbars
+   ══════════════════════════════════════════════════════════════════ */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+    background: rgba(15, 23, 42, 0.18);
+    border-radius: var(--radius-pill);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    transition: background-color var(--t-fast) var(--ease-std);
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(15, 23, 42, 0.32); background-clip: padding-box; }
+
+/* Firefox */
+* { scrollbar-width: thin; scrollbar-color: rgba(15, 23, 42, 0.18) transparent; }
+
+/* ══════════════════════════════════════════════════════════════════
+   Dark mode — monochrome high-contrast (ChatGPT-style)
+   ──────────────────────────────────────────────────────────────────
+   `body.dark` is applied by JS whenever the *effective* theme is dark
+   (either user forced it or system is dark and they're on "Auto").
+   color-scheme: dark cascades into iframes so Safari's native PDF
+   viewer renders dark chrome instead of a white frame.
+   ══════════════════════════════════════════════════════════════════ */
+body.dark {
+    color-scheme: dark;
+
+    /* Neutral grays — no blue tint */
+    --bg:            #0d0d0d;
+    --bg-elevated:   #1f1f1f;
+    --bg-sunken:     #000000;
+    --bg-card:       #1f1f1f;
+    --bg-hover:      rgba(255, 255, 255, 0.06);
+    --bg-active:     rgba(255, 255, 255, 0.10);
+
+    --text:          #ededed;
+    --text-muted:    #a3a3a3;
+    --text-subtle:   #6e6e6e;
+    --text-inverse:  #0d0d0d;
+
+    /* Accent is near-white — primary surfaces invert (white pill, dark text) */
+    --accent:        #ffffff;
+    --accent-hover:  #d4d4d4;
+    --accent-soft:   rgba(255, 255, 255, 0.10);
+    --accent-glow:   rgba(255, 255, 255, 0.22);
+
+    /* Pane headers go monochrome too — no colored gradient */
+    --header-bg:     #1f1f1f;
+    --header-fg:     var(--text);
+
+    /* Semantic colors stay color-coded but muted to fit a neutral surface */
+    --good:          #4ade80;
+    --good-hover:    #22c55e;
+    --good-soft:     rgba(74, 222, 128, 0.14);
+    --bad:           #f87171;
+    --bad-hover:     #ef4444;
+    --bad-soft:      rgba(248, 113, 113, 0.14);
+    --warn:          #facc15;
+    --warn-soft:     rgba(250, 204, 21, 0.12);
+    --info:          #93c5fd;
+
+    --status-pending: #6e6e6e;
+    --status-loading: #facc15;
+    --status-ready:   #93c5fd;
+    --status-good:    #4ade80;
+    --status-bad:     #f87171;
+    --status-error:   #fb923c;
+
+    --border:        #2e2e2e;
+    --border-light:  #1f1f1f;
+    --border-strong: #525252;
+
+    --editor-bg:      #161616;
+    --editor-changed: #1c3a23;
+    --editor-na:      #0d0d0d;
+
+    --e1: 0 1px 2px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.35);
+    --e2: 0 2px 6px rgba(0, 0, 0, 0.55), 0 8px 20px rgba(0, 0, 0, 0.40);
+    --e3: 0 12px 24px rgba(0, 0, 0, 0.60), 0 24px 56px rgba(0, 0, 0, 0.50);
+}
+
+/* Apply color-scheme to the iframe too — without this Safari draws a white
+   frame around the PDF page even with body.dark on the host page. */
+body.dark .pdf-pane iframe { color-scheme: dark; background: #0d0d0d; }
+body.dark iframe { color-scheme: dark; }
+
+/* Force-dark-PDF: gated by a user toggle in the Themes modal. Defaults on
+   for Safari (whose QuickLook PDF viewer ignores color-scheme: dark) and
+   off elsewhere. Filter-invert flips the whole iframe — white frame goes
+   black, document text goes white; hue-rotate keeps non-grayscale colors
+   near their original hue. Trade-off: logos / color charts look inverted,
+   so flip the toggle (or switch to Light mode) for original colors. */
+html.force-dark-pdf body.dark .pdf-pane iframe {
+    filter: invert(1) hue-rotate(180deg);
+    background: #0d0d0d;
+}
+
+/* Glass top-bar tint follows the new neutral surface */
+body.dark .top-bar {
+    background: rgba(13, 13, 13, 0.80);
+    border-bottom-color: var(--border-light);
+}
+body.dark .top-bar::after {
+    background: linear-gradient(90deg,
+        transparent 0%,
+        rgba(255, 255, 255, 0.08) 30%,
+        rgba(255, 255, 255, 0.08) 70%,
+        transparent 100%);
+}
+
+/* Primary surfaces are inverted (white bg → dark text) so the accent reads */
+body.dark .btn-primary { color: var(--text-inverse); }
+body.dark .tab-btn.active {
+    background: var(--accent);
+    color: var(--text-inverse);
+    border-color: var(--accent);
+}
+body.dark .sample-item.selected {
+    background: var(--accent);
+    color: var(--text-inverse);
+}
+body.dark .sample-item.selected::before { background: var(--accent-hover); }
+body.dark .item-list .att-item.selected {
+    background: var(--accent);
+    color: var(--text-inverse);
+}
+
+/* Good / bad / danger buttons stay color-on-color (semantic clarity wins) */
+body.dark .btn-good, body.dark .btn-bad,
+body.dark .btn-danger, body.dark .btn-good-links { color: var(--text-inverse); }
+
+/* Hover states use additive white instead of accent in dark mode */
+body.dark .sample-item:hover { background: rgba(255, 255, 255, 0.11); padding-left: 16px; }
+body.dark .item-list .att-item:hover { background: var(--bg-hover); padding-left: 14px; }
+body.dark #test-table tr:hover td { background: var(--bg-hover); }
+
+body.dark .modal { background: rgba(0, 0, 0, 0.70); }
+
+body.dark .rr-info {
+    background: rgba(250, 204, 21, 0.10);
+    border-color: rgba(250, 204, 21, 0.30);
+    border-left-color: var(--warn);
+    color: #fef3c7;
+}
+
+body.dark ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.18);
+    background-clip: padding-box;
+}
+body.dark ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.32);
+    background-clip: padding-box;
+}
+body.dark * { scrollbar-color: rgba(255, 255, 255, 0.18) transparent; }
+
+/* ══════════════════════════════════════════════════════════════════
+   Responsive
+   ══════════════════════════════════════════════════════════════════ */
+@media (max-width: 1100px) {
+    .right-panel { width: 280px; min-width: 240px; }
+    .hotkey-bar { display: none; }
+}
+@media (max-width: 900px) {
+    .left-panel  { width: 220px; min-width: 200px; }
+    .right-panel { width: 230px; min-width: 210px; }
+    .user-display { display: none; }
+}
+@media (max-width: 760px) {
+    .left-panel  { width: 200px; min-width: 180px; }
+    .right-panel { width: 190px; min-width: 170px; }
+}
+
+
+/* ══════════════════════════════════════════════════════════════════
+   Reduced motion — disable all animations + transitions
+   ══════════════════════════════════════════════════════════════════ */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 1ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 1ms !important;
+        scroll-behavior: auto !important;
+    }
+    /* Spinner is informational — keep a slow rotation so users still see
+       activity, just without the buzzy 720ms rate. */
+    .spinner { animation-duration: 1800ms !important; }
+    /* The antigravity canvas honors prefers-reduced-motion at the JS layer
+       (one static frame, no RAF loop), so nothing extra is needed here. */
+}
+
+
+/* ══════════════════════════════════════════════════════════════════
+   Portal login — interactive antigravity background + Studio-toned
+   sign-in card. The portal modal is special-cased: it owns the full
+   viewport (no scrim, no blur) so the canvas can be the background.
+   ══════════════════════════════════════════════════════════════════ */
+
+:root {
+    /* Read by JS to color the dot field. Slate-on-light, near-white-on-dark. */
+    --antigravity-dot: #0f172a;
+}
+body.dark {
+    --antigravity-dot: #cbd5e1;
+}
+
+/* Strip the default modal scrim/blur. Applied to every login-flow modal
+   (portal, boot-splash, review-mode) so the body-level canvas is the
+   backdrop for the entire pre-app experience.
+   `background: transparent` is critical — using var(--bg) here would
+   paint an opaque rectangle OVER the body-level antigravity canvas,
+   hiding all the dots. The body itself paints var(--bg) below the
+   canvas, so transparent modals are correct. */
+.modal.portal-modal,
+.modal.no-scrim {
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    padding: 0;
+    overflow: hidden;
+    animation: portal-fade 360ms var(--ease-out) both;
+}
+@keyframes portal-fade {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+/* The canvas lives at body level (sibling of every modal) and sits below
+   modal content (z 1000) but above the body background. */
+#antigravity-canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    pointer-events: none;  /* clicks pass through to modal-content */
+    z-index: 1;
+}
+#antigravity-canvas.hidden { display: none !important; }
+
+/* Atmosphere — a faint accent halo behind the card adds depth that the
+   dot field alone can't provide. Sits between the canvas and the card. */
+.modal.portal-modal::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background:
+        radial-gradient(50% 55% at 50% 48%, var(--accent-soft), transparent 70%),
+        radial-gradient(120% 80% at 0% 100%,
+            rgba(15, 23, 42, 0.035), transparent 60%),
+        radial-gradient(120% 80% at 100% 0%,
+            rgba(15, 23, 42, 0.035), transparent 60%);
+}
+body.dark .modal.portal-modal::before {
+    background:
+        radial-gradient(50% 55% at 50% 48%,
+            rgba(255, 255, 255, 0.045), transparent 70%),
+        radial-gradient(120% 80% at 0% 100%,
+            rgba(0, 0, 0, 0.4), transparent 60%);
+}
+
+/* ── Theme pips (Auto / Light / Dark) — top right of the screen ─────── */
+.theme-pips {
+    position: absolute;
+    top: 18px;
+    right: 18px;
+    z-index: 3;
+    display: inline-flex;
+    gap: 2px;
+    padding: 3px;
+    background: rgba(255, 255, 255, 0.62);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    backdrop-filter: blur(14px) saturate(140%);
+    border: 1px solid var(--border-light);
+    border-radius: 999px;
+    box-shadow: var(--e1);
+}
+body.dark .theme-pips {
+    background: rgba(20, 22, 28, 0.55);
+    border-color: rgba(255, 255, 255, 0.08);
+}
+.theme-pip {
+    -webkit-appearance: none;
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-muted);
+    transition: background-color var(--t-fast) var(--ease-std),
+                color var(--t-fast) var(--ease-std),
+                transform var(--t-fast) var(--ease-std);
+}
+.theme-pip:hover { background: var(--bg-hover); color: var(--text); }
+.theme-pip:active { transform: scale(0.94); }
+.theme-pip.active {
+    background: var(--text);
+    color: var(--text-inverse);
+}
+body.dark .theme-pip.active {
+    background: var(--text-inverse);
+    color: var(--text);
+}
+
+/* ── Physics toggle (ball-pit) — bottom right of the screen ─────────── */
+/* Same frosted-pill treatment as .theme-pips, single beaker button.     */
+.physics-toggle {
+    -webkit-appearance: none;
+    appearance: none;
+    position: absolute;
+    bottom: 18px;
+    right: 18px;
+    z-index: 3;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    background: rgba(255, 255, 255, 0.62);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    backdrop-filter: blur(14px) saturate(140%);
+    border: 1px solid var(--border-light);
+    border-radius: 999px;
+    box-shadow: var(--e1);
+    color: var(--text-muted, #64748b);
+    cursor: pointer;
+    transition: color var(--t-fast) var(--ease-std),
+                border-color var(--t-fast) var(--ease-std),
+                transform var(--t-fast) var(--ease-std);
+}
+body.dark .physics-toggle {
+    background: rgba(20, 22, 28, 0.55);
+    border-color: rgba(255, 255, 255, 0.08);
+}
+.physics-toggle:hover { color: var(--text); }
+.physics-toggle:active { transform: scale(0.94); }
+.physics-toggle.active {
+    color: var(--accent);
+    border-color: var(--accent);
+    box-shadow: var(--e1), 0 0 0 3px var(--accent-glow);
+}
+
+/* ── Sign-in card ──────────────────────────────────────────────────── */
+.portal-card {
+    position: relative;
+    z-index: 1;
+    width: min(440px, calc(100vw - 40px));
+    padding: 36px 40px 26px;
+    background: rgba(255, 255, 255, 0.78);
+    -webkit-backdrop-filter: blur(20px) saturate(150%);
+    backdrop-filter: blur(20px) saturate(150%);
+    border: 1px solid var(--border-light);
+    border-radius: 18px;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.7),
+        0 24px 64px rgba(15, 23, 42, 0.16),
+        0 4px 12px rgba(15, 23, 42, 0.08);
+    animation: portal-card-in 480ms var(--ease-out) both;
+    transform-origin: center 40%;
+}
+body.dark .portal-card {
+    background: rgba(20, 22, 28, 0.62);
+    border-color: rgba(255, 255, 255, 0.08);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.04),
+        0 28px 68px rgba(0, 0, 0, 0.55);
+}
+@keyframes portal-card-in {
+    from { opacity: 0; transform: translateY(10px) scale(0.985); }
+    to   { opacity: 1; transform: translateY(0)    scale(1); }
+}
+
+/* ── Portal typography ──────────────────────────────────────────────
+   Inter is loaded in the <head> of index.html with font-display: optional
+   so the brand mark reads identically across macOS Safari, Windows Chrome,
+   etc. If Inter doesn't arrive in time on cold load, the system stack
+   below is a perceptually-close fallback. */
+.portal-card,
+.portal-brand-mark,
+.portal-brand-sub,
+.portal-card label {
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont,
+                 'Segoe UI Variable Text', 'Segoe UI', Roboto, sans-serif;
+    /* font-synthesis: none keeps Safari from faking a bold from the
+       Regular weight if Inter is still loading — better to fall back to
+       the system bold than to render a synthetic stretched one. */
+    font-synthesis: none;
+    font-optical-sizing: auto;
+}
+
+/* ── Brand mark — heavy display weight, hairline rule, spaced subline ── */
+.portal-brand {
+    display: flex;
+    align-items: stretch;
+    gap: 14px;
+    margin-bottom: 6px;
+}
+.portal-brand-mark {
+    font-size: 34px;
+    font-weight: 800;
+    letter-spacing: -0.035em;
+    color: var(--text);
+    line-height: 1;
+    /* These ss/cv tags are Inter-specific (alt 1, single-story a). They
+       are silently ignored when the system fallback is rendering. */
+    font-feature-settings: "ss01", "cv11";
+}
+.portal-brand-rule {
+    flex: 0 0 1px;
+    background: linear-gradient(180deg,
+        transparent, var(--border), transparent);
+    margin: 2px 0;
+}
+.portal-brand-sub {
+    align-self: flex-end;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    padding-bottom: 4px;
+}
+.portal-tagline {
+    margin: 0 0 22px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.55;
+    max-width: 34ch;
+}
+
+/* ── Form controls inside the card ──────────────────────────────────
+   `appearance: none` strips Safari/iOS native input chrome (rounded
+   corners, inset bevel) that otherwise paints through our borders. */
+.portal-card label {
+    display: block;
+    margin: 12px 0 5px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+.portal-card input[type="text"],
+.portal-card input[type="email"],
+.portal-card input[type="password"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    padding: 10px 13px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 13.5px;
+    font-family: inherit;
+    background: rgba(255, 255, 255, 0.6);
+    color: var(--text);
+    transition: border-color var(--t-fast) var(--ease-std),
+                box-shadow var(--t-fast) var(--ease-std),
+                background-color var(--t-fast) var(--ease-std);
+}
+body.dark .portal-card input[type="text"],
+body.dark .portal-card input[type="email"],
+body.dark .portal-card input[type="password"] {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.12);
+}
+.portal-card input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: var(--ring);
+    background: var(--bg);
+}
+body.dark .portal-card input:focus { background: rgba(255, 255, 255, 0.07); }
+
+/* Placeholder color — Safari defaults to rgba(0,0,0,0.5) and Firefox uses
+   opacity:0.54, which both look heavier than our intended subtle hint. */
+.portal-card input::placeholder { color: var(--text-subtle); opacity: 1; }
+.portal-card input::-webkit-input-placeholder { color: var(--text-subtle); }
+.portal-card input::-moz-placeholder        { color: var(--text-subtle); opacity: 1; }
+
+/* Safari/Chrome autofill — kill the yellow background + blue text.
+   The 600000s transition trick freezes our colors against the browser's
+   internal autofill animation. -webkit-text-fill-color overrides the
+   `color` Chromium forces on autofilled inputs. */
+.portal-card input:-webkit-autofill,
+.portal-card input:-webkit-autofill:hover,
+.portal-card input:-webkit-autofill:focus,
+.portal-card input:-webkit-autofill:active {
+    -webkit-box-shadow: 0 0 0 1000px #f7f8fa inset;
+    -webkit-text-fill-color: var(--text);
+    caret-color: var(--text);
+    border-color: var(--border);
+    transition: background-color 600000s 0s, color 600000s 0s;
+}
+body.dark .portal-card input:-webkit-autofill,
+body.dark .portal-card input:-webkit-autofill:hover,
+body.dark .portal-card input:-webkit-autofill:focus,
+body.dark .portal-card input:-webkit-autofill:active {
+    -webkit-box-shadow: 0 0 0 1000px #1c1f25 inset;
+    -webkit-text-fill-color: var(--text);
+}
+.portal-card input::-webkit-credentials-auto-fill-button {
+    /* Safari's blue key icon next to password fields — keep it but tint
+       it to the accent so it stops fighting the design. */
+    background-color: var(--accent);
+}
+.portal-card input::-ms-reveal,
+.portal-card input::-ms-clear {
+    display: none;  /* Edge's eye/x glyphs — redundant with autofill key */
+}
+
+/* ── Sign In button — full width, slight extra polish ─────────────── */
+.btn.portal-signin {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: auto;
+    padding: 12px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    margin-top: 6px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), var(--e2);
+}
+/* Safari paints a faint inner shadow on focused buttons even with our
+   custom focus ring — kill it so the button looks the same on focus. */
+.btn.portal-signin:focus-visible {
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), var(--e2), var(--ring);
+}
+.portal-card .modal-buttons {
+    display: block;
+    margin-top: 22px;
+}
+
+/* ── Footnote — a quiet hint about the interactive background ─────── */
+.portal-footnote {
+    margin-top: 22px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border-light);
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--text-subtle);
+}
+body.dark .portal-footnote { border-top-color: rgba(255, 255, 255, 0.06); }
+
+.portal-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+    animation: portal-pulse 2.4s var(--ease-std) infinite;
+}
+@keyframes portal-pulse {
+    0%, 100% { box-shadow: 0 0 0 3px var(--accent-soft); }
+    50%      { box-shadow: 0 0 0 8px transparent; }
+}
+
+/* Hide the portal-only ornamentation on narrow viewports — the canvas
+   still renders, just the chrome around it tightens. */
+@media (max-width: 480px) {
+    .portal-card { padding: 28px 24px 22px; }
+    .portal-brand-mark { font-size: 28px; }
+    .theme-pips { top: 12px; right: 12px; }
+}
+
+
+/* ══════════════════════════════════════════════════════════════════
+   Info-mode sample editor — sibling of #test-editor in the right panel.
+   Mirrors the test-editor's header treatment, then renders a form of
+   labeled inputs (editable on Enter) followed by a read-only Panels row.
+   ══════════════════════════════════════════════════════════════════ */
+.info-editor {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    border-top: 1px solid var(--border-light);
+}
+.info-editor-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: var(--header-bg);
+    color: var(--header-fg);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+}
+.info-editor-title { letter-spacing: 0.04em; }
+.info-editor-status {
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    opacity: 0.85;
+}
+.info-editor-fields {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.info-editor-placeholder {
+    color: var(--text-subtle);
+    font-size: 12px;
+    text-align: center;
+    padding: 18px;
+}
+.info-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.info-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+.info-input,
+.info-readonly {
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 12.5px;
+    line-height: 1.4;
+    background: var(--bg-elevated);
+    color: var(--text);
+    border: 1px solid var(--border);
+    font-family: inherit;
+}
+.info-input {
+    -webkit-appearance: none;
+    appearance: none;
+    transition: border-color var(--t-fast) var(--ease-std),
+                box-shadow var(--t-fast) var(--ease-std),
+                background-color var(--t-fast) var(--ease-std);
+}
+textarea.info-input { resize: vertical; min-height: 56px; }
+/* ── Field visibility settings (gear button + modal) ────────────────── */
+.field-settings-btn {
+    -webkit-appearance: none;
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    margin-left: 6px;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted, #64748b);
+    cursor: pointer;
+}
+.field-settings-btn:hover { background: var(--bg-hover); color: var(--text); }
+.field-settings-content { max-width: 560px; }
+.field-settings-msg { color: var(--text-muted, #64748b); font-size: 13px; margin: 8px 0 14px; }
+.field-settings-list {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 18px;
+    max-height: 46vh;
+    overflow-y: auto;
+    margin-bottom: 12px;
+}
+.field-settings-item { font-size: 13px; }
+.field-settings-extras {
+    font-size: 13px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-light);
+    display: block;
+}
+
+/* Dropdown variant — appearance:none above strips the native arrow, so
+   draw a chevron; slate stroke works on both light and dark field bg. */
+select.info-input {
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    background-size: 14px;
+    padding-right: 28px;
+}
+.info-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: var(--ring);
+}
+.info-input--saving  { opacity: 0.7; }
+.info-input--saved   { border-color: var(--good); background: var(--good-soft); }
+.info-input--error   { border-color: var(--bad);  background: var(--bad-soft); }
+
+.info-readonly {
+    background: var(--bg-sunken);
+    color: var(--text-muted);
+    border-style: dashed;
+}
+.info-empty { color: var(--text-subtle); }
+.info-panels {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 6px 8px;
+}
+.info-panel-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 9px;
+    font-size: 11.5px;
+    font-weight: 500;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Review-mode visibility — declarative show/hide per data-show-mode.
+   Tabs (and other elements) tagged with data-show-mode="info" only
+   render when body.mode-info; the reverse for "tests". Untagged
+   elements appear in both modes.
+   ══════════════════════════════════════════════════════════════════ */
+body.mode-info  [data-show-mode="tests"] { display: none !important; }
+body.mode-tests [data-show-mode="info"]  { display: none !important; }
+
+
+/* ══════════════════════════════════════════════════════════════════
+   Review mode picker — "What are you checking today?"
+   Shown immediately after login. Two pills side-by-side, with a soft
+   "coming soon" state for the Info dead-end.
+   ══════════════════════════════════════════════════════════════════ */
+.review-mode-content {
+    min-width: 460px;
+    max-width: 520px;
+    padding: 40px 44px 36px;
+    text-align: center;
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont,
+                 'Segoe UI', Roboto, sans-serif;
+    font-synthesis: none;
+}
+
+.review-mode-eyebrow {
+    margin: 0 0 10px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-subtle);
+}
+.review-mode-eyebrow span { color: var(--text); }
+
+.review-mode-question {
+    margin: 0 0 28px !important;  /* override .modal-content h2 margin */
+    font-size: 24px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+    color: var(--text);
+}
+
+.review-mode-pills {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+}
+
+/* The pills themselves — tall, generous, accent-tinted on hover. */
+.review-pill {
+    -webkit-appearance: none;
+    appearance: none;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 22px 16px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    box-shadow: var(--e1);
+    transition: background-color var(--t-fast) var(--ease-std),
+                border-color  var(--t-fast) var(--ease-std),
+                color         var(--t-fast) var(--ease-std),
+                box-shadow    var(--t-fast) var(--ease-std),
+                transform     var(--t-fast) var(--ease-std);
+}
+.review-pill:hover {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+    box-shadow: var(--e2);
+    transform: translateY(-1px);
+}
+.review-pill:active { transform: translateY(0); box-shadow: var(--e1); }
+.review-pill:focus-visible { box-shadow: var(--e1), var(--ring); }
+
+body.dark .review-pill {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.12);
+}
+body.dark .review-pill:hover {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.review-pill-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+    transition: background-color var(--t-fast) var(--ease-std),
+                color var(--t-fast) var(--ease-std);
+}
+.review-pill:hover .review-pill-icon {
+    background: var(--accent);
+    color: var(--text-inverse);
+}
+
+.review-pill-label {
+    font-size: 15px;
+    font-weight: 600;
+}
+
+/* ── Soft dead-end placeholder for Info ──────────────────────────── */
+.review-mode-soon h2 {
+    margin: 4px 0 12px !important;
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text);
+}
+.review-mode-soon-msg {
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.55;
+    margin: 0 auto 22px;
+    max-width: 36ch;
+}
+.review-mode-back {
+    margin: 0 auto;
+}
+
+
+/* ══════════════════════════════════════════════════════════════════
+   Restart-server confirm modal
+   ══════════════════════════════════════════════════════════════════ */
+.restart-confirm-content {
+    min-width: 420px;
+    max-width: 460px;
+    padding: 30px 32px 24px;
+}
+.restart-confirm-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    margin-bottom: 14px;
+    background: var(--warn-soft);
+    color: var(--warn);
+}
+body.dark .restart-confirm-icon {
+    background: rgba(217, 119, 6, 0.18);
+    color: #fbbf24;
+}
+.restart-confirm-content h2 { margin-bottom: 6px; }
+.restart-confirm-msg {
+    color: var(--text-muted);
+    font-size: 12.5px;
+    line-height: 1.55;
+    margin-bottom: 18px;
+}
+
+.restart-stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    margin: 0 0 22px;
+    padding: 1px;
+    background: var(--border-light);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+}
+body.dark .restart-stats { background: rgba(255, 255, 255, 0.08); }
+.restart-stats > div {
+    padding: 12px 14px;
+    background: var(--bg-sunken);
+}
+body.dark .restart-stats > div { background: rgba(255, 255, 255, 0.03); }
+.restart-stats dt {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    color: var(--text-subtle);
+    margin-bottom: 4px;
+}
+.restart-stats dd {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+   Command Center
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Unreachable-LabCore banner. Deliberately loud: in this state flagging a
+   sample fails, and the reviewer needs to know before they work a queue. */
+.cc-banner {
+    padding: 8px 16px;
+    background: #b3261e;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    text-align: center;
+}
+
+/* The flag form is tall; keep it scrollable rather than overflowing. */
+.cc-modal-content {
+    max-width: 560px;
+    max-height: 86vh;
+    overflow-y: auto;
+}
+
+.cc-section {
+    margin: 16px 0 6px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    color: var(--text-subtle);
+}
+.cc-section:first-of-type { margin-top: 8px; }
+
+.cc-req { color: #b3261e; }
+
+.cc-input {
+    width: 100%;
+    padding: 7px 9px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+
+.cc-modal-msg {
+    font-size: 12px;
+    color: var(--text-subtle);
+    margin-bottom: 10px;
+}
+
+/* Lab-id chips on the flag form */
+.cc-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+    min-height: 22px;
+}
+.cc-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 6px 3px 9px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+}
+body.dark .cc-chip { background: rgba(255, 255, 255, 0.06); }
+.cc-chip-x {
+    border: 0;
+    background: none;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    color: var(--text-subtle);
+    padding: 0 2px;
+}
+.cc-chip-x:hover { color: #b3261e; }
+
+/* Existing-listing cards, shown in the conflict and resolve modals */
+.cc-listing-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 12px;
+    max-height: 240px;
+    overflow-y: auto;
+}
+.cc-listing {
+    padding: 10px 12px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+}
+body.dark .cc-listing { background: rgba(255, 255, 255, 0.04); }
+.cc-listing-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 5px;
+}
+.cc-listing-id {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--text-subtle);
+}
+.cc-listing-status {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+}
+.cc-status-urgent {
+    background: #b3261e;
+    border-color: #b3261e;
+    color: #fff;
+}
+.cc-listing-problem {
+    font-size: 13px;
+    color: var(--text);
+    white-space: pre-wrap;
+}
+.cc-listing-meta {
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--text-subtle);
+}
+
+/* Secondary action row under Bad / Good */
+.action-buttons--secondary {
+    margin-top: 6px;
+    display: flex;
+    gap: 6px;
+}
+.action-buttons--secondary .btn { flex: 1; }
+
+/* ══════════════════════════════════════════════════════════════════════
+   Keycard login
+   ══════════════════════════════════════════════════════════════════════ */
+
+.portal-card-scan {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: 20px 8px 8px;
+}
+.portal-card-graphic {
+    color: var(--accent, #3b82f6);
+    opacity: 0.9;
+    margin-bottom: 14px;
+    animation: portal-card-pulse 2.4s ease-in-out infinite;
+}
+@keyframes portal-card-pulse {
+    0%, 100% { opacity: 0.55; transform: scale(1); }
+    50%      { opacity: 1;    transform: scale(1.04); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .portal-card-graphic { animation: none; opacity: 0.9; }
+}
+.portal-card-title {
+    margin: 0 0 6px;
+    font-size: 17px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+}
+.portal-card-hint {
+    margin: 0 0 10px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-subtle);
+    max-width: 34ch;
+}
+/* Focusable but not visible: the wedge types into this. Not display:none —
+   a hidden element cannot hold focus, and the scan would go nowhere. */
+.portal-card-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    border: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+.portal-card-status {
+    min-height: 18px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent, #3b82f6);
+}
+.portal-switch-link {
+    display: block;
+    width: 100%;
+    margin-top: 14px;
+    padding: 6px;
+    border: 0;
+    background: none;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text-subtle);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+}
+.portal-switch-link:hover { color: var(--text); }
+
+/* ══════════════════════════════════════════════════════════════════════
+   Sample multi-select + context menu
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Dragging across rows must not paint the browser's own text selection. */
+#sample-list { user-select: none; }
+
+.sample-item.selected {
+    background: color-mix(in srgb, var(--accent, #3b82f6) 16%, transparent);
+    box-shadow: inset 2px 0 0 var(--accent, #3b82f6);
+}
+body.dark .sample-item.selected {
+    background: color-mix(in srgb, var(--accent, #3b82f6) 26%, transparent);
+}
+
+.ctx-menu {
+    position: fixed;
+    z-index: 9999;
+    min-width: 250px;
+    padding: 5px;
+    background: var(--panel, #fff);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+body.dark .ctx-menu { box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5); }
+
+.ctx-item {
+    display: block;
+    width: 100%;
+    padding: 7px 10px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: none;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+}
+.ctx-item:hover { background: var(--bg-sunken); }
+body.dark .ctx-item:hover { background: rgba(255, 255, 255, 0.07); }
+.ctx-item--muted { color: var(--text-subtle); }
+
+.ctx-sep {
+    height: 1px;
+    margin: 4px 6px;
+    background: var(--border);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   Pane checkboxes + Lab Vision data pane
+   ══════════════════════════════════════════════════════════════════════ */
+
+.view-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 8px;
+    font-size: 12px;
+    font-weight: 550;
+    color: var(--text);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+.view-check input { margin: 0; cursor: pointer; }
+
+.labvision-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 12px;
+    font-size: 12px;
+}
+.labvision-empty {
+    padding: 18px 4px;
+    color: var(--text-subtle);
+    text-align: center;
+}
+.lv-row {
+    display: grid;
+    grid-template-columns: minmax(0, 40%) minmax(0, 1fr);
+    gap: 4px 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+}
+.lv-row:last-child { border-bottom: 0; }
+.lv-key {
+    color: var(--text-subtle);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    align-self: center;
+    word-break: break-word;
+}
+.lv-val {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    word-break: break-word;
+}
+/* A value QBench already holds differently — the sync will ask before
+   touching it, so flag it here too. */
+.lv-row--clash { background: color-mix(in srgb, #f59e0b 12%, transparent); }
+.lv-note {
+    grid-column: 2;
+    font-size: 11px;
+    color: #b45309;
+}
+body.dark .lv-note { color: #fbbf24; }
+
+/* ── Lab Vision test list (Tests mode) ─────────────────────────────── */
+.lv-test-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 90px) minmax(0, 54px);
+    gap: 10px;
+    align-items: baseline;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+}
+.lv-test-row:last-child { border-bottom: 0; }
+.lv-test-name { color: var(--text); word-break: break-word; }
+.lv-test-result {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    text-align: right;
+    word-break: break-word;
+}
+.lv-test-op {
+    color: var(--text-subtle);
+    font-size: 11px;
+    text-align: right;
+}
+/* A test with no result is the thing a reviewer is looking for, so it is
+   marked rather than left to blend in with the rest of the list. */
+.lv-test-row--noresult { background: color-mix(in srgb, #f59e0b 12%, transparent); }
+.lv-test-row--noresult .lv-test-result { color: #b45309; }
+body.dark .lv-test-row--noresult .lv-test-result { color: #fbbf24; }
+
+/* ══════════════════════════════════════════════════════════════════════
+   Sync Data dialog
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Sample-information sync belongs to Info mode. Offering it during a results
+   review invites an accidental write to sample fields. */
+#sync-data-btn { display: none; }
+body.mode-info #sync-data-btn { display: inline-flex; }
+
+.sync-modal-content {
+    max-width: 900px;
+    max-height: 88vh;
+    overflow-y: auto;
+}
+.sync-hint {
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--text-subtle);
+    margin-bottom: 10px;
+}
+.sync-warning {
+    margin-bottom: 10px;
+    padding: 7px 10px;
+    font-size: 12px;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, #f59e0b 15%, transparent);
+    color: #92400e;
+}
+body.dark .sync-warning { color: #fbbf24; }
+
+/* Two columns: Lab Vision on the left, QBench on the right. A drag from one
+   to the other is the pairing, so they scroll together as one board. */
+.sync-board {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+}
+.sync-col { min-width: 0; }
+.sync-col-head {
+    padding: 0 4px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-subtle);
+    border-bottom: 1px solid var(--border);
+}
+.sync-col-body {
+    max-height: 52vh;
+    overflow-y: auto;
+    padding: 6px 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+/* ── left column: Lab Vision fields ─────────────────────────────────── */
+.sync-card {
+    padding: 6px 9px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: grab;
+}
+.sync-card:active { cursor: grabbing; }
+body.dark .sync-card { background: rgba(255, 255, 255, 0.05); }
+/* QBench cannot accept this field, so it is readable but not draggable —
+   a drag it would refuse promises a write that cannot happen. */
+.sync-card--locked { opacity: 0.5; cursor: default; }
+.sync-card--paired { border-color: var(--accent, #3b82f6); }
+.sync-card-name {
+    display: block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-subtle);
+}
+.sync-card-val {
+    display: block;
+    font-size: 13px;
+    color: var(--text);
+    word-break: break-word;
+}
+.sync-card-link {
+    display: block;
+    font-size: 11px;
+    color: var(--accent, #3b82f6);
+}
+
+/* ── right column: QBench fields ────────────────────────────────────── */
+/* The tick sits in its own right-hand gutter spanning both rows, so it never
+   collides with a long current value or a long pairing line. */
+.sync-slot {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 20px;
+    column-gap: 8px;
+    padding: 6px 9px;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-sm);
+}
+.sync-slot > .sync-slot-main,
+.sync-slot > .sync-slot-pair { grid-column: 1; }
+.sync-slot--locked { opacity: 0.45; border-style: solid; }
+.sync-slot--paired { border-style: solid; border-color: var(--accent, #3b82f6); }
+.sync-slot--clash  { background: color-mix(in srgb, #f59e0b 12%, transparent); }
+.sync-slot--same   { opacity: 0.6; }
+.sync-slot--over {
+    border-color: var(--accent, #3b82f6);
+    border-style: solid;
+    background: color-mix(in srgb, var(--accent, #3b82f6) 12%, transparent);
+}
+.sync-slot-main { display: flex; justify-content: space-between; gap: 8px; }
+.sync-slot-name {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-subtle);
+    word-break: break-word;
+}
+.sync-slot-cur { font-size: 12px; color: var(--text); word-break: break-word; }
+.sync-slot-pair {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin-top: 3px;
+    font-size: 12px;
+    color: var(--accent, #3b82f6);
+}
+.sync-slot-from { word-break: break-word; }
+.sync-slot-warn { font-size: 11px; color: #b45309; }
+body.dark .sync-slot-warn { color: #fbbf24; }
+.sync-unpair {
+    margin-left: auto;
+    border: 0;
+    background: none;
+    color: var(--text-subtle);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+}
+.sync-unpair:hover { color: var(--danger, #dc2626); }
+.sync-slot-send {
+    grid-column: 2;
+    grid-row: 1 / -1;
+    align-self: center;
+    text-align: center;
+}
+.sync-qb-sep {
+    margin: 8px 0 2px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-subtle);
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+}
+.sync-empty { padding: 20px; text-align: center; color: var(--text-subtle); }
+
+/* Right-hand column: SIF on top, Lab Vision beneath. Stacking them (rather
+   than adding two more columns) is what makes each a quarter of the area
+   next to a half-width COA. */
+#side-panes {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    gap: 0;
+}
+#side-panes .pdf-pane { min-height: 0; }
+/* The generic sibling rule draws a LEFT border between columns; inside the
+   stack the divider belongs on top instead. */
+#side-panes .pdf-pane + .pdf-pane {
+    border-left: 0;
+    border-top: 1px solid var(--border);
+}
+#side-panes .pdf-pane:first-child { border-radius: 0 var(--radius-md) 0 0; }
+#side-panes .pdf-pane:last-child  { border-radius: 0 0 var(--radius-md) 0; }
+#side-panes .pdf-pane:only-child  { border-radius: 0 var(--radius-md) var(--radius-md) 0; }
+
+/* A portal order legitimately has no SIF — inform, don't alarm. A paper
+   order missing its document is a genuine problem, so it reads as one. */
+.sif-placeholder.sif-online {
+    color: var(--text-subtle);
+    font-style: italic;
+}
+.sif-placeholder.sif-missing {
+    color: #b3261e;
+    font-weight: 600;
+}
+body.dark .sif-placeholder.sif-missing { color: #f87171; }

@@ -1,0 +1,74 @@
+# ── Due Out (71 reviewed) ──
+lab_id,sample_id,tab,outcome,reason,date
+040626-32298,35971,Due Out,Good,,2026-04-09
+040626-32298,35971,Due Out,Bad,missing graph explaining flash,2026-04-09
+040626-32297,35970,Due Out,Good,,2026-04-09
+040626-32296,35969,Due Out,Good,,2026-04-09
+040626-32295,35968,Due Out,Good,,2026-04-09
+040626-32294,35967,Due Out,Bad,missing graph,2026-04-09
+040626-32293,35966,Due Out,Good,,2026-04-09
+040626-32292,35965,Due Out,Good,,2026-04-09
+040626-32316,35964,Due Out,Good,,2026-04-09
+040626-32315,35963,Due Out,Good,,2026-04-09
+040626-32314,35962,Due Out,Good,,2026-04-09
+040626-32313,35961,Due Out,Good,,2026-04-09
+040626-32312,35960,Due Out,Good,,2026-04-09
+040626-32311,35959,Due Out,Good,,2026-04-09
+040626-32310,35958,Due Out,Good,,2026-04-09
+040626-32309,35957,Due Out,Good,,2026-04-09
+040626-32308,35956,Due Out,Good,,2026-04-09
+040626-32307,35955,Due Out,Good,,2026-04-09
+040626-32306,35954,Due Out,Good,,2026-04-09
+040626-32305,35953,Due Out,Good,,2026-04-09
+040626-32304,35952,Due Out,Good,,2026-04-09
+040626-32302,35951,Due Out,Good,,2026-04-09
+040626-32301,35950,Due Out,Good,,2026-04-09
+040626-32300,35949,Due Out,Good,,2026-04-09
+040626-32299,35948,Due Out,Good,,2026-04-09
+040626-32303,35878,Due Out,Good,,2026-04-09
+040626-32357,35814,Due Out,Good,,2026-04-09
+040626-32318,35813,Due Out,Good,,2026-04-09
+040626-32317,35812,Due Out,Good,,2026-04-09
+040626-32353,35811,Due Out,Good,,2026-04-09
+040626-32354,35810,Due Out,Good,,2026-04-09
+040626-32351,35808,Due Out,Good,,2026-04-09
+040626-32352,35807,Due Out,Good,,2026-04-09
+040626-32350,35631,Due Out,Good,,2026-04-09
+040626-32344,35630,Due Out,Good,,2026-04-09
+040626-32349,35629,Due Out,Good,,2026-04-09
+040626-32348,35628,Due Out,Good,,2026-04-09
+040626-32346,35627,Due Out,Good,,2026-04-09
+040626-32345,35626,Due Out,Good,,2026-04-09
+040626-32347,35625,Due Out,Good,,2026-04-09
+040626-32343,35624,Due Out,Good,,2026-04-09
+040626-32342,35623,Due Out,Good,,2026-04-09
+040626-32341,35622,Due Out,Good,,2026-04-09
+040626-32340,35621,Due Out,Good,,2026-04-09
+040626-32339,35620,Due Out,Good,,2026-04-09
+040626-32338,35619,Due Out,Good,,2026-04-09
+040626-32337,35618,Due Out,Good,,2026-04-09
+040626-32336,35617,Due Out,Good,,2026-04-09
+040626-32335,35616,Due Out,Good,,2026-04-09
+040626-32334,35615,Due Out,Good,,2026-04-09
+040626-32333,35614,Due Out,Good,,2026-04-09
+040626-32332,35613,Due Out,Good,,2026-04-09
+040626-32331,35612,Due Out,Bad,missing flash,2026-04-09
+040626-32330,35611,Due Out,Good,,2026-04-09
+040626-32329,35610,Due Out,Good,,2026-04-09
+040626-32328,35609,Due Out,Good,,2026-04-09
+040626-32327,35608,Due Out,Good,,2026-04-09
+040626-32326,35607,Due Out,Good,,2026-04-09
+040626-32325,35606,Due Out,Good,,2026-04-09
+040626-32324,35605,Due Out,Good,,2026-04-09
+040626-32356,35604,Due Out,Good,,2026-04-09
+040626-32355,35603,Due Out,Good,,2026-04-09
+040626-32323,35602,Due Out,Good,,2026-04-09
+040626-32322,35601,Due Out,Good,,2026-04-09
+040626-32321,35600,Due Out,Good,,2026-04-09
+040626-32320,35599,Due Out,Good,,2026-04-09
+040626-32319,35598,Due Out,Good,,2026-04-09
+040626-32303,35878,Due Out,Bad,graph needed,2026-04-09
+040626-32307,35955,Due Out,Bad,graph needed,2026-04-09
+040626-32295,35968,Due Out,Bad,graph needed,2026-04-09
+040626-32296,35969,Due Out,Bad,graph needed,2026-04-09
+# QBench Good Samples (Due Out): https://asaplabs.qbench.net/tests?sample_ids=35971&sample_ids=35970&sample_ids=35969&sample_ids=35968&sample_ids=35966&sample_ids=35965&sample_ids=35964&sample_ids=35963&sample_ids=35962&sample_ids=35961&sample_ids=35960&sample_ids=35959&sample_ids=35958&sample_ids=35957&sample_ids=35956&sample_ids=35955&sample_ids=35954&sample_ids=35953&sample_ids=35952&sample_ids=35951&sample_ids=35950&sample_ids=35949&sample_ids=35948&sample_ids=35878&sample_ids=35814&sample_ids=35813&sample_ids=35812&sample_ids=35811&sample_ids=35810&sample_ids=35808&sample_ids=35807&sample_ids=35631&sample_ids=35630&sample_ids=35629&sample_ids=35628&sample_ids=35627&sample_ids=35626&sample_ids=35625&sample_ids=35624&sample_ids=35623&sample_ids=35622&sample_ids=35621&sample_ids=35620&sample_ids=35619&sample_ids=35618&sample_ids=35617&sample_ids=35616&sample_ids=35615&sample_ids=35614&sample_ids=35613&sample_ids=35611&sample_ids=35610&sample_ids=35609&sample_ids=35608&sample_ids=35607&sample_ids=35606&sample_ids=35605&sample_ids=35604&sample_ids=35603&sample_ids=35602&sample_ids=35601&sample_ids=35600&sample_ids=35599&sample_ids=35598&sort_order=DESC&view_config_id=17&page_size=700

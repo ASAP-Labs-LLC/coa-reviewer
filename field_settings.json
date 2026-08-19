@@ -1,0 +1,13 @@
+{
+  "sample_info_hidden": [
+    "accession_number",
+    "attachments",
+    "component_model",
+    "generator",
+    "package_size",
+    "point_of_collection",
+    "source",
+    "tags"
+  ],
+  "show_extra_fields": false
+}

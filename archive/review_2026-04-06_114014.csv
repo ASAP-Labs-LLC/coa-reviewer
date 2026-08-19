@@ -1,0 +1,73 @@
+# ── Due Out (70 reviewed) ──
+lab_id,sample_id,tab,outcome,reason,date
+040126-32136,35875,Due Out,Good,,2026-04-06
+040126-32180,35874,Due Out,Good,,2026-04-06
+040126-32179,35873,Due Out,Good,,2026-04-06
+040126-32178,35872,Due Out,Good,,2026-04-06
+040126-32177,35871,Due Out,Good,,2026-04-06
+040126-32176,35870,Due Out,Good,,2026-04-06
+040126-32175,35869,Due Out,Good,,2026-04-06
+040126-32174,35868,Due Out,Good,,2026-04-06
+040126-32173,35867,Due Out,Good,,2026-04-06
+040126-32172,35866,Due Out,Good,,2026-04-06
+040126-32171,35865,Due Out,Good,,2026-04-06
+040126-32170,35864,Due Out,Good,,2026-04-06
+040126-32168,35862,Due Out,Bad,missing petro-oxy,2026-04-06
+040126-32167,35861,Due Out,Good,,2026-04-06
+040126-32169,35863,Due Out,Good,,2026-04-06
+040126-32166,35860,Due Out,Good,,2026-04-06
+040126-32165,35859,Due Out,Good,,2026-04-06
+040126-32164,35858,Due Out,Bad,missing petro,2026-04-06
+040126-32157,35851,Due Out,Good,,2026-04-06
+040126-32156,35850,Due Out,Good,,2026-04-06
+040126-32155,35849,Due Out,Good,,2026-04-06
+040126-32154,35848,Due Out,Good,,2026-04-06
+040126-32153,35847,Due Out,Good,,2026-04-06
+040126-32152,35846,Due Out,Good,,2026-04-06
+040126-32151,35845,Due Out,Good,,2026-04-06
+040126-32150,35844,Due Out,Good,,2026-04-06
+040126-32149,35843,Due Out,Good,,2026-04-06
+040126-32148,35842,Due Out,Good,,2026-04-06
+040126-32147,35841,Due Out,Good,,2026-04-06
+040126-32146,35840,Due Out,Good,,2026-04-06
+040126-32145,35839,Due Out,Good,,2026-04-06
+040126-32144,35838,Due Out,Good,,2026-04-06
+040126-32137,35837,Due Out,Good,,2026-04-06
+040126-32208,35593,Due Out,Bad,missing data,2026-04-06
+040126-32202,35592,Due Out,Bad,coolant with ICP oils test,2026-04-06
+040126-32143,35591,Due Out,Good,,2026-04-06
+040126-32201,35590,Due Out,Good,,2026-04-06
+040126-32207,35589,Due Out,Bad,oil with extra tests,2026-04-06
+040126-32142,35588,Due Out,Good,,2026-04-06
+040126-32200,35587,Due Out,Bad,coolant with CP oil tests,2026-04-06
+040126-32206,35586,Due Out,Bad,oil with extra tests,2026-04-06
+040126-32141,35585,Due Out,Good,,2026-04-06
+040126-32199,35584,Due Out,Good,,2026-04-06
+040126-32205,35583,Due Out,Bad,oil with extra tests,2026-04-06
+040126-32199,35584,Due Out,Bad,Coolant with ICP oil test,2026-04-06
+040126-32140,35582,Due Out,Good,,2026-04-06
+040126-32198,35581,Due Out,Bad,Coolant with Oil test,2026-04-06
+040126-32204,35580,Due Out,Good,,2026-04-06
+040126-32204,35580,Due Out,Bad,oil with extra tests,2026-04-06
+040126-32139,35579,Due Out,Good,,2026-04-06
+040126-32197,35578,Due Out,Bad,coolant with ICp Oil test,2026-04-06
+040126-32203,35577,Due Out,Bad,oil with extra tests,2026-04-06
+040126-32138,35576,Due Out,Good,,2026-04-06
+040126-32138,35576,Due Out,Bad,missing GC grapgh,2026-04-06
+040126-32187,35427,Due Out,Good,,2026-04-06
+040126-32196,35426,Due Out,Good,,2026-04-06
+040126-32186,35425,Due Out,Good,,2026-04-06
+040126-32195,35424,Due Out,Good,,2026-04-06
+040126-32194,35423,Due Out,Good,,2026-04-06
+040126-32185,35422,Due Out,Good,,2026-04-06
+040126-32193,35421,Due Out,Good,,2026-04-06
+040126-32184,35420,Due Out,Good,,2026-04-06
+040126-32192,35419,Due Out,Good,,2026-04-06
+040126-32191,35418,Due Out,Good,,2026-04-06
+040126-32183,35417,Due Out,Good,,2026-04-06
+040126-32182,35416,Due Out,Good,,2026-04-06
+040126-32190,35415,Due Out,Good,,2026-04-06
+040126-32181,35413,Due Out,Good,,2026-04-06
+040126-32188,35412,Due Out,Good,,2026-04-06
+040126-32189,35414,Due Out,Good,,2026-04-06
+# QBench Good Samples (Due Out): https://asaplabs.qbench.net/tests?sample_ids=35875&sample_ids=35874&sample_ids=35873&sample_ids=35872&sample_ids=35871&sample_ids=35870&sample_ids=35869&sample_ids=35868&sample_ids=35867&sample_ids=35866&sample_ids=35865&sample_ids=35864&sample_ids=35861&sample_ids=35863&sample_ids=35860&sample_ids=35859&sample_ids=35851&sample_ids=35850&sample_ids=35849&sample_ids=35848&sample_ids=35847&sample_ids=35846&sample_ids=35845&sample_ids=35844&sample_ids=35843&sample_ids=35842&sample_ids=35841&sample_ids=35840&sample_ids=35839&sample_ids=35838&sample_ids=35837&sample_ids=35591&sample_ids=35590&sample_ids=35588&sample_ids=35585&sample_ids=35584&sample_ids=35582&sample_ids=35580&sample_ids=35579&sample_ids=35576&sample_ids=35427&sample_ids=35426&sample_ids=35425&sample_ids=35424&sample_ids=35423&sample_ids=35422&sample_ids=35421&sample_ids=35420&sample_ids=35419&sample_ids=35418&sample_ids=35417&sample_ids=35416&sample_ids=35415&sample_ids=35413&sample_ids=35412&sample_ids=35414&sort_order=DESC&view_config_id=17&page_size=700

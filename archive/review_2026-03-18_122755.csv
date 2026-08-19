@@ -1,0 +1,6 @@
+lab_id,sample_id,tab,outcome,reason,date
+031326-31326,34857,Due Out,Bad,this is a test,2026-03-18
+031326-31326,34857,Due Out,Good,,2026-03-18
+
+QBench Good Samples View:
+https://asaplabs.qbench.net/tests?sample_ids=34857&sort_order=DESC&view_config_id=17&page_size=700

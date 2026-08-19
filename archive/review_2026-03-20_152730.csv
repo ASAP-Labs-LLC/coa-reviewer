@@ -1,0 +1,75 @@
+lab_id,sample_id,tab,outcome,reason,date
+31478,33902,Re-review,Good,,2026-03-20
+031726-31458,34944,Due Out,Bad,particle count missing,2026-03-20
+031726-31493,34943,Due Out,Good,,2026-03-20
+031726-31465,34942,Due Out,Good,,2026-03-20
+031726-31463,34940,Due Out,Good,,2026-03-20
+031726-31462,34939,Due Out,Good,,2026-03-20
+031726-31461,34938,Due Out,Bad,missing all results,2026-03-20
+031726-31460,34937,Due Out,Bad,missing particle count,2026-03-20
+031726-31459,34936,Due Out,Bad,missing particle count,2026-03-20
+031726-31492,34632,Due Out,Bad,missing particle count,2026-03-20
+031726-31473,33949,Due Out,Good,,2026-03-20
+031726-31474,33948,Due Out,Good,,2026-03-20
+031726-31472,33947,Due Out,Good,,2026-03-20
+031726-31471,33943,Due Out,Good,,2026-03-20
+031726-31468,33942,Due Out,Good,,2026-03-20
+031726-31466,33941,Due Out,Good,,2026-03-20
+031726-31466,33941,Due Out,Good,,2026-03-20
+031726-31470,33940,Due Out,Good,,2026-03-20
+031726-31467,33939,Due Out,Good,,2026-03-20
+031726-31488,33912,Due Out,Good,,2026-03-20
+031726-31487,33911,Due Out,Good,,2026-03-20
+031726-31486,33910,Due Out,Good,,2026-03-20
+031726-31485,33909,Due Out,Good,,2026-03-20
+031726-31484,33908,Due Out,Good,,2026-03-20
+031726-31483,33907,Due Out,Good,,2026-03-20
+031726-31482,33906,Due Out,Good,,2026-03-20
+031726-31481,33905,Due Out,Good,,2026-03-20
+031726-31480,33904,Due Out,Good,,2026-03-20
+031726-31479,33903,Due Out,Good,,2026-03-20
+031726-31478,33902,Due Out,Good,,2026-03-20
+031726-31477,33900,Due Out,Good,,2026-03-20
+031726-31477,33900,Due Out,Good,,2026-03-20
+031726-31477,33900,Due Out,Bad,missing KF,2026-03-20
+031726-31476,33899,Due Out,Good,,2026-03-20
+031726-31475,33898,Due Out,Good,,2026-03-20
+031726-31491,31788,Due Out,Bad,missing particle count,2026-03-20
+031726-31490,31787,Due Out,Bad,missing particle count,2026-03-20
+031726-31489,31784,Due Out,Bad,missing particle count,2026-03-20
+031726-31469,31726,Due Out,Good,,2026-03-20
+031826-31496,34990,Yesterday,Good,,2026-03-20
+031826-31495,34989,Yesterday,Good,,2026-03-20
+031826-31494,34988,Yesterday,Good,,2026-03-20
+031826-31498,34965,Yesterday,Bad,missing particle count,2026-03-20
+031826-31497,34964,Yesterday,Bad,missing particle count,2026-03-20
+031826-31520,34987,Yesterday,Good,,2026-03-20
+031826-31519,34986,Yesterday,Good,,2026-03-20
+031826-31518,34985,Yesterday,Bad,missing particle count,2026-03-20
+031826-31517,34984,Yesterday,Bad,missing particle count,2026-03-20
+031826-31516,34983,Yesterday,Bad,missing particle count,2026-03-20
+031826-31518,34985,Yesterday,Bad,markes as fail? and missing particle count,2026-03-20
+031826-31518,34985,Yesterday,Bad,markes as fail? and missing particle count,2026-03-20
+031826-31517,34984,Yesterday,Bad,markes as fail? and missing particle count,2026-03-20
+031826-31516,34983,Yesterday,Bad,markes as fail? and missing particle count,2026-03-20
+031826-31515,34982,Yesterday,Good,,2026-03-20
+031826-31514,34981,Yesterday,Good,,2026-03-20
+031826-31513,34980,Yesterday,Bad,flashed 90 missing graph,2026-03-20
+031826-31512,34979,Yesterday,Good,,2026-03-20
+031826-31511,34978,Yesterday,Good,,2026-03-20
+031826-31510,34977,Yesterday,Good,,2026-03-20
+031826-31509,34976,Yesterday,Good,,2026-03-20
+031826-31508,34975,Yesterday,Good,,2026-03-20
+031826-31507,34974,Yesterday,Good,,2026-03-20
+031826-31506,34973,Yesterday,Good,,2026-03-20
+031826-31505,34972,Yesterday,Good,,2026-03-20
+031826-31504,34971,Yesterday,Good,,2026-03-20
+031826-31503,34970,Yesterday,Good,,2026-03-20
+031826-31504,34971,Yesterday,Bad,nosulfur comment,2026-03-20
+031826-31502,34969,Yesterday,Bad,no sulfuir comment,2026-03-20
+031826-31501,34968,Yesterday,Bad,no sulfur comment,2026-03-20
+031826-31500,34967,Yesterday,Bad,no sufur comment,2026-03-20
+031826-31499,34966,Yesterday,Good,,2026-03-20
+
+QBench Good Samples View:
+https://asaplabs.qbench.net/tests?sample_ids=34943&sample_ids=34942&sample_ids=34940&sample_ids=34939&sample_ids=33949&sample_ids=33948&sample_ids=33947&sample_ids=33943&sample_ids=33942&sample_ids=33941&sample_ids=33941&sample_ids=33940&sample_ids=33939&sample_ids=33912&sample_ids=33911&sample_ids=33910&sample_ids=33909&sample_ids=33908&sample_ids=33907&sample_ids=33906&sample_ids=33905&sample_ids=33904&sample_ids=33903&sample_ids=33902&sample_ids=33900&sample_ids=33900&sample_ids=33899&sample_ids=33898&sample_ids=31726&sort_order=DESC&view_config_id=17&page_size=700

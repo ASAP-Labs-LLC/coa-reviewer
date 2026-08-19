@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>COA Reviewer</title>
+    <!--
+      Inter is loaded for the login brand mark + portal form labels so that
+      "COA / Reviewer" reads identically across macOS Safari, Windows Chrome,
+      etc. The body keeps the system stack (declared in app.css) so the
+      rest of the app stays zero-flash. `font-display: optional` means: if
+      Inter hasn't downloaded within ~100ms the browser uses the fallback
+      for THIS view but caches Inter for subsequent loads — eliminates
+      visible swap after first cold load.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800&display=optional">
+    <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+    <!-- Antigravity background — body-level so it shows behind every
+         login-flow modal (portal-login, boot-splash, review-mode). The
+         JS observes #app's visibility and stops the field once the main
+         UI is rendered. -->
+    <canvas id="antigravity-canvas" aria-hidden="true"></canvas>
+
+    <!-- ── Portal Login Modal (shown first on every page load) ─────── -->
+    <div id="portal-login-modal" class="modal portal-modal hidden">
+        <!-- Theme pip-strip — Auto / Light / Dark — top right of the screen.
+             Mirrors the `applyTheme()` modes used by the top-bar #dark-toggle. -->
+        <div class="theme-pips" role="group" aria-label="Color theme">
+            <button class="theme-pip" data-theme="system" title="Match system" aria-label="Auto">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="12" cy="12" r="9"/>
+                    <path d="M12 3 v18"/>
+                    <path d="M12 3 a9 9 0 0 0 0 18" fill="currentColor" stroke="none"/>
+                </svg>
+            </button>
+            <button class="theme-pip" data-theme="light" title="Light" aria-label="Light">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="12" cy="12" r="4"/>
+                    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+                </svg>
+            </button>
+            <button class="theme-pip" data-theme="dark" title="Dark" aria-label="Dark">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" fill="currentColor" stroke="none"/>
+                </svg>
+            </button>
+        </div>
+
+        <!-- Physics toggle — bottom right. First click drops the background
+             dots into a bouncing ball pit; second click pulls them back
+             into their grid slots. Wired up in initAntigravity(). -->
+        <button id="physics-toggle" class="physics-toggle" title="Ball-pit physics"
+                aria-label="Toggle ball-pit physics" aria-pressed="false">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M9.5 3h5"/>
+                <path d="M10.5 3v5.4L5.2 17.6a2.1 2.1 0 0 0 1.9 3h9.8a2.1 2.1 0 0 0 1.9-3L13.5 8.4V3"/>
+                <path d="M7.6 14.6h8.8"/>
+            </svg>
+        </button>
+
+        <div class="portal-card">
+            <div class="portal-brand">
+                <span class="portal-brand-mark">COA</span>
+                <span class="portal-brand-rule" aria-hidden="true"></span>
+                <span class="portal-brand-sub">Reviewer</span>
+            </div>
+            <p class="portal-tagline">ASAP Labs internal — Certificate of Analysis review console</p>
+
+            <!-- Keycard-first, mirroring LabStation's login dialog. LabLink
+                 readers are keyboard wedges: they type the card code and
+                 press Enter into whatever holds focus, so the capture field
+                 below stays focused while this view is up. -->
+            <div id="portal-card-view">
+                <div class="portal-card-scan">
+                    <div class="portal-card-graphic" aria-hidden="true">
+                        <svg viewBox="0 0 64 44" width="72" height="50" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="3" width="42" height="38" rx="5"/>
+                            <circle cx="24" cy="22" r="4"/>
+                            <path d="M52 13a13 13 0 0 1 0 18"/>
+                            <path d="M57 8a20 20 0 0 1 0 28"/>
+                        </svg>
+                    </div>
+                    <h3 class="portal-card-title">Tap your LabLink card</h3>
+                    <p class="portal-card-hint">Hold your card to the reader. You'll be signed in as your LabLink account.</p>
+                    <!-- Visually hidden, but focusable: the wedge types here. -->
+                    <input type="password" id="portal-card-input" class="portal-card-input"
+                           autocomplete="off" aria-label="Keycard scan">
+                    <div id="portal-card-status" class="portal-card-status"></div>
+                </div>
+                <button type="button" id="portal-use-password" class="portal-switch-link">Sign in with a password instead</button>
+            </div>
+
+            <!-- The password alternative to the card. Same LabLink account
+                 either way, so there is nothing to type but the credentials —
+                 the name is whatever LabCore resolves them to. -->
+            <div id="portal-password-view" class="hidden">
+                <p class="portal-card-hint">Sign in with your LabLink username and password.</p>
+                <label>LabLink Username</label>
+                <input type="text" id="portal-username" placeholder="e.g. Ryan C" autocomplete="username">
+                <label>LabLink Password</label>
+                <input type="password" id="portal-password" placeholder="••••••••" autocomplete="current-password">
+
+                <div class="modal-buttons">
+                    <button id="portal-login-btn" class="btn btn-primary portal-signin">Sign In</button>
+                </div>
+                <button type="button" id="portal-use-card" class="portal-switch-link">Use a keycard instead</button>
+            </div>
+
+            <div id="portal-login-error" class="error-text"></div>
+
+            <div class="portal-footnote" aria-hidden="true">
+                <span class="portal-dot"></span>
+                <span>Move your cursor</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Review Mode Picker (shown immediately after login) ───────── -->
+    <div id="review-mode-modal" class="modal no-scrim hidden">
+        <div class="modal-content review-mode-content">
+            <div class="review-mode-picker">
+                <p class="review-mode-eyebrow">Welcome, <span id="review-mode-name">there</span></p>
+                <h2 class="review-mode-question">What are you checking today?</h2>
+                <div class="review-mode-pills">
+                    <button class="review-pill" data-mode="info" type="button">
+                        <span class="review-pill-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="12" cy="12" r="9"/>
+                                <line x1="12" y1="11" x2="12" y2="16.5"/>
+                                <circle cx="12" cy="7.8" r="0.6" fill="currentColor" stroke="none"/>
+                            </svg>
+                        </span>
+                        <span class="review-pill-label">Sample Info (SIF)</span>
+                    </button>
+                    <button class="review-pill" data-mode="tests" type="button">
+                        <span class="review-pill-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M9 3v6.2L4.6 17a2 2 0 0 0 1.7 3h11.4a2 2 0 0 0 1.7-3L15 9.2V3"/>
+                                <line x1="8" y1="3" x2="16" y2="3"/>
+                                <line x1="7.2" y1="14" x2="16.8" y2="14"/>
+                            </svg>
+                        </span>
+                        <span class="review-pill-label">Test Results</span>
+                    </button>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- ── Boot Splash (shown until QBench login finishes) ─────────── -->
+    <div id="boot-splash" class="modal no-scrim hidden">
+        <div class="modal-content" style="text-align:center; min-width:460px;">
+            <h2>COA Reviewer</h2>
+            <p id="boot-msg" style="color:#666; margin:16px 0;">Logging in to QBench...</p>
+            <div class="spinner"></div>
+            <div id="boot-status-log" class="boot-status-log"></div>
+            <div id="boot-slow-notice" class="hidden" style="margin-top:16px;">
+                <p style="color:var(--text-muted);font-size:12px;margin-bottom:8px;">Taking longer than expected.</p>
+                <button id="boot-show-login" class="btn btn-sm">Enter Credentials Manually</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Session Timeout Overlay ──────────────────────────────────── -->
+    <div id="timeout-overlay" class="modal hidden">
+        <div class="modal-content">
+            <h2>&#9679; Session Timeout</h2>
+            <p class="timeout-msg">For your own safety, you have been logged out due to inactivity.</p>
+            <p class="timeout-user">Signed in as: <strong id="timeout-user-display"></strong></p>
+            <!-- Mirrors the login screen: tap back in, or type the same
+                 LabLink password. The account is fixed to whoever owns this
+                 session — a different user has to sign out, not take over. -->
+            <p class="portal-card-hint">Tap your LabLink card, or enter your LabLink password.</p>
+            <input type="password" id="reauth-card-input" class="portal-card-input"
+                   autocomplete="off" aria-label="Keycard scan">
+            <label>LabLink Password:</label>
+            <input type="password" id="reauth-password" placeholder="Enter password to log back in" autocomplete="current-password">
+            <div class="modal-buttons">
+                <button id="reauth-btn" class="btn btn-primary">Log Back In</button>
+            </div>
+            <div id="reauth-error" class="error-text"></div>
+        </div>
+    </div>
+
+    <!-- ── QBench Login Modal ────────────────────────────────────────── -->
+    <div id="login-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2>QBench Login</h2>
+            <label>Username (email):</label>
+            <input type="email" id="login-username" placeholder="user@example.com" autocomplete="username">
+            <label>Password:</label>
+            <input type="password" id="login-password" placeholder="Password" autocomplete="current-password">
+            <label class="checkbox-label">
+                <input type="checkbox" id="login-save" checked> Save credentials
+            </label>
+            <div class="modal-buttons">
+                <button id="login-btn" class="btn btn-primary">Login & Start</button>
+            </div>
+            <div id="login-error" class="error-text"></div>
+        </div>
+    </div>
+
+    <!-- ── Flag Modal — creates a Command Center listing ─────────────── -->
+    <!-- Field set mirrors LabVision's "New listing" form. The type/status/
+         department values are LabCore's enums (CC_TASK_TYPES,
+         CC_TASK_STATUSES, CC_DEPTS) — a value outside those sets is silently
+         coerced to a default by LabCore's writer. -->
+    <div id="cc-modal" class="modal hidden">
+        <div class="modal-content cc-modal-content">
+            <h2 id="cc-title">Flag Sample — Command Center</h2>
+
+            <h4 class="cc-section">What is it?</h4>
+            <label for="cc-problem">Describe the problem <span class="cc-req">*</span></label>
+            <textarea id="cc-problem" rows="3" placeholder="e.g. Potency reads low — customer disputes result"></textarea>
+
+            <label for="cc-type">Type</label>
+            <select id="cc-type" class="cc-input">
+                <option value="double_check" selected>Double Check</option>
+                <option value="customer_clarification">Customer Clarification</option>
+                <option value="maintenance">Maintenance</option>
+                <option value="other">Other</option>
+            </select>
+
+            <label for="cc-context">Context / notes (optional)</label>
+            <textarea id="cc-context" rows="2" placeholder="Anything the person picking this up should know…"></textarea>
+
+            <h4 class="cc-section">Who / which samples?</h4>
+            <label for="cc-customer">Customer</label>
+            <input type="text" id="cc-customer" class="cc-input" list="cc-customer-options" autocomplete="off" placeholder="Pick or type a customer…">
+            <datalist id="cc-customer-options"></datalist>
+
+            <label for="cc-sample-input">Samples</label>
+            <input type="text" id="cc-sample-input" class="cc-input" autocomplete="off" placeholder="Add another lab ID, then press Enter">
+            <div id="cc-samples" class="cc-chips"></div>
+
+            <h4 class="cc-section">Board placement</h4>
+            <label for="cc-status">Starting status</label>
+            <select id="cc-status" class="cc-input">
+                <option value="open" selected>Open</option>
+                <option value="in_progress">In Progress</option>
+                <option value="waiting">Waiting</option>
+                <option value="urgent">URGENT</option>
+                <option value="ready_to_release">Ready to Release</option>
+            </select>
+
+            <label for="cc-department">Department (optional)</label>
+            <select id="cc-department" class="cc-input">
+                <option value="">—</option>
+                <option value="Office">Office</option>
+                <option value="Lab">Lab</option>
+                <option value="Admin">Admin</option>
+                <option value="Shipping">Shipping</option>
+                <option value="Other">Other</option>
+            </select>
+
+            <div id="cc-error" class="error-text"></div>
+            <div class="modal-buttons">
+                <button id="cc-cancel" class="btn">Cancel</button>
+                <button id="cc-submit" class="btn btn-danger">Flag as Bad</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Conflict Modal — sample already has an active listing ─────── -->
+    <div id="cc-conflict-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2>Already on the board</h2>
+            <p class="cc-modal-msg">This sample is already covered by an active Command Center listing.</p>
+            <div id="cc-conflict-list" class="cc-listing-list"></div>
+            <div class="modal-buttons">
+                <button id="cc-conflict-cancel" class="btn">Back out</button>
+                <button id="cc-conflict-create" class="btn btn-danger">Create a separate listing</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Resolve Modal — marking Good / un-marking a listed sample ─── -->
+    <div id="cc-resolve-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2 id="cc-resolve-title">This sample has an open listing</h2>
+            <div id="cc-resolve-list" class="cc-listing-list"></div>
+            <label for="cc-resolve-notes">Final result / finding (required to complete)</label>
+            <textarea id="cc-resolve-notes" rows="3" placeholder="What was the outcome?"></textarea>
+            <div id="cc-resolve-error" class="error-text"></div>
+            <div class="modal-buttons">
+                <button id="cc-resolve-back" class="btn">Back out</button>
+                <button id="cc-resolve-continue" class="btn">Continue anyway</button>
+                <button id="cc-resolve-complete" class="btn btn-primary">Complete the listing</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Export Modal ──────────────────────────────────────────────── -->
+    <div id="export-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2>Export Options</h2>
+            <div id="export-tabs-list"></div>
+            <label class="checkbox-label">
+                <input type="checkbox" id="export-links" checked> Include QBench links for Good samples
+            </label>
+            <div class="modal-buttons">
+                <button id="export-cancel" class="btn">Cancel</button>
+                <button id="export-ok" class="btn btn-primary">Export</button>
+            </div>
+            <div id="export-result" class="hidden">
+                <p id="export-filename"></p>
+                <div id="export-links-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Field Visibility Settings Modal ──────────────────────────── -->
+    <div id="field-settings-modal" class="modal hidden">
+        <div class="modal-content field-settings-content">
+            <h2>Sample Info fields</h2>
+            <p class="field-settings-msg">Choose which fields appear in the Sample Info (SIF) panel.
+               Applies to <strong>all reviewers</strong> and is saved on the server.</p>
+            <div id="field-settings-list" class="field-settings-list"></div>
+            <label class="checkbox-label field-settings-extras">
+                <input type="checkbox" id="field-settings-extras">
+                Show other QBench fields (auto-discovered)
+            </label>
+            <div id="field-settings-error" class="error-text"></div>
+            <div class="modal-buttons">
+                <button id="field-settings-cancel" class="btn">Cancel</button>
+                <button id="field-settings-save" class="btn btn-primary">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Restart Server Confirm Modal ─────────────────────────────── -->
+    <div id="restart-confirm-modal" class="modal hidden">
+        <div class="modal-content restart-confirm-content">
+            <div class="restart-confirm-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 12a9 9 0 1 1-3.5-7.1"/>
+                    <polyline points="21 4 21 10 15 10"/>
+                </svg>
+            </div>
+            <h2>Restart application?</h2>
+            <p class="restart-confirm-msg">All open sessions will be briefly disconnected. The page will reload automatically when the application is ready.</p>
+            <dl class="restart-stats">
+                <div>
+                    <dt>Uptime</dt>
+                    <dd id="restart-uptime">—</dd>
+                </div>
+                <div>
+                    <dt>Active users</dt>
+                    <dd id="restart-active-users">—</dd>
+                </div>
+            </dl>
+            <div class="modal-buttons">
+                <button id="restart-cancel" class="btn">Cancel</button>
+                <button id="restart-confirm-ok" class="btn btn-danger">Restart Application</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Good Samples Modal ───────────────────────────────────────── -->
+    <div id="good-modal" class="modal hidden">
+        <div class="modal-content">
+            <h2>Open Good Samples in QBench</h2>
+            <p style="font-size:12px;color:#666;margin-bottom:12px;">Select which tabs to include, then open the QBench filter link.</p>
+            <div id="good-tabs-list"></div>
+            <div id="good-links-result" class="hidden" style="margin-top:12px;"></div>
+            <div class="modal-buttons">
+                <button id="good-modal-cancel" class="btn">Close</button>
+                <button id="good-modal-open" class="btn btn-primary">Open in QBench</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Sync Data — Lab Vision sample info → QBench ──────────────── -->
+    <div id="sync-modal" class="modal hidden">
+        <div class="modal-content sync-modal-content">
+            <h2 id="sync-title">Sync Lab Vision Data</h2>
+            <p class="sync-hint">
+                Drag a <strong>Lab Vision</strong> field onto the
+                <strong>QBench</strong> field it belongs in, then tick what to send.
+                Obvious matches are paired already. A QBench field that already holds
+                a different value is highlighted and left unticked — replacing it has
+                to be deliberate. Drag a card back to the left to unpair it.
+            </p>
+            <div id="sync-warning" class="sync-warning hidden"></div>
+            <div class="sync-board">
+                <div class="sync-col">
+                    <div class="sync-col-head">Lab Vision</div>
+                    <div id="sync-lv-col" class="sync-col-body"></div>
+                </div>
+                <div class="sync-col">
+                    <div class="sync-col-head">QBench</div>
+                    <div id="sync-qb-col" class="sync-col-body"></div>
+                </div>
+            </div>
+            <div id="sync-error" class="error-text"></div>
+            <div class="modal-buttons">
+                <button id="sync-cancel" class="btn">Cancel</button>
+                <button id="sync-apply" class="btn btn-primary">Sync &amp; Regenerate</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Sample list right-click menu ─────────────────────────────── -->
+    <div id="sample-context-menu" class="ctx-menu hidden" role="menu">
+        <button id="ctx-regenerate" class="ctx-item" role="menuitem">Regenerate selected</button>
+        <button id="ctx-group-cc" class="ctx-item" role="menuitem">Group into one Command Center listing…</button>
+        <div class="ctx-sep" role="separator"></div>
+        <button id="ctx-clear" class="ctx-item ctx-item--muted" role="menuitem">Clear selection</button>
+    </div>
+
+    <!-- ── Main Layout ──────────────────────────────────────────────── -->
+    <div id="app" class="hidden">
+        <!-- Top Bar -->
+        <!-- Shown when LabCore/Command Center can't be reached. Flagging a
+             sample fails loudly in that state rather than silently dropping. -->
+        <div id="cc-banner" class="cc-banner hidden">
+            Command Center (LabCore) is unreachable — flagging and Re-review are unavailable.
+        </div>
+
+        <div class="top-bar">
+            <div class="tb-group tb-group--primary">
+                <button id="start-btn" class="btn btn-primary">Start Pulling from QBench</button>
+                <span id="status-label" class="status-label">Ready</span>
+            </div>
+
+            <div class="tb-group tb-group--actions">
+                <!-- Checkboxes, not a three-way slider: the slider could not
+                     express e.g. COA + Lab Vision without the SIF. -->
+                <div class="view-toggle" role="group" aria-label="Visible panes">
+                    <label class="view-check"><input type="checkbox" id="view-coa" checked> COA</label>
+                    <label class="view-check"><input type="checkbox" id="view-sif" checked> SIF</label>
+                    <label class="view-check"><input type="checkbox" id="view-labvision"> Lab Vision</label>
+                </div>
+                <button id="good-links-btn" class="btn btn-good-links" disabled>Good Samples</button>
+                <button id="export-btn" class="btn" disabled>Export CSV</button>
+            </div>
+
+            <span class="tb-divider" aria-hidden="true"></span>
+
+            <div class="tb-group tb-group--utility">
+                <button id="change-mode-btn" class="btn" title="Change checking mode" aria-label="Change checking mode">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polyline points="1 4 1 10 7 10"/>
+                        <polyline points="23 20 23 14 17 14"/>
+                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                    </svg>
+                    Switch
+                </button>
+                <button id="dark-toggle" class="btn">Dark</button>
+                <button id="restart-btn" class="btn btn-restart" title="Restart application" aria-label="Restart application">&#x21bb;</button>
+                <span id="user-display" class="user-display"></span>
+                <button id="portal-logout-btn" class="btn btn-signout">Sign Out</button>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Left Panel -->
+            <div class="left-panel">
+                <!-- Tab Buttons Row 1 — `data-show-mode` gates per-mode
+                     visibility (CSS handles the show/hide). Tabs without
+                     the attribute are shared by both modes. -->
+                <div class="tab-row">
+                    <button class="tab-btn" data-tab="Intaked" data-show-mode="info">Intaked</button>
+                    <button class="tab-btn" data-tab="Yesterday">Yesterday</button>
+                    <button class="tab-btn" data-tab="Due Out">Due Out</button>
+                    <button class="tab-btn" data-tab="Re-review" data-show-mode="tests">Re-review</button>
+                </div>
+                <!-- Tab Buttons Row 2 -->
+                <div class="tab-row">
+                    <button class="tab-btn" data-tab="Search">Search</button>
+                    <button class="tab-btn" data-tab="Custom Day">Custom Day</button>
+                </div>
+
+                <!-- Search Bar -->
+                <div id="search-bar" class="input-bar hidden">
+                    <input type="text" id="search-input" placeholder="Lab ID, range (32217-32222), or comma-separated...">
+                    <button id="search-btn" class="btn btn-sm">Search</button>
+                </div>
+
+                <!-- Custom Day Bar -->
+                <div id="custom-day-bar" class="input-bar hidden">
+                    <input type="date" id="custom-date">
+                    <button id="custom-load-btn" class="btn btn-sm">Load</button>
+                </div>
+
+                <!-- Sample Count -->
+                <div id="sample-count" class="sample-count">0 samples</div>
+
+                <!-- Sample List -->
+                <div id="sample-list" class="sample-list"></div>
+
+                <!-- Action Buttons -->
+                <div class="action-buttons">
+                    <button id="bad-btn" class="btn btn-bad" disabled>&#8592; Bad</button>
+                    <button id="good-btn" class="btn btn-good" disabled>Good &#8594;</button>
+                </div>
+                <div class="action-buttons action-buttons--secondary">
+                    <button id="uncheck-btn" class="btn btn-sm" disabled title="Clear this sample's Good/Bad mark">Uncheck</button>
+                    <button id="regen-pending-btn" class="btn btn-sm" disabled title="Re-render every unmarked sample on this tab">Regenerate Pending</button>
+                </div>
+
+                <div class="hotkey-legend">
+                    Tab: switch | Up/Down: navigate | Left: bad | Right: good | U: uncheck
+                </div>
+            </div>
+
+            <!-- Center Panel -->
+            <div class="center-panel">
+                <!-- Re-review Info Banner -->
+                <div id="rr-info" class="rr-info hidden"></div>
+
+                <!-- PDF Viewer (split: COA + SIF) -->
+                <div id="pdf-area" class="pdf-area">
+                    <div id="pdf-placeholder" class="placeholder" style="display:flex;">
+                        Select a sample from the list to view its COA.
+                    </div>
+                    <div id="coa-pane" class="pdf-pane" style="display:none;">
+                        <div class="pane-label">COA Preview</div>
+                        <iframe id="pdf-viewer" title="COA Preview"></iframe>
+                    </div>
+                    <!-- Right half: SIF on top, Lab Vision beneath it. With
+                         COA on the left that makes each a quarter of the area. -->
+                    <div id="side-panes" style="display:none;">
+                        <div id="sif-pane" class="pdf-pane" style="display:none;">
+                            <div class="pane-label">SIF <span id="sif-page-badge" class="sif-badge"></span></div>
+                            <iframe id="sif-viewer" title="SIF Document"></iframe>
+                            <div id="sif-placeholder" class="sif-placeholder" style="display:none;">SIF loading...</div>
+                        </div>
+                        <div id="labvision-pane" class="pdf-pane" style="display:none;">
+                            <div class="pane-label" id="labvision-label">Lab Vision Data</div>
+                            <div id="labvision-content" class="labvision-content">
+                                <div class="labvision-empty">Select a sample.</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sample Info -->
+                <div class="bottom-bar">
+                    <span id="sample-info"></span>
+                    <div>
+                        <button id="download-btn" class="btn btn-sm" disabled>&#8615; Download</button>
+                        <button id="open-browser-btn" class="btn btn-sm" disabled>Open in Browser</button>
+                        <button id="open-qbench-btn" class="btn btn-sm" disabled>Open in QBench</button>
+                        <button id="open-labvision-btn" class="btn btn-sm" disabled>Open in Lab Vision</button>
+                        <button id="sync-data-btn" class="btn btn-sm" disabled title="Sync Lab Vision sample information into QBench">Sync Data</button>
+                        <button id="regen-btn" class="btn btn-sm" disabled>Regenerate</button>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- Right Panel -->
+            <div class="right-panel">
+                <div class="panel-section">
+                    <div class="panel-header">
+                        <span>Attachments</span>
+                        <button id="att-refresh-btn" class="btn btn-icon" title="Refresh">&#8634;</button>
+                    </div>
+                    <div id="att-list" class="item-list">
+                        <div class="placeholder-item">Select a sample</div>
+                    </div>
+                    <button id="att-delete-btn" class="btn btn-sm btn-danger" disabled>Delete Selected</button>
+                </div>
+
+                <hr class="divider">
+
+                <div class="panel-section">
+                    <div class="panel-header">
+                        <span>Comments</span>
+                        <div>
+                            <button id="comment-edit-btn" class="btn btn-icon" title="Edit" disabled>&#9998;</button>
+                            <button id="comment-save-btn" class="btn btn-icon hidden" title="Save">&#10003;</button>
+                            <button id="comment-cancel-btn" class="btn btn-icon hidden" title="Cancel">&#10007;</button>
+                        </div>
+                    </div>
+                    <div id="comments-display" class="comments-area">
+                        <span class="placeholder-item">Select a sample</span>
+                    </div>
+                    <textarea id="comments-editor" class="comments-editor hidden" rows="4" placeholder="Enter comments..."></textarea>
+                </div>
+
+                <hr class="divider">
+
+                <!-- Test Editor — visible only in Tests mode -->
+                <div id="test-editor" class="test-editor" data-show-mode="tests">
+                    <div class="test-editor-header">
+                        <span class="test-editor-title">Test Results</span>
+                        <span id="test-editor-status" class="test-editor-status"></span>
+                    </div>
+                    <div id="test-table-wrapper" class="test-table-wrapper">
+                        <table id="test-table">
+                            <thead>
+                                <tr>
+                                    <th>Test Name</th>
+                                    <th>Result</th>
+                                </tr>
+                            </thead>
+                            <tbody id="test-table-body">
+                                <tr><td colspan="2" class="placeholder-cell">Select a sample to view tests</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Sample Info Editor — visible only in Info mode. Renders
+                     sample-level fields (editable, save on Enter) plus the
+                     overall testing package (panels). -->
+                <div id="info-editor" class="info-editor" data-show-mode="info">
+                    <div class="info-editor-header">
+                        <span class="info-editor-title">Sample Info (SIF)</span>
+                        <button id="field-settings-btn" class="field-settings-btn"
+                                title="Choose visible fields" aria-label="Choose visible fields">
+                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <circle cx="12" cy="12" r="3"/>
+                                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                            </svg>
+                        </button>
+                        <span id="info-editor-status" class="info-editor-status"></span>
+                    </div>
+                    <div id="info-editor-fields" class="info-editor-fields">
+                        <p class="info-editor-placeholder">Select a sample to view fields</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

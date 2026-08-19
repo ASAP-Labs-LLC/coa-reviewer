@@ -1,0 +1,14 @@
+lab_id,sample_id,tab,outcome,reason,date
+032326-31720,35291,Due Out,Good,,2026-03-26
+032326-31719,35290,Due Out,Good,,2026-03-26
+032326-31718,35289,Due Out,Good,,2026-03-26
+032326-31717,35288,Due Out,Good,,2026-03-26
+032326-31716,35287,Due Out,Good,,2026-03-26
+032326-31715,35286,Due Out,Good,,2026-03-26
+032326-31714,35285,Due Out,Good,,2026-03-26
+032326-31713,35284,Due Out,Good,,2026-03-26
+032326-31712,35283,Due Out,Good,,2026-03-26
+032326-31711,35282,Due Out,Good,,2026-03-26
+
+QBench Good Samples View:
+https://asaplabs.qbench.net/tests?sample_ids=35291&sample_ids=35290&sample_ids=35289&sample_ids=35288&sample_ids=35287&sample_ids=35286&sample_ids=35285&sample_ids=35284&sample_ids=35283&sample_ids=35282&sort_order=DESC&view_config_id=17&page_size=700
