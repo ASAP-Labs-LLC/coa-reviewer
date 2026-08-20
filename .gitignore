@@ -55,3 +55,10 @@ service_account*.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local state and credentials - NEVER COMMIT
+# Copy web_app_config.default.json -> web_app_config.json and fill it in.
+web_app_config.json
+re_review_state.json
+login.log
+install.log
