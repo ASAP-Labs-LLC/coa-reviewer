@@ -15,6 +15,20 @@ constants (``CONFIG_FILE``, ``RE_REVIEW_STATE_FILE``) to point inside a
 
 from __future__ import annotations
 
+# QBench credentials come from a local store (see qbench_secrets). Point that
+# store at a throwaway file with dummy values BEFORE anything imports ``app``,
+# which builds an AppState -> QBenchAPIClient at module scope. Without this the
+# suite would either fail on an unconfigured machine or, worse, pick up a
+# developer's real credentials.
+import json as _json
+import os as _os
+import tempfile as _tempfile
+
+_store = _os.path.join(_tempfile.mkdtemp(prefix="qbench-test-store-"), "qbench.json")
+with open(_store, "w", encoding="utf-8") as _fh:
+    _json.dump({"client_id": "test-client-id", "client_secret": "test-client-secret"}, _fh)
+_os.environ.setdefault("QBENCH_STORE_PATH", _store)
+
 import socket
 import sys
 import threading

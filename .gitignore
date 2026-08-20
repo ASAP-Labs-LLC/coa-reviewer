@@ -62,3 +62,7 @@ web_app_config.json
 re_review_state.json
 login.log
 install.log
+
+# QBench credential store (must live outside the repo)
+qbench.json
+.env
