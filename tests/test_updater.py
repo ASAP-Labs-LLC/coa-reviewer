@@ -234,6 +234,82 @@ def test_write_staged_is_atomic(tmp_path):
     assert json.loads((tmp_path / "staged.json").read_text(encoding="utf-8"))["tag"] == "v1.0.1"
 
 
+# ── supervision ─────────────────────────────────────────────────────────────
+
+class TestSupervisionDecision:
+    """Something has to restart an app that exits on its own.
+
+    COA does this by design: ``_auto_restart_worker`` calls ``os._exit(0)`` at
+    3 AM to refresh long-lived Playwright and QBench tokens, and ``/api/restart``
+    does the same when a reviewer clicks Restart. Under the shared-drive setup
+    ``Run.pyw`` respawned it — that is the 03:00 line in launcher.log. The
+    deployed layout has no Run.pyw, so without this the app would exit at 3 AM
+    and simply never come back, and a reviewer clicking Restart would end the
+    service for the day.
+
+    The updater is already a loop that knows each app's port and how to start
+    it, so it supervises. What it must *not* do is what Run.pyw did wrong:
+    restart blindly, forever, with no way for a human to hold it down.
+    """
+
+    def test_running_app_is_left_alone(self):
+        assert updater.supervision_decision(
+            has_listener=True, paused=False, starts_in_window=0, max_starts=3
+        ) == updater.SUPERVISE_OK
+
+    def test_dead_app_is_started(self):
+        assert updater.supervision_decision(
+            has_listener=False, paused=False, starts_in_window=0, max_starts=3
+        ) == updater.SUPERVISE_START
+
+    def test_paused_app_is_never_started(self):
+        """A human taking an app down deliberately must stay down. Without
+        this, stopping an app for maintenance means fighting the updater."""
+        assert updater.supervision_decision(
+            has_listener=False, paused=True, starts_in_window=0, max_starts=3
+        ) == updater.SUPERVISE_PAUSED
+
+    def test_paused_beats_running(self):
+        """Pause is about intent, not current state — it must not silently
+        expire the moment the app happens to be up."""
+        assert updater.supervision_decision(
+            has_listener=True, paused=True, starts_in_window=0, max_starts=3
+        ) == updater.SUPERVISE_PAUSED
+
+    def test_a_crashlooping_app_is_given_up_on(self):
+        """Restarting forever turns a crash into a silent 100%-CPU spin and
+        hides the failure. Stop, and say so."""
+        assert updater.supervision_decision(
+            has_listener=False, paused=False, starts_in_window=3, max_starts=3
+        ) == updater.SUPERVISE_GIVING_UP
+
+    def test_the_storm_guard_allows_the_expected_daily_restart(self):
+        """COA's 3 AM exit is one restart a day; that must not look like a
+        crashloop."""
+        assert updater.supervision_decision(
+            has_listener=False, paused=False, starts_in_window=1, max_starts=3
+        ) == updater.SUPERVISE_START
+
+
+class TestPauseMarker:
+    def test_absent_marker_is_not_paused(self, tmp_path):
+        assert updater.is_paused(tmp_path) is False
+
+    def test_present_marker_is_paused(self, tmp_path):
+        (tmp_path / "paused").write_text("down for maintenance", encoding="utf-8")
+        assert updater.is_paused(tmp_path) is True
+
+
+class TestStartWindow:
+    def test_counts_only_starts_inside_the_window(self):
+        # now = 1000, window = 900s
+        starts = [50, 90, 150, 995]
+        assert updater.starts_within(starts, now=1000.0, window=900.0) == 2
+
+    def test_empty_history_is_zero(self):
+        assert updater.starts_within([], now=1000.0, window=900.0) == 0
+
+
 # ── per-app launch arguments ────────────────────────────────────────────────
 
 def _app(**cfg):

@@ -66,7 +66,20 @@ from typing import Any, Iterable, Optional, Sequence
 SLEEP = "sleep"
 STAGE = "stage"
 
+# Supervision outcomes.
+SUPERVISE_OK = "ok"
+SUPERVISE_START = "start"
+SUPERVISE_PAUSED = "paused"
+SUPERVISE_GIVING_UP = "giving_up"
+
+# A crashlooping app must not be restarted forever: that turns a crash into a
+# silent spin and hides the failure. Three starts in fifteen minutes is well
+# clear of COA's one deliberate restart a day.
+SUPERVISE_MAX_STARTS = 3
+SUPERVISE_WINDOW_SECONDS = 900.0
+
 DEFAULT_POLL_SECONDS = 300
+DEFAULT_SUPERVISE_SECONDS = 20
 DEFAULT_KEEP = 5
 HEALTH_TIMEOUT = 60.0
 
@@ -185,6 +198,45 @@ def may_switch(*, staged: Optional[dict], requested_tag: str) -> tuple[bool, str
             f"{staged.get('notes') or 'no detail'}"
         )
     return True, ""
+
+
+def supervision_decision(*, has_listener: bool, paused: bool,
+                         starts_in_window: int, max_starts: int) -> str:
+    """Whether to (re)start an app this cycle.
+
+    ``paused`` is checked first and regardless of whether the app is up: pause
+    records a human's intent to keep it down, and intent that expires the
+    moment the app happens to be running is not a pause at all.
+    """
+    if paused:
+        return SUPERVISE_PAUSED
+    if has_listener:
+        return SUPERVISE_OK
+    if starts_in_window >= max_starts:
+        return SUPERVISE_GIVING_UP
+    return SUPERVISE_START
+
+
+def is_paused(data_dir: Path | str) -> bool:
+    """Whether the app should be left down.
+
+    ``<data>\\paused`` is a human's hold — Run.pyw's failure mode was that
+    there was no way to stop the app without fighting the supervisor.
+
+    ``<data>\\switching`` is held for the moments a switch has the app stopped.
+    Without it, a ``switch`` run from the command line while the service loop
+    is running would race it: the loop sees no listener, decides the app has
+    died, and starts the *old* release from under the junction that is being
+    repointed. Two markers rather than one, so a switch cannot clear a hold a
+    person put there.
+    """
+    d = Path(data_dir)
+    return (d / "paused").exists() or (d / "switching").exists()
+
+
+def starts_within(starts: Sequence[float], *, now: float, window: float) -> int:
+    """How many of ``starts`` (monotonic timestamps) fall inside ``window``."""
+    return sum(1 for t in starts if now - t <= window)
 
 
 def releases_to_prune(names_newest_first: Sequence[str], *, keep: int,
@@ -800,9 +852,10 @@ def switch(app: App, tag: str, *, force: bool = False) -> bool:
         return False
 
     log.info("[%s] switching %s -> %s", app.name, previous, tag)
-    _stop_app(app)
-    repoint_junction(app.current, target)
-    _start_app(app)
+    with _switch_guard(app):
+        _stop_app(app)
+        repoint_junction(app.current, target)
+        _start_app(app)
 
     healthy, notes = _verify_live(app, expected=tag)
     if healthy:
@@ -832,6 +885,25 @@ def switch(app: App, tag: str, *, force: bool = False) -> bool:
         log.critical("[%s] rollback to %s is also unhealthy: %s",
                      app.name, previous, back_notes)
     return False
+
+
+class _switch_guard:
+    """Hold off supervision while a switch has the app deliberately stopped."""
+
+    def __init__(self, app: App) -> None:
+        self.marker = Path(app.data_dir) / "switching"
+
+    def __enter__(self):
+        self.marker.parent.mkdir(parents=True, exist_ok=True)
+        self.marker.write_text("switch in progress", encoding="utf-8")
+        return self
+
+    def __exit__(self, *exc):
+        # Always cleared, including on failure: a stale marker would leave the
+        # app unsupervised for as long as it sat there, which is exactly when
+        # supervision is most needed.
+        self.marker.unlink(missing_ok=True)
+        return False
 
 
 def rollback(app: App) -> bool:
@@ -913,6 +985,67 @@ def prune(app: App, *, protected: Iterable[str] = ()) -> None:
 
 # ── service ─────────────────────────────────────────────────────────────────
 
+_START_HISTORY: dict = {}
+
+
+def supervise(app: App) -> str:
+    """Restart ``app`` if it has stopped serving.
+
+    COA exits on purpose — ``_auto_restart_worker`` at 3 AM to refresh
+    long-lived Playwright and QBench tokens, and ``/api/restart`` when a
+    reviewer clicks Restart. Run.pyw used to respawn it; the deployed layout
+    has no Run.pyw, so without this COA would exit at 3 AM and never return,
+    and a reviewer clicking Restart would end the service for the day.
+
+    Probing is by connecting, never by binding: on Windows ``SO_REUSEADDR``
+    lets a bind succeed against a port that is already being served, which is
+    how the 2026-07-31 inert-duplicate incident happened.
+    """
+    if not app.port:
+        return SUPERVISE_OK
+
+    sup = _load_supervisor()
+    has_listener = (sup.port_has_listener(app.port) if sup
+                    else bool(_pids_on_port(app.port)))
+
+    history = _START_HISTORY.setdefault(app.name, [])
+    now = time.monotonic()
+    decision = supervision_decision(
+        has_listener=has_listener,
+        paused=is_paused(app.data_dir),
+        starts_in_window=starts_within(history, now=now,
+                                       window=SUPERVISE_WINDOW_SECONDS),
+        max_starts=SUPERVISE_MAX_STARTS,
+    )
+
+    if decision == SUPERVISE_START:
+        log.warning("[%s] not serving on port %s — starting it", app.name, app.port)
+        history.append(now)
+        history[:] = [t for t in history if now - t <= SUPERVISE_WINDOW_SECONDS]
+        try:
+            _start_app(app)
+        except Exception:
+            log.exception("[%s] failed to start", app.name)
+            return decision
+        if sup and sup.wait_until_serving(app.port, timeout=60.0):
+            log.info("[%s] back up on port %s", app.name, app.port)
+        else:
+            log.error("[%s] started but nothing is serving port %s yet",
+                      app.name, app.port)
+    elif decision == SUPERVISE_GIVING_UP:
+        log.critical(
+            "[%s] has failed to stay up after %d starts in %.0f minutes — not "
+            "restarting again. Something is wrong with the release; check "
+            "%s\\app.log. Clear the condition and it will be picked up on the "
+            "next poll.",
+            app.name, SUPERVISE_MAX_STARTS, SUPERVISE_WINDOW_SECONDS / 60,
+            app.data_dir)
+    elif decision == SUPERVISE_PAUSED and not has_listener:
+        log.info("[%s] down and paused (%s\\paused) — leaving it alone",
+                 app.name, app.data_dir)
+    return decision
+
+
 def poll_once(app: App, token: Optional[str]) -> str:
     release = latest_release(app.repo, token)
     latest = release.get("tag_name") if release else None
@@ -958,7 +1091,8 @@ def setup_logging(log_path: Path, verbose: bool = False) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     here = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description="ASAP Labs deployment updater")
-    ap.add_argument("command", choices=["run", "poll", "status", "switch", "rollback"])
+    ap.add_argument("command", choices=["run", "poll", "status", "switch",
+                                        "rollback", "pause", "resume", "start"])
     ap.add_argument("--config", default=str(here / "config.json"))
     ap.add_argument("--app")
     ap.add_argument("--tag")
@@ -985,12 +1119,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     if args.command == "status":
+        sup = _load_supervisor()
         for a in chosen:
             s = read_staged(a.data_dir) or {}
-            print(f"{a.name}: current={a.current_version()} "
+            if a.port:
+                up = (sup.port_has_listener(a.port) if sup
+                      else bool(_pids_on_port(a.port)))
+                serving = f"SERVING on {a.port}" if up else f"DOWN (port {a.port})"
+            else:
+                serving = "no port configured"
+            held = " [PAUSED]" if (Path(a.data_dir) / "paused").exists() else ""
+            print(f"{a.name}: {serving}{held}  current={a.current_version()} "
                   f"junction->{a.current_target_name()} "
-                  f"staged={s.get('tag')} healthy={s.get('healthy')} "
-                  f"notes={s.get('notes')}")
+                  f"staged={s.get('tag')} healthy={s.get('healthy')}")
+            if s.get("notes"):
+                print(f"    notes: {s.get('notes')}")
+        return 0
+
+    if args.command in ("pause", "resume"):
+        for a in chosen:
+            marker = Path(a.data_dir) / "paused"
+            if args.command == "pause":
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("paused by hand", encoding="utf-8")
+                print(f"{a.name}: paused — the updater will not restart it. "
+                      f"Stop it yourself if it is still running.")
+            else:
+                marker.unlink(missing_ok=True)
+                print(f"{a.name}: resumed — it will be started within one poll.")
+        return 0
+
+    if args.command == "start":
+        for a in chosen:
+            if (Path(a.data_dir) / "paused").exists():
+                print(f"{a.name}: is paused; run `resume` first", file=sys.stderr)
+                continue
+            print(f"{a.name}: {supervise(a)}")
         return 0
 
     if args.command == "switch":
@@ -1012,14 +1176,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     interval = int(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS))
-    log.info("updater started; polling every %ss", interval)
+    supervise_interval = int(cfg.get("supervise_seconds", DEFAULT_SUPERVISE_SECONDS))
+    # Deliberately decoupled. Checking GitHub is a network call and every five
+    # minutes is plenty; noticing that an app has stopped serving is a local
+    # port probe costing nothing. Tying them together would mean a reviewer who
+    # clicks Restart waits up to a full release-poll for the app to come back.
+    log.info("updater started; release check every %ss, supervision every %ss",
+             interval, supervise_interval)
+    next_release_check = 0.0
     while True:
+        now = time.monotonic()
         for a in chosen:
+            # Supervision first, and in its own try: keeping the lab's apps up
+            # matters more than checking GitHub, and a release-check failure
+            # must not stop a dead app from being restarted.
             try:
-                poll_once(a, token)
+                supervise(a)
             except Exception:
-                log.exception("[%s] unhandled error in poll cycle", a.name)
-        time.sleep(interval)
+                log.exception("[%s] unhandled error while supervising", a.name)
+
+        if now >= next_release_check:
+            for a in chosen:
+                try:
+                    poll_once(a, token)
+                except Exception:
+                    log.exception("[%s] unhandled error in poll cycle", a.name)
+            next_release_check = time.monotonic() + interval
+
+        time.sleep(supervise_interval)
 
 
 if __name__ == "__main__":
