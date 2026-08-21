@@ -1,0 +1,25 @@
+{
+  "_comment": "Copy to config.json next to updater.py and edit. The GitHub token is NOT here on purpose - it lives in Windows Credential Manager under the name in credential_target, so it cannot end up in a backup, a screenshot, or a repo.",
+
+  "poll_seconds": 300,
+  "credential_target": "asaplabs-github",
+  "log_file": "C:\\ASAPApps\\updater\\updater.log",
+
+  "_playwright": "One machine-wide browser cache. Without this, the updater running as a scheduled task under a different account gets its own 655 MB copy, and the first COA render after a deploy pays for the download.",
+  "playwright_browsers_path": "C:\\ASAPApps\\browsers",
+
+  "keep_releases": 5,
+
+  "apps": [
+    {
+      "name": "coa",
+      "repo": "ASAP-Labs-LLC/coa-reviewer",
+      "root": "C:\\ASAPApps\\coa",
+      "port": 5559,
+      "scratch_port": 15559,
+      "entry": "app.py",
+      "data_env": "COA_DATA_DIR",
+      "keep_releases": 5
+    }
+  ]
+}
