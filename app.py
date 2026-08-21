@@ -562,12 +562,35 @@ def save_re_review_state(state_data: Dict[str, dict]) -> None:
 # Sample Info (SIF) panel should hide; `show_extra_fields` gates the
 # auto-discovered QBench fields appended after the known 22.
 
-FIELD_SETTINGS_FILE = APP_DIR / "field_settings.json"
+# State, not config: /api/field-settings writes this at runtime when a reviewer
+# hides a column, so it belongs in DATA_DIR. Bound to APP_DIR it would ship
+# inside the release and be silently reverted to the shipped copy on the next
+# deploy — the reviewer's setting would vanish with no error anywhere.
+FIELD_SETTINGS_FILE = DATA_DIR / "field_settings.json"
+FIELD_SETTINGS_TEMPLATE = APP_DIR / "field_settings.json"
 
 DEFAULT_FIELD_SETTINGS: Dict[str, Any] = {
     "sample_info_hidden": [],
     "show_extra_fields": True,
 }
+
+
+def _seed_field_settings_if_absent() -> None:
+    """Copy the shipped field settings into DATA_DIR on first boot only.
+
+    No-op when DATA_DIR is APP_DIR (template and target are the same file).
+    """
+    if FIELD_SETTINGS_FILE.exists() or not FIELD_SETTINGS_TEMPLATE.is_file():
+        return
+    if FIELD_SETTINGS_TEMPLATE.resolve() == FIELD_SETTINGS_FILE.resolve():
+        return
+    try:
+        shutil.copyfile(FIELD_SETTINGS_TEMPLATE, FIELD_SETTINGS_FILE)
+    except OSError:
+        pass  # defaults are fine; failing to boot over this is not
+
+
+_seed_field_settings_if_absent()
 
 
 def load_field_settings() -> Dict[str, Any]:

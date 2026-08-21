@@ -49,6 +49,7 @@ def _probe(data_dir: str | None, extra_env: dict[str, str] | None = None) -> dic
         "'SECRET_KEY_FILE': str(app._SECRET_KEY_FILE),"
         "'LOG_FILE': str(app._LOG_FILE),"
         "'CHANGE_LOG_DIR': str(app.state.change_log.directory),"
+        "'FIELD_SETTINGS_FILE': str(app.FIELD_SETTINGS_FILE),"
         "}) + '>>>')" % PROJECT_ROOT
     )
     proc = subprocess.run(
@@ -89,6 +90,7 @@ def test_data_dir_falls_back_to_app_dir():
         ("SECRET_KEY_FILE", ".secret_key"),
         ("LOG_FILE", "app.log"),
         ("CHANGE_LOG_DIR", "changelog"),
+        ("FIELD_SETTINGS_FILE", "field_settings.json"),
     ],
 )
 def test_state_path_lives_under_data_dir(tmp_path, attr, name):
@@ -132,6 +134,25 @@ def test_first_boot_does_not_overwrite_existing_config(tmp_path):
     _probe(tmp_path)
 
     assert json.loads(cfg.read_text("utf-8")) == original
+
+
+def test_field_settings_are_seeded_then_never_overwritten(tmp_path):
+    """A reviewer hiding a column must survive a deploy.
+
+    This is written at runtime by /api/field-settings, so the shipped copy is
+    a first-boot template only — re-seeding over it would silently revert the
+    reviewer's choice with no error anywhere.
+    """
+    _probe(tmp_path)
+    settings = tmp_path / "field_settings.json"
+    assert settings.is_file(), "field settings were not seeded into DATA_DIR"
+
+    customised = {"sample_info_hidden": ["tags"], "show_extra_fields": True}
+    settings.write_text(json.dumps(customised), encoding="utf-8")
+
+    _probe(tmp_path)
+
+    assert json.loads(settings.read_text("utf-8")) == customised
 
 
 def test_existing_secret_key_survives(tmp_path):

@@ -62,6 +62,7 @@ def test_app_paths_are_children_of_data_dir() -> None:
     for attr in (
         "CONFIG_FILE", "RE_REVIEW_STATE_FILE", "ARCHIVE_DIR",
         "LOGIN_LOG_FILE", "_SECRET_KEY_FILE", "_LOG_FILE",
+        "FIELD_SETTINGS_FILE",
     ):
         path: Path = getattr(app, attr)
         assert path.resolve().parent == app.DATA_DIR.resolve(), (
@@ -82,6 +83,9 @@ def test_no_state_path_is_bound_to_app_dir_in_source() -> None:
         "web_app_config.json", "re_review_state.json", '"archive"',
         "login.log", '".secret_key"', '"app.log"', '"changelog"',
     ):
+        # field_settings.json is deliberately excluded from this loop: APP_DIR /
+        # "field_settings.json" is the legitimate *template* path. The test
+        # above proves the live one hangs off DATA_DIR.
         assert f"APP_DIR / {name}" not in src, (
             f"{name} is bound to APP_DIR; state must hang off DATA_DIR so a "
             "release swap cannot destroy it"
