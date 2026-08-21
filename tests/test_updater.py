@@ -234,6 +234,71 @@ def test_write_staged_is_atomic(tmp_path):
     assert json.loads((tmp_path / "staged.json").read_text(encoding="utf-8"))["tag"] == "v1.0.1"
 
 
+# ── per-app launch arguments ────────────────────────────────────────────────
+
+def _app(**cfg):
+    base = {"name": "x", "repo": "o/r", "root": r"C:\ASAPApps\x", "port": 1234}
+    base.update(cfg)
+    return updater.App(base, {})
+
+
+class TestLaunchArgs:
+    """The two apps are launched differently and the updater must not assume.
+
+    COA takes its port from the ``PORT`` environment variable; LEM takes
+    ``--port`` on the command line and ignores the environment entirely. An
+    updater that only knew COA's way would start LEM on its **default** 5557
+    while believing it had started it on the scratch port — which, during a
+    health check, means starting a second copy of LEM on the live port.
+    """
+
+    def test_default_is_just_the_entry_point(self):
+        argv = updater.launch_args(_app(entry="app.py"), port=5559,
+                                   for_health_check=False)
+        assert argv == ["app.py"]
+
+    def test_port_arg_is_passed_when_configured(self):
+        argv = updater.launch_args(
+            _app(entry="web_server.pyw", port_arg="--port"),
+            port=15557, for_health_check=False)
+        assert argv == ["web_server.pyw", "--port", "15557"]
+
+    def test_extra_args_always_apply(self):
+        argv = updater.launch_args(
+            _app(entry="web_server.pyw", args=["--no-tray"]),
+            port=5557, for_health_check=False)
+        assert argv == ["web_server.pyw", "--no-tray"]
+
+    def test_health_args_apply_only_to_the_health_check(self):
+        app = _app(entry="web_server.pyw", args=["--no-tray"],
+                   health_args=["--no-publish"])
+
+        live = updater.launch_args(app, port=5557, for_health_check=False)
+        probe = updater.launch_args(app, port=15557, for_health_check=True)
+
+        assert "--no-publish" not in live, (
+            "the real launch must publish; only the throwaway one stays quiet"
+        )
+        assert "--no-publish" in probe
+        assert "--no-tray" in live and "--no-tray" in probe
+
+
+class TestLaunchEnv:
+    def test_data_env_and_port_env_are_set(self):
+        env = updater.launch_env(_app(data_env="COA_DATA_DIR"),
+                                 port=5559, data_dir="D:/state", base={})
+        assert env["COA_DATA_DIR"] == "D:/state"
+        assert env["PORT"] == "5559"
+
+    def test_port_env_is_omitted_when_the_port_goes_on_the_command_line(self):
+        """Setting both invites them to disagree, and the CLI flag wins — so a
+        stale PORT would be a lie sitting in the environment of a live app."""
+        env = updater.launch_env(_app(data_env="LEM_DATA_DIR", port_arg="--port"),
+                                 port=15557, data_dir="D:/state", base={})
+        assert env["LEM_DATA_DIR"] == "D:/state"
+        assert "PORT" not in env
+
+
 # ── supervisor contract ─────────────────────────────────────────────────────
 
 def test_kill_callable_matches_supervisor_contract():

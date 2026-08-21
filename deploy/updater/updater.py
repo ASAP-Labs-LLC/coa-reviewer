@@ -335,7 +335,20 @@ def latest_release(repo: str, token: Optional[str]) -> Optional[dict]:
         return _api(url, token)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            log.info("%s: no releases published yet", repo)
+            # A 404 here is ambiguous and the two cases need different actions.
+            # GitHub answers 404 (not 403) for a private repo a fine-grained
+            # token is not scoped to, which is indistinguishable from "this
+            # repo has no releases yet" unless you ask about the repo itself.
+            # Reporting the wrong one sends someone hunting for a missing
+            # release when the real problem is the token's repository access.
+            if _repo_visible(repo, token):
+                log.info("%s: no releases published yet", repo)
+            else:
+                log.warning(
+                    "%s: the repository is not visible with this credential. "
+                    "If it is private, add it to the token's repository "
+                    "access — a fine-grained PAT reports 404, not 403, for a "
+                    "repo outside its selected list.", repo)
             return None
         body = ""
         try:
@@ -357,6 +370,15 @@ def latest_release(repo: str, token: Optional[str]) -> Optional[dict]:
     except (urllib.error.URLError, ValueError, OSError) as exc:
         log.warning("%s: could not reach GitHub: %s", repo, exc)
         return None
+
+
+def _repo_visible(repo: str, token: Optional[str]) -> bool:
+    """Whether this credential can see the repository at all."""
+    try:
+        _api(f"https://api.github.com/repos/{repo}", token)
+        return True
+    except Exception:
+        return False
 
 
 def download(url: str, dest: Path, token: Optional[str]) -> None:
@@ -511,8 +533,8 @@ def _http_get_json(url: str, timeout: float = 3.0) -> Optional[dict]:
         return None
 
 
-def health_check(*, python: Path, release_dir: Path, entry: str, port: int,
-                 data_dir: Path, data_env: str, expected_version: Optional[str],
+def health_check(*, python: Path, release_dir: Path, argv: Sequence[str], port: int,
+                 data_dir: Path, env_extra: dict, expected_version: Optional[str],
                  browsers_path: Optional[str] = None,
                  timeout: float = HEALTH_TIMEOUT) -> tuple[bool, str]:
     """Start the release on a scratch port and prove ``/healthz`` answers.
@@ -522,14 +544,12 @@ def health_check(*, python: Path, release_dir: Path, entry: str, port: int,
     archive/log, which is exactly what we want to exercise anyway.
     """
     data_dir.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env[data_env] = str(data_dir)
-    env["PORT"] = str(port)
+    env = dict(env_extra)
     if browsers_path:
         env["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
 
     proc = subprocess.Popen(
-        [str(python), entry], cwd=str(release_dir), env=env,
+        [str(python), *argv], cwd=str(release_dir), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     try:
@@ -634,6 +654,14 @@ class App:
         self.scratch_port = int(cfg.get("scratch_port", 15000 + (self.port % 1000)))
         self.entry = cfg.get("entry", "app.py")
         self.data_env = cfg.get("data_env", "COA_DATA_DIR")
+        # How this app is told which port to use. COA reads the PORT
+        # environment variable; LEM takes --port on the command line and
+        # ignores the environment. Assuming COA's way would silently start LEM
+        # on its default 5557 — during a health check, a second copy on the
+        # live port.
+        self.port_arg = cfg.get("port_arg") or ""
+        self.args = list(cfg.get("args") or [])
+        self.health_args = list(cfg.get("health_args") or [])
         self.keep = int(cfg.get("keep_releases", defaults.get("keep_releases", DEFAULT_KEEP)))
         self.browsers_path = defaults.get("playwright_browsers_path")
 
@@ -664,6 +692,33 @@ class App:
             return Path(os.readlink(str(self.current))).name
         except (OSError, ValueError):
             return None
+
+
+def launch_args(app: App, *, port: int, for_health_check: bool) -> list:
+    """The argv (after the interpreter) for starting ``app`` on ``port``."""
+    argv = [app.entry]
+    if app.port_arg:
+        argv += [app.port_arg, str(port)]
+    argv += app.args
+    if for_health_check:
+        argv += app.health_args
+    return argv
+
+
+def launch_env(app: App, *, port: int, data_dir: str, base: dict) -> dict:
+    """Environment for starting ``app``.
+
+    ``PORT`` is set only when the port is *not* passed on the command line.
+    Setting both invites them to disagree, and the flag wins — leaving a stale
+    PORT sitting in a live app's environment saying something untrue.
+    """
+    env = dict(base)
+    env[app.data_env] = str(data_dir)
+    if app.port_arg:
+        env.pop("PORT", None)
+    else:
+        env["PORT"] = str(port)
+    return env
 
 
 def stage(app: App, release: dict, token: Optional[str]) -> None:
@@ -710,8 +765,11 @@ def stage(app: App, release: dict, token: Optional[str]) -> None:
     if probe_data.exists():
         shutil.rmtree(probe_data, ignore_errors=True)
     healthy, notes = health_check(
-        python=python, release_dir=target, entry=app.entry,
-        port=app.scratch_port, data_dir=probe_data, data_env=app.data_env,
+        python=python, release_dir=target,
+        argv=launch_args(app, port=app.scratch_port, for_health_check=True),
+        port=app.scratch_port, data_dir=probe_data,
+        env_extra=launch_env(app, port=app.scratch_port, data_dir=str(probe_data),
+                             base=os.environ),
         expected_version=tag, browsers_path=app.browsers_path,
     )
     shutil.rmtree(probe_data, ignore_errors=True)
@@ -821,12 +879,12 @@ def _start_app(app: App) -> None:
     python = app.current / ".venv" / "Scripts" / "python.exe"
     if not python.exists():
         python = Path(sys.executable)
-    env = dict(os.environ)
-    env[app.data_env] = str(app.data_dir)
-    env["PORT"] = str(app.port)
+    env = launch_env(app, port=app.port, data_dir=str(app.data_dir),
+                     base=os.environ)
     if app.browsers_path:
         env["PLAYWRIGHT_BROWSERS_PATH"] = app.browsers_path
-    subprocess.Popen([str(python), app.entry], cwd=str(app.current), env=env,
+    argv = launch_args(app, port=app.port, for_health_check=False)
+    subprocess.Popen([str(python), *argv], cwd=str(app.current), env=env,
                      creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
 
 
