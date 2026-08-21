@@ -1,0 +1,9 @@
+# Development / CI dependencies.
+#
+# Includes the runtime set rather than restating it, so the two cannot drift.
+# A release venv installs requirements.txt only: the test runner is weight on
+# every deploy and nothing in the app imports it.
+
+-r requirements.txt
+
+pytest==9.1.1

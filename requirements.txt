@@ -1,0 +1,47 @@
+# COA Reviewer — runtime dependencies, exactly pinned.
+#
+# This is what the updater builds each release venv from. Pins are ``==``, not
+# ``>=``, on purpose: a deploy must install exactly what was tested. An
+# unpinned deploy can pull a new transitive release between staging and switch
+# and fail its health check for reasons that have nothing to do with the code
+# change — and the automatic rollback would then blame the wrong commit.
+#
+# install.bat / install.sh keep their ``>=`` floors. Those set up a person's
+# machine, where current packages are what you want. tests/test_install_scripts.py
+# keeps the three files in lock-step and fails if a pin here drops below a
+# floor declared there.
+#
+# Versions captured from the live COA environment (system Python 3.14.4 on
+# ASAPSV1) on 2026-08-21 — the set the app was actually running against.
+#
+# To refresh: install into a clean venv, verify /healthz, then re-freeze.
+
+# ── direct ──────────────────────────────────────────────────────────────────
+Flask==3.1.3
+PyJWT==2.12.1
+requests==2.33.1
+playwright==1.58.0
+PyMuPDF==1.27.2.3
+pyzbar==0.1.9
+pystray==0.19.5
+pillow==12.2.0
+
+# ── transitive ──────────────────────────────────────────────────────────────
+# Pinned as well, because these are exactly the packages that break a deploy
+# without anyone having touched them. Werkzeug in particular ships breaking
+# changes that surface only at Flask import time.
+blinker==1.9.0
+certifi==2026.2.25
+charset-normalizer==3.4.7
+click==8.3.2
+colorama==0.4.6          # click pulls this on Windows only
+greenlet==3.5.0
+idna==3.11
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+pyee==13.0.1
+six==1.17.0
+typing_extensions==4.16.0
+urllib3==2.6.3
+Werkzeug==3.1.8

@@ -27,7 +27,32 @@ macOS / Linux — one-shot bootstrap (creates `.venv`, installs deps into it, la
 
 Re-running `install.sh` reuses the existing `.venv` and is essentially the daily launcher. To run the app without re-running pip, do `.venv/bin/python app.py` directly.
 
-Dependencies are pinned inline inside `install.bat` and `install.sh` — there is no `requirements.txt`. If you add or upgrade a Python package, update **both** scripts and the `REQUIRED_PACKAGES` list in `tests/test_install_scripts.py`; the test suite will fail loudly if the two scripts drift out of sync.
+Dependencies live in **three** files that must stay in lock-step, and
+`tests/test_install_scripts.py` fails loudly when they drift:
+
+- `install.bat` / `install.sh` — the "set up my machine" path, floating `>=`
+  floors, because a person setting up a laptop wants current packages.
+- `requirements.txt` — **runtime only, exactly pinned (`==`)**. This is what the
+  updater builds each release venv from. A deploy must install exactly what was
+  tested; an unpinned deploy can pull a new transitive release between staging
+  and switch, fail its health check, and trigger an automatic rollback that
+  blames the wrong commit.
+- `requirements-dev.txt` — `-r requirements.txt` plus `pytest`. A release venv
+  deliberately does not carry the test runner.
+
+If you add or upgrade a package, update all three plus the `REQUIRED_PACKAGES`
+list in `tests/test_install_scripts.py`.
+
+**Playwright's Chromium is not per-venv.** It caches at
+`%LOCALAPPDATA%\ms-playwright` (655 MB as of 2026-08-21), outside any virtual
+environment, so retaining five release venvs does *not* mean five Chromiums —
+only the pip packages are duplicated. `playwright install chromium` still runs
+on every release venv build: it is a ~15s no-op when the matching build is
+already cached, and it is what downloads a new browser when the `playwright`
+pin is bumped. Set `PLAYWRIGHT_BROWSERS_PATH` to one machine-wide path for both
+the app and the updater — otherwise a scheduled task running as a different
+account gets its own 655 MB copy and the first post-deploy COA render pays for
+the download.
 
 `Run.pyw` is the production launcher — a pystray system-tray icon that spawns `app.py`, captures stdout/stderr to `server.log` (rotated at 1 MB), watches every `*.py` in the directory and auto-restarts the server when any change. Tray menu: Open Browser, Restart Server, Show/Hide Log, Quit.
 
@@ -78,13 +103,14 @@ What is mocked / never touched in tests:
   - SIF helpers (`_sif_find_candidates`, `_sif_download`, `_sif_find_page`, `_sif_extract_page`) — pick a non-COA PDF from order-level attachments, find the page containing `lab_id` via pyzbar barcode scan (falls back to text search), and extract that single page.
   - Background workers: `_session_cleanup_worker` (idle session GC), `_auto_restart_worker` (graceful self-restart at 3 AM if idle ≥ 5 min so Run.pyw respawns a fresh process).
   - Routes are grouped by feature: `/api/portal-*` (portal auth), `/api/login` + `/api/start` (QBench login + begin pulling), `/api/tabs/<tab_name>`, `/api/pdf/<lab_id>`, `/api/sif/<lab_id>`, `/api/tests/<lab_id>` (GET) + `/api/tests/<test_id>` (PATCH inline edits), `/api/attachments/<lab_id>`, `/api/comments/<lab_id>`, `/api/mark` (`good` / `bad` / `uncheck`), `/api/regenerate`, `/api/regenerate-pending`, `/api/search`, `/api/custom-day`, `/api/export`, `/api/good-links`, `/api/events` (SSE), `/api/heartbeat`, `/api/restart`.
+  - **`/healthz`** is the deployment contract, distinct from `/api/health` (which serves the frontend's restart poll). It takes **no auth** — the updater calls it on a scratch port before the release is live — and makes **no outbound call**: `labcore` reports the last-known reachability recorded by real traffic, because probing LabCore here would let a blip on their side roll back a release that was never broken. Do not add `@require_portal` to it; `tests/test_healthz.py` asserts its absence.
   - **Command Center proxy**: `/api/cc/config`, `/api/cc/check/<lab_id>`, `/api/cc/lookup/<lab_id>`, `POST /api/cc/tasks`, `POST /api/cc/tasks/<id>/complete`, `/api/cc/customers`. These exist because **LabCore sends no CORS headers and has no OPTIONS handler**, so the browser cannot call it directly — never have the frontend address LabCore itself.
   - **Sync + auth**: `/api/portal-card-login` (LabLink keycard), `/api/sync-preview/<lab_id>`, `POST /api/sync-sample-info/<lab_id>`, `/api/regenerate-selected`.
   - `check` vs `lookup` is a latency split, not a style choice. Marking Good and un-marking must ask before closing a sample out, and that runs on *every* sample a reviewer clears; `check` does the one call that answers it (~150ms against live LabCore) instead of `lookup`'s two (~272ms). `lookup` additionally fetches customer/fuel autofill for the flag form, and runs its two calls concurrently. Don't point the marking path back at `lookup`.
   - `_lab_vision_base_url()` returns LabCore's own base URL — LabVision is served by LabCore, at one public hostname that resolves the same from the server and from every browser. It briefly derived this from `request.host`, which was only correct while LabCore ran on this machine; don't reintroduce that.
   - SSE (`/api/events`) is the only push channel — frontend listens for `sample_status`, `status`, `auto_login_done`, etc.
 
-- **`qbench_client.py`** — `QBenchAPIClient` for QBench REST API v2 at `asaplabs.qbench.net`. OAuth2 JWT Bearer (client credentials are **hardcoded constants** at the top of the file), thread-safe token cache with clock-skew recovery, a module-level `GLOBAL_RATE_LIMITER` (270 calls/min — below QBench's real 300/60s ceiling; override with `QBENCH_MAX_CALLS_PER_MIN` env), with 429 backoff that honors the server's `Retry-After`/"Retry in N seconds" hint, 401 token refresh and 429 backoff. Helpers used by `app.py`: `fetch_samples_by_lab_id_prefix`, `fetch_tests_for_sample_ids`, `fetch_attachments_for_sample`, `fetch_order_attachments`, `fetch_order_comments`, `update_test`, `delete_attachment`.
+- **`qbench_client.py`** — `QBenchAPIClient` for QBench REST API v2 at `asaplabs.qbench.net`. OAuth2 JWT Bearer. Credentials are **not in this file**: they resolve at construction time via `qbench_secrets.py` from `%APPDATA%\ASAPLabs\qbench.json` (or `QBENCH_CLIENT_ID` / `QBENCH_CLIENT_SECRET`). Resolution is lazy, so importing the module never requires a configured machine — but **the app will not start without the store**, raising `QBenchSecretMissing` naming the key and path. See `QBENCH-CREDENTIALS.md`. Thread-safe token cache with clock-skew recovery, a module-level `GLOBAL_RATE_LIMITER` (270 calls/min — below QBench's real 300/60s ceiling; override with `QBENCH_MAX_CALLS_PER_MIN` env), with 429 backoff that honors the server's `Retry-After`/"Retry in N seconds" hint, 401 token refresh and 429 backoff. Helpers used by `app.py`: `fetch_samples_by_lab_id_prefix`, `fetch_tests_for_sample_ids`, `fetch_attachments_for_sample`, `fetch_order_attachments`, `fetch_order_comments`, `update_test`, `delete_attachment`.
 
 - **`labcore_client.py`** — `LabCoreClient` for LabLink's Command Center. Command Center lives in **LabCore** (`apps/LabCore/src/LabCore.py` in the LabLink repo), *not* LabStation; its board is a tab in the LabVision web UI that LabCore serves. Writes go through `POST /api/queue/write` — LabCore's explicitly unauthenticated "any LabLink program can POST here" gateway, dispatching `cc_create_task` / `cc_complete_task` onto its serialized write queue. (`POST /api/cc/tasks` is the alternative but needs a LabVision bearer token this headless server cannot obtain.) Reads are public GETs. Every write carries an `op_id` so a retry can't create a duplicate listing. Raises `LabCoreUnavailable` rather than returning falsy — a flag that silently fails to file is worse than one that visibly refuses.
 
@@ -100,13 +126,29 @@ What is mocked / never touched in tests:
 
 ## External dependencies
 
-- **QBench API v2** at `https://asaplabs.qbench.net` — OAuth2 JWT-bearer using hardcoded client_id/client_secret in `qbench_client.py`.
+- **QBench API v2** at `https://asaplabs.qbench.net` — OAuth2 JWT-bearer. The client_id/client_secret come from the local store (`qbench_secrets.py`), never from the source tree.
 - **QBench web session** — Playwright Chromium for COA preview rendering (no public API for `/report/preview`).
 - **LabCore / Command Center** at `https://labvision.asaplabs.net` — **remote, behind Cloudflare on HTTPS/443** (not a LAN host:port). Serves both the Command Center API and the LabVision UI, so the same URL is used server-side and as the browser's "Open in Lab Vision" target. Verified 2026-07-31: no CORS headers and no `OPTIONS`/`HEAD` handler (a HEAD returns 501), which is why every call is proxied through Flask. Because it is a real network hop rather than loopback, the client's timeouts are sized for internet latency — don't drop them back to loopback values. Source of truth: the LabLink repo (`https://github.com/ASAP-Labs-LLC/LabLink`, private — working checkout at `/Volumes/Labsharedrive/Ryan C/LabLink`).
 - **`web_app_config.json`** — QBench username/password, `report_config_id`, `labcore_url`. One whole URL, not host+port: a host/port pair cannot express the scheme. A bare hostname is normalized to `https://`. Point it at `http://127.0.0.1:8080` to develop against a local LabCore. Contains secrets; do not commit real values.
 - **Portal auth** — every way in is a **LabLink account**, resolved by LabCore's `POST /api/login`: tap a card (`authenticate_card`) or type the same username and password (`authenticate_user`). The canonical account name LabCore returns becomes the session identity, `created_by` / `completed_by` on Command Center listings, and the audit-log user. There is deliberately **no local fallback credential** — the old hardcoded `Administrator` password plus a typed "Your Name" box let anyone who knew one string file work under any name, and a credential that still worked while LabCore was down would reintroduce exactly that. If LabCore is unreachable, login returns 503 `labcore_down` and says so; a session without LabCore couldn't flag, re-review, or sync anyway.
 
-## Persistent state files (project root)
+## Persistent state files (`DATA_DIR`, **not** the project root)
+
+`DATA_DIR` is `COA_DATA_DIR` when set, otherwise `APP_DIR` — so a shared-drive
+install behaves exactly as it always did, while a deployed install keeps state
+outside the release. Under the deployment layout `APP_DIR` is
+`C:\ASAPApps\coa\current` (a junction onto an immutable release) and `DATA_DIR`
+is `C:\ASAPApps\coa\data`, which deploys never touch.
+
+**Never bind a state path to `APP_DIR`.** With `COA_DATA_DIR` unset the two are
+equal, so the mistake passes every test on a dev box and only destroys data in
+production, on the first release swap. `tests/test_consolidation.py` has a
+source-level guard against it and `tests/test_data_dir.py` covers the
+resolution.
+
+Resolution is import-time, not lazy: `ARCHIVE_DIR.mkdir()` and the rotating log
+handler both run at module scope.
+
 
 - `web_app_config.json` — QBench + LabCore config (above).
 - `re_review_state.json` — **a QBench-resolution cache only**, keyed by lab_id → `sample_id` / `test_ids` / `order_id` (values that never change). It used to hold the Re-review queue itself; Command Center is the source of truth for *which* samples are in the tab, and the listing is deliberately not persisted here so a stale file can never contradict the live board.

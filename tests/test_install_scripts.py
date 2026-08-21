@@ -1,12 +1,22 @@
 """Invariants for the install.bat / install.sh setup scripts.
 
-These scripts replace the old ``requirements.txt`` workflow. Two scripts
-must stay in lock-step: every dependency, plus the Playwright chromium
-install and pytest, has to appear in both.
+Three files now describe the same dependency set and must stay in lock-step:
+``install.bat`` and ``install.sh`` (the human "set up my machine" path) and
+``requirements.txt`` (the path the updater builds a release venv from). A
+dependency present in one and missing from another means a release that
+installs cleanly and then fails at import — which the updater would correctly
+roll back, having wasted a deploy on a packaging mistake.
+
+``requirements.txt`` is pinned with ``==`` while the install scripts float
+with ``>=``. That is deliberate, not drift: a person setting up a laptop wants
+current packages, whereas a deploy must install exactly what was tested, or a
+health check can fail for reasons that have nothing to do with the code
+change.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -14,6 +24,21 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_BAT = PROJECT_ROOT / "install.bat"
 INSTALL_SH = PROJECT_ROOT / "install.sh"
+REQUIREMENTS = PROJECT_ROOT / "requirements.txt"
+REQUIREMENTS_DEV = PROJECT_ROOT / "requirements-dev.txt"
+
+
+def _requirement_names(path: Path) -> dict[str, str]:
+    """``{lowercased package name: pinned version}`` from a requirements file."""
+    found: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        m = re.match(r"^([A-Za-z0-9._-]+)\s*==\s*(.+)$", line)
+        assert m, f"{path.name}: {line!r} is not an == pin"
+        found[m.group(1).lower().replace("_", "-")] = m.group(2).strip()
+    return found
 
 # Packages required by app.py + labcore_client.py + qbench_client.py +
 # sif_test_app.py + Run.pyw (PyPI names, lower-cased for comparison).
@@ -77,6 +102,77 @@ def test_install_sh_has_bash_shebang() -> None:
     assert first_line.startswith("#!") and "sh" in first_line, (
         f"install.sh first line should be a shell shebang, got: {first_line!r}"
     )
+
+
+# ── requirements.txt: what the updater builds a release venv from ───────────
+
+def test_requirements_txt_exists() -> None:
+    assert REQUIREMENTS.is_file(), (
+        "requirements.txt is missing; the updater has nothing to build a "
+        "release venv from"
+    )
+
+
+def test_requirements_dev_exists_and_includes_runtime() -> None:
+    assert REQUIREMENTS_DEV.is_file(), "requirements-dev.txt is missing"
+    assert "-r requirements.txt" in REQUIREMENTS_DEV.read_text(encoding="utf-8"), (
+        "requirements-dev.txt must include the runtime set rather than "
+        "restating it, or the two will drift"
+    )
+
+
+@pytest.mark.parametrize("package", [p for p in REQUIRED_PACKAGES if p != "pytest"])
+def test_runtime_package_is_pinned_in_requirements(package: str) -> None:
+    """Every runtime dependency appears in requirements.txt, pinned."""
+    assert package in _requirement_names(REQUIREMENTS), (
+        f"{package} is installed by the setup scripts but missing from "
+        "requirements.txt, so a release venv would not have it"
+    )
+
+
+def test_pytest_is_not_a_runtime_dependency() -> None:
+    """pytest belongs to the dev set. A release venv should not carry the test
+    runner: it is weight on every deploy and it is not imported by the app."""
+    assert "pytest" not in _requirement_names(REQUIREMENTS)
+    assert "pytest" in _requirement_names(REQUIREMENTS_DEV)
+
+
+def test_every_requirement_is_exactly_pinned() -> None:
+    """No floating specifiers. _requirement_names asserts the == form, so this
+    just proves the file is non-empty and parseable."""
+    pins = _requirement_names(REQUIREMENTS)
+    assert len(pins) >= len(REQUIRED_PACKAGES) - 1
+
+
+def test_requirements_does_not_drift_below_install_script_floors() -> None:
+    """A pin must satisfy the floor the install scripts advertise.
+
+    Catches the case where requirements.txt is pinned to something older than
+    ``install.bat`` claims to require — the deploy would then install a version
+    the project has already declared too old.
+    """
+    bat = INSTALL_BAT.read_text(encoding="utf-8")
+    pins = _requirement_names(REQUIREMENTS)
+
+    for name, floor in re.findall(r'"([A-Za-z0-9._-]+)>=([0-9][^"]*)"', bat):
+        key = name.lower().replace("_", "-")
+        if key == "pytest" or key not in pins:
+            continue
+        pinned = pins[key]
+
+        def parts(v: str) -> list[int]:
+            out = []
+            for chunk in re.split(r"[.\-+]", v):
+                if chunk.isdigit():
+                    out.append(int(chunk))
+                else:
+                    break
+            return out
+
+        assert parts(pinned) >= parts(floor), (
+            f"requirements.txt pins {name}=={pinned}, below the "
+            f"{name}>={floor} floor declared in install.bat"
+        )
 
 
 def test_install_sh_aborts_on_error() -> None:
