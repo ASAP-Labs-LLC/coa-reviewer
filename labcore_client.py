@@ -63,6 +63,21 @@ class LabCoreClient:
                  source: str = "COAReviewer") -> None:
         self._base_url = self._normalize(base_url)
         self._source = source
+        # Last observed reachability, maintained as a side effect of real
+        # traffic so ``/healthz`` can report it without making a call of its
+        # own. ``None`` means nothing has been attempted yet — deliberately not
+        # ``True``, because claiming a service is reachable before ever having
+        # reached it is the kind of health check that reports green through an
+        # outage.
+        self._last_reachable: Optional[bool] = None
+
+    @property
+    def last_reachable(self) -> Optional[bool]:
+        """``True``/``False`` from the last attempt, ``None`` if never tried."""
+        return self._last_reachable
+
+    def _mark_reachable(self, ok: bool) -> None:
+        self._last_reachable = ok
 
     @staticmethod
     def _normalize(base_url: str) -> str:
@@ -99,13 +114,16 @@ class LabCoreClient:
             try:
                 resp = requests.get(url, params=params, timeout=timeout)
                 resp.raise_for_status()
+                self._mark_reachable(True)
                 return resp.json()
             except _TRANSIENT as exc:
                 last = exc
                 if attempt < READ_RETRIES - 1:
                     time.sleep(READ_RETRY_BACKOFF * (attempt + 1))
             except requests.RequestException as exc:
+                self._mark_reachable(False)
                 raise LabCoreUnavailable(f"LabCore GET {path} failed: {exc}") from exc
+        self._mark_reachable(False)
         raise LabCoreUnavailable(f"LabCore unreachable at {self.base_url}: {last}")
 
     def _write(self, operation: str, params: Dict[str, Any],
@@ -128,9 +146,11 @@ class LabCoreClient:
                 f"{self.base_url}/api/queue/write", json=body, timeout=WRITE_TIMEOUT,
             )
         except requests.RequestException as exc:
+            self._mark_reachable(False)
             raise LabCoreUnavailable(
                 f"LabCore unreachable at {self.base_url}: {exc}"
             ) from exc
+        self._mark_reachable(True)
         try:
             return resp.json()
         except ValueError as exc:
@@ -147,8 +167,11 @@ class LabCoreClient:
             resp = requests.get(
                 f"{self.base_url}/api/queue/status", timeout=STATUS_TIMEOUT,
             )
-            return resp.status_code == 200
+            ok = resp.status_code == 200
+            self._mark_reachable(ok)
+            return ok
         except requests.RequestException:
+            self._mark_reachable(False)
             return False
 
     # ── authentication ───────────────────────────────────────────────────

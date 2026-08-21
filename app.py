@@ -125,6 +125,31 @@ def _seed_config_if_absent() -> None:
 
 _seed_config_if_absent()
 
+# ── Version stamp ───────────────────────────────────────────────────────────
+# CI writes the release tag into a VERSION file next to the code, so the stamp
+# travels with the release rather than with the state. The updater compares
+# what /healthz reports against the tag it staged; if they don't match, the
+# junction swap didn't take effect and it must roll back.
+VERSION_FILE = APP_DIR / "VERSION"
+
+
+def _read_version(path: Path | None = None) -> str:
+    """The release tag, or ``"dev"`` for a working checkout.
+
+    Never raises. A health check that 500s because VERSION is missing or
+    corrupt would make a working release look broken and trigger a needless
+    rollback — the exact failure this file exists to prevent.
+    """
+    target = VERSION_FILE if path is None else Path(path)
+    try:
+        stamp = target.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return "dev"
+    return stamp.splitlines()[0].strip() if stamp else "dev"
+
+
+APP_VERSION = _read_version()
+
 QBENCH_BASE = "https://asaplabs.qbench.net"
 REPORT_CONFIG_ID = "18"
 REPORT_LEVEL = "sample"
@@ -1782,6 +1807,32 @@ def index():
 def health():
     """Lightweight health check — no auth required. Used by frontend restart polling."""
     return jsonify({"ok": True, "pid": os.getpid(), "t": time.time()})
+
+
+@app.route("/healthz")
+def healthz():
+    """Deployment health check — **no auth**, no outbound calls.
+
+    Distinct from ``/api/health`` on purpose: that one answers the frontend's
+    "is my server back yet" poll, this one is the updater's contract. It runs
+    against a release started on a scratch port before that release is live,
+    so it must answer without a session and must answer fast.
+
+    ``labcore`` is deliberately last-known state rather than a probe. LabCore
+    is a real internet hop behind Cloudflare; probing it here would let a
+    momentary blip on their side fail a health check and roll back a release
+    that was never broken. Reporting it at all is still useful — the updater
+    logs it, and a release that comes up with LabCore unreachable is worth a
+    human look even though it is not a rollback trigger.
+    """
+    last = getattr(getattr(state, "labcore", None), "last_reachable", None)
+    labcore = "unknown" if last is None else ("reachable" if last else "unreachable")
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "labcore": labcore,
+        "pid": os.getpid(),
+    })
 
 
 # ── Portal Auth ──────────────────────────────────────────────────────────────

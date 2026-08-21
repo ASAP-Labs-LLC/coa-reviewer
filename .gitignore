@@ -66,3 +66,8 @@ install.log
 # QBench credential store (must live outside the repo)
 qbench.json
 .env
+
+# Written into a release by CI (see .github/workflows/release.yml). A working
+# checkout has no VERSION and reports "dev"; committing one would make every
+# dev box claim to be a release.
+VERSION
