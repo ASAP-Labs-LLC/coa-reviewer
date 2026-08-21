@@ -7,3 +7,8 @@
 -r requirements.txt
 
 pytest==9.1.1
+
+# tests/test_release_workflow.py parses .github/workflows/release.yml. Without
+# it those checks importorskip themselves into silence, which is worse than
+# not having them.
+PyYAML==6.0.3

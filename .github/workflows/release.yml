@@ -1,0 +1,136 @@
+name: Release
+
+# Tag-driven. Both forms the deployment uses are accepted: a semver-ish `v*`
+# tag and the date tag the updater's release folders are named after
+# (`2026.08.21-1`).
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]*'
+
+# Creating a release needs this. On a repo whose default workflow token is
+# read-only, omitting it fails late with a confusing 403 from `gh release`.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage release contents
+        env:
+          PKG: coa-reviewer-${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/$PKG"
+          # Source only. State is excluded by name rather than by trusting
+          # .gitignore: changelog/*.jsonl is *tracked*, so a gitignore-based
+          # filter would happily ship the audit trail, and web_app_config.json
+          # would publish live QBench credentials as an asset on a public repo.
+          rsync -a ./ "dist/$PKG/" \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'dist/' \
+            --exclude '__pycache__/' \
+            --exclude '*.pyc' \
+            --exclude '.pytest_cache/' \
+            --exclude '.venv/' \
+            --exclude 'venv/' \
+            --exclude 'archive/' \
+            --exclude 'changelog/' \
+            --exclude 'web_app_config.json' \
+            --exclude 're_review_state.json' \
+            --exclude '.secret_key' \
+            --exclude 'login.log' \
+            --exclude 'install.log' \
+            --exclude '*.log' \
+            --exclude '*.log.*'
+
+      - name: Stamp VERSION from the tag
+        env:
+          PKG: coa-reviewer-${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # The stamp must come from the tag. /healthz reports this back and
+          # the updater compares it against what it staged; a hand-edited or
+          # stale value makes a good swap look like a failed one.
+          printf '%s\n' "${{ github.ref_name }}" > "dist/$PKG/VERSION"
+          cat "dist/$PKG/VERSION"
+
+      - name: Verify no state leaked into the archive
+        env:
+          PKG: coa-reviewer-${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd "dist/$PKG"
+          leaked=0
+          for f in web_app_config.json re_review_state.json .secret_key login.log install.log; do
+            if [ -e "$f" ]; then echo "LEAKED: $f"; leaked=1; fi
+          done
+          for d in archive changelog .venv venv __pycache__; do
+            if [ -e "$d" ]; then echo "LEAKED: $d/"; leaked=1; fi
+          done
+          if find . -name '*.pyc' -o -name '*.log' | grep -q .; then
+            echo "LEAKED: compiled or log files"; find . -name '*.pyc' -o -name '*.log'; leaked=1
+          fi
+          # Positive control: the things a release genuinely needs.
+          for required in app.py requirements.txt VERSION templates static; do
+            if [ ! -e "$required" ]; then echo "MISSING: $required"; leaked=1; fi
+          done
+          if [ "$leaked" -ne 0 ]; then
+            echo "Refusing to publish this archive."; exit 1
+          fi
+          echo "archive contents verified"
+
+      - name: Create zip and checksum
+        env:
+          PKG: coa-reviewer-${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          zip -q -r "$PKG.zip" "$PKG"
+          sha256sum "$PKG.zip" > "$PKG.zip.sha256"
+          cat "$PKG.zip.sha256"
+          # Prove the checksum verifies here, so a bad one can never reach the
+          # updater — which treats a checksum mismatch as a hard stop.
+          sha256sum -c "$PKG.zip.sha256"
+
+      - name: Write release notes
+        env:
+          PKG: coa-reviewer-${{ github.ref_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # A quoted heredoc, so backticks and backslashes in the notes are
+          # literal. Passing this as an inline --notes string made bash try to
+          # command-substitute the code fences.
+          cat > dist/notes.md <<'NOTES_END'
+          Automated release of COA Reviewer.
+
+          Unpack into `C:\ASAPApps\coa\releases\<tag>\` and point the `current`
+          junction at it. State lives in `C:\ASAPApps\coa\data\` and is
+          deliberately not part of this archive.
+
+          Verify the asset before use:
+          ```
+          sha256sum -c coa-reviewer-<tag>.zip.sha256
+          ```
+          NOTES_END
+          sed -i "s/<tag>/$TAG/g" dist/notes.md
+          cat dist/notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PKG: coa-reviewer-${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" \
+            "dist/$PKG.zip" \
+            "dist/$PKG.zip.sha256" \
+            --title "${{ github.ref_name }}" \
+            --notes-file dist/notes.md
