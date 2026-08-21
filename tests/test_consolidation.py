@@ -42,16 +42,47 @@ def test_labcore_client_does_not_walk_above_its_own_dir() -> None:
     assert "Path(__file__).parent.parent" not in src
 
 
-def test_app_paths_are_children_of_app_dir() -> None:
-    """After import, the path constants must live under ``APP_DIR``.
+def test_app_paths_are_children_of_data_dir() -> None:
+    """After import, the state paths must live under ``DATA_DIR``.
+
+    This used to assert ``APP_DIR``, back when code and state shared a
+    directory. Deployment split them (see ``tests/test_data_dir.py``), so the
+    invariant moved rather than disappeared: state belongs to DATA_DIR, and
+    binding it to APP_DIR is now the bug — that is what a release swap
+    destroys.
+
+    The original cross-folder invariant is unchanged and still enforced by the
+    tests above: nothing may traverse *out* of the tree into a sibling folder.
 
     Skipped if Flask isn't installed (importing ``app`` requires it).
     """
     pytest.importorskip("flask")
     import app
 
-    for attr in ("CONFIG_FILE", "RE_REVIEW_STATE_FILE", "ARCHIVE_DIR"):
+    for attr in (
+        "CONFIG_FILE", "RE_REVIEW_STATE_FILE", "ARCHIVE_DIR",
+        "LOGIN_LOG_FILE", "_SECRET_KEY_FILE", "_LOG_FILE",
+    ):
         path: Path = getattr(app, attr)
-        assert app.APP_DIR in path.resolve().parents or path.resolve() == app.APP_DIR, (
-            f"{attr} ({path}) is not inside APP_DIR ({app.APP_DIR})"
+        assert path.resolve().parent == app.DATA_DIR.resolve(), (
+            f"{attr} ({path}) is not inside DATA_DIR ({app.DATA_DIR})"
+        )
+
+
+def test_no_state_path_is_bound_to_app_dir_in_source() -> None:
+    """Guard the regression directly in the source.
+
+    An import-time check can't catch this on its own: with ``COA_DATA_DIR``
+    unset DATA_DIR *equals* APP_DIR, so a state path wrongly written as
+    ``APP_DIR / ...`` would still satisfy the test above on a developer box and
+    only fail in production, which is precisely the wrong place to find out.
+    """
+    src = APP_PY.read_text(encoding="utf-8")
+    for name in (
+        "web_app_config.json", "re_review_state.json", '"archive"',
+        "login.log", '".secret_key"', '"app.log"', '"changelog"',
+    ):
+        assert f"APP_DIR / {name}" not in src, (
+            f"{name} is bound to APP_DIR; state must hang off DATA_DIR so a "
+            "release swap cannot destroy it"
         )

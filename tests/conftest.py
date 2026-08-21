@@ -29,6 +29,14 @@ with open(_store, "w", encoding="utf-8") as _fh:
     _json.dump({"client_id": "test-client-id", "client_secret": "test-client-secret"}, _fh)
 _os.environ.setdefault("QBENCH_STORE_PATH", _store)
 
+# Same reasoning for state. Importing ``app`` creates archive/, opens a
+# rotating app.log, seeds a config and appends to the change log; with
+# COA_DATA_DIR unset all of that lands in the source tree, so simply running
+# the suite dirtied the tracked changelog/*.jsonl files with test audit
+# entries. Point DATA_DIR at a throwaway directory before ``app`` is imported.
+# ``setdefault`` so tests/test_data_dir.py can still probe both branches.
+_os.environ.setdefault("COA_DATA_DIR", _tempfile.mkdtemp(prefix="coa-test-data-"))
+
 import socket
 import sys
 import threading

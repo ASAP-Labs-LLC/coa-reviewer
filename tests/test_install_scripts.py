@@ -39,9 +39,35 @@ def test_install_sh_exists() -> None:
 
 
 def test_install_sh_is_executable() -> None:
+    """``install.sh`` must be executable where it is actually run.
+
+    NTFS carries no POSIX exec bit, so on Windows the filesystem always reports
+    the file as non-executable no matter what the repository says. What matters
+    is the mode git records — that is what a POSIX checkout materialises — so on
+    Windows we ask git instead of the filesystem. Asserting ``st_mode`` there
+    tested the platform, not the repo.
+    """
     import stat
+    import subprocess
+    import sys
 
     assert INSTALL_SH.is_file()
+
+    if sys.platform == "win32":
+        out = subprocess.run(
+            ["git", "ls-files", "-s", "--", "install.sh"],
+            cwd=str(PROJECT_ROOT), capture_output=True, text=True,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            pytest.skip("not a git checkout; cannot verify the recorded mode")
+        recorded = out.stdout.split()[0]
+        assert recorded == "100755", (
+            f"install.sh is recorded in git as {recorded}, not 100755 — a POSIX "
+            "checkout would not be executable. Fix with: "
+            "git update-index --chmod=+x install.sh"
+        )
+        return
+
     mode = INSTALL_SH.stat().st_mode
     assert mode & stat.S_IXUSR, "install.sh must be executable (chmod +x)"
 

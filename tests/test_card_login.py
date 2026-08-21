@@ -38,7 +38,7 @@ def card(monkeypatch, tmp_path):
 def _sessions(directory):
     rows = []
     for f in sorted(directory.glob("sessions-*.jsonl")):
-        rows += [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+        rows += [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
     return rows
 
 

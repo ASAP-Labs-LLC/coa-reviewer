@@ -23,6 +23,7 @@ import os
 import queue
 import re
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -73,11 +74,56 @@ except Exception:
     _PILImage = None
 
 # ── Paths ───────────────────────────────────────────────────────────────────
+# APP_DIR is where the *code* is; DATA_DIR is where everything this app writes
+# lives. They used to be the same directory, which is exactly what stopped the
+# app being deployable: a versioned release directory gets swapped underneath
+# the process, and any state sitting inside it is destroyed with the old
+# release. Under the deployment layout APP_DIR is
+# ``C:\ASAPApps\coa\current`` (a junction onto an immutable release) while
+# DATA_DIR is ``C:\ASAPApps\coa\data``, which deploys never touch.
+#
+# Resolution is deliberately import-time, not lazy: ARCHIVE_DIR.mkdir() and the
+# rotating log handler below both run at module scope, so a DATA_DIR that only
+# resolved on first use would already be too late.
 APP_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = APP_DIR / "web_app_config.json"
-RE_REVIEW_STATE_FILE = APP_DIR / "re_review_state.json"
-ARCHIVE_DIR = APP_DIR / "archive"
+
+
+def _resolve_data_dir() -> Path:
+    """Where this app keeps its state.
+
+    ``COA_DATA_DIR`` when set, otherwise ``APP_DIR`` — so an existing
+    shared-drive installation keeps behaving exactly as it did before.
+    """
+    raw = os.environ.get("COA_DATA_DIR", "").strip()
+    return Path(raw).expanduser().resolve() if raw else APP_DIR
+
+
+DATA_DIR = _resolve_data_dir()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+CONFIG_FILE = DATA_DIR / "web_app_config.json"
+CONFIG_TEMPLATE_FILE = APP_DIR / "web_app_config.default.json"
+RE_REVIEW_STATE_FILE = DATA_DIR / "re_review_state.json"
+ARCHIVE_DIR = DATA_DIR / "archive"
 ARCHIVE_DIR.mkdir(exist_ok=True)
+
+
+def _seed_config_if_absent() -> None:
+    """Copy the shipped template into DATA_DIR on first boot — never over a
+    real config. Overwriting here would cost the live QBench credentials, so
+    the existence check is the whole point of the function.
+    """
+    if CONFIG_FILE.exists() or not CONFIG_TEMPLATE_FILE.is_file():
+        return
+    try:
+        shutil.copyfile(CONFIG_TEMPLATE_FILE, CONFIG_FILE)
+    except OSError:
+        # A missing config is recoverable (load_config falls back to defaults);
+        # failing to boot because the seed failed is not.
+        pass
+
+
+_seed_config_if_absent()
 
 QBENCH_BASE = "https://asaplabs.qbench.net"
 REPORT_CONFIG_ID = "18"
@@ -89,7 +135,7 @@ REPORT_LEVEL = "sample"
 # fallback credential — one that still worked while LabCore was down would be
 # exactly the shared, unattributable login this replaced, and a session
 # without LabCore can't flag, re-review, or sync anyway.
-LOGIN_LOG_FILE = APP_DIR / "login.log"
+LOGIN_LOG_FILE = DATA_DIR / "login.log"
 SESSION_TIMEOUT_SECONDS = 600   # 10 min – frontend timer threshold
 SESSION_CLEANUP_SECONDS = 720   # 12 min – server-side cleanup (grace period for reauth)
 AUTO_RESTART_HOUR = 3           # 3 AM – daily auto-restart target
@@ -114,7 +160,7 @@ PREVIEW_POOL = ThreadPoolExecutor(max_workers=_preview_workers(), thread_name_pr
 IO_POOL = ThreadPoolExecutor(max_workers=_preview_workers() * 2, thread_name_prefix="io")
 
 # Stable secret key so cookies survive server restarts
-_SECRET_KEY_FILE = APP_DIR / ".secret_key"
+_SECRET_KEY_FILE = DATA_DIR / ".secret_key"
 if _SECRET_KEY_FILE.exists():
     APP_SECRET_KEY = _SECRET_KEY_FILE.read_text("utf-8").strip()
 else:
@@ -123,7 +169,7 @@ else:
 
 # ── Logging with rotation ────────────────────────────────────────────────────
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-_LOG_FILE = APP_DIR / "app.log"
+_LOG_FILE = DATA_DIR / "app.log"
 _log_formatter = logging.Formatter(_LOG_FORMAT)
 
 # Rotating file handler: 2 MB per file, keep 5 backups
@@ -945,10 +991,12 @@ class AppState:
             base_url=self.config.get("labcore_url", "https://labvision.asaplabs.net"),
         )
 
-        # APP_DIR is already on the network share, so the default keeps the
-        # audit trail off any one reviewer's machine without a traversal.
+        # The audit trail is state, not code: it defaults into DATA_DIR so a
+        # release swap cannot take the change log with it. An explicit
+        # ``change_log_dir`` in config still wins (that is how it gets pointed
+        # at the network share).
         self.change_log = ChangeLog(
-            self.config.get("change_log_dir") or (APP_DIR / "changelog")
+            self.config.get("change_log_dir") or (DATA_DIR / "changelog")
         )
 
     def broadcast_sse(self, data: dict) -> None:

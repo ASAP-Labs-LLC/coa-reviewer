@@ -320,7 +320,7 @@ def test_a_sync_is_written_to_the_audit_log(sync, tmp_path) -> None:
 
     rows = []
     for f in (tmp_path / "cl").glob("qbench_edits-*.jsonl"):
-        rows += [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+        rows += [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
     synced = [r for r in rows if r["event"] == "sample_sync"]
     assert synced, "a sync must be attributable"
     assert synced[-1]["lab_id"] == "073126-41552"

@@ -39,7 +39,7 @@ def portal(monkeypatch, tmp_path):
 def _sessions(directory):
     rows = []
     for f in sorted(directory.glob("sessions-*.jsonl")):
-        rows += [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+        rows += [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
     return rows
 
 
@@ -235,7 +235,7 @@ def test_there_is_no_hardcoded_portal_password_left(portal) -> None:
     assert not hasattr(app_module, "APP_LOGIN_PASSWORD")
 
     from pathlib import Path
-    src = (Path(app_module.__file__)).read_text()
+    src = (Path(app_module.__file__)).read_text(encoding="utf-8")
     assert "A$aprocks!1" not in src
 
 
@@ -348,7 +348,7 @@ def test_the_login_form_no_longer_asks_for_a_typed_name() -> None:
     from pathlib import Path
     import app as app_module
 
-    html = (Path(app_module.__file__).parent / "templates" / "index.html").read_text()
+    html = (Path(app_module.__file__).parent / "templates" / "index.html").read_text(encoding="utf-8")
     assert 'id="portal-name"' not in html
     assert 'id="reauth-name"' not in html
 
@@ -357,6 +357,6 @@ def test_the_frontend_sends_no_name_on_login() -> None:
     from pathlib import Path
     import app as app_module
 
-    js = (Path(app_module.__file__).parent / "static" / "js" / "app.js").read_text()
+    js = (Path(app_module.__file__).parent / "static" / "js" / "app.js").read_text(encoding="utf-8")
     assert "#portal-name" not in js
     assert "#reauth-name" not in js
