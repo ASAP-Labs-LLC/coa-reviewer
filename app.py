@@ -1814,8 +1814,19 @@ _NON_ACTIVITY_PATHS = frozenset({"/healthz", "/api/health"})
 
 @app.before_request
 def track_activity():
+    """Record that a *reviewer* did something.
+
+    Deliberately gated on holding a session rather than on the path. Something
+    on this network has requested ``GET /`` every ~2.2 minutes since long
+    before this deployment (it is all over the old server.log), and counting
+    that kept the app permanently "busy" — which both blocks an idle-gated
+    deploy and suppresses the 3 AM auto-restart. Excluding ``/`` instead is
+    wrong, because ``/`` is also exactly what a real reviewer opens. A session
+    separates them: a monitor carries no cookie, and anyone with work in
+    progress always does.
+    """
     global _last_request_time
-    if request.path not in _NON_ACTIVITY_PATHS:
+    if request.path not in _NON_ACTIVITY_PATHS and session.get("uid"):
         _last_request_time = time.time()
     # Log non-static, non-polling requests for debugging
     if not request.path.startswith("/static/") and request.path != "/api/events":

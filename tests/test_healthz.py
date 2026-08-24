@@ -194,13 +194,45 @@ class TestIdleReporting:
         anon_client.get("/api/health")
         assert app_module._last_request_time == before
 
-    def test_a_real_request_does_count_as_activity(self, anon_client):
-        """The guard must not have switched activity tracking off entirely."""
+    def test_an_anonymous_request_does_not_count_as_activity(self, anon_client):
+        """A monitor polling ``/`` is not a reviewer.
+
+        Something on this network requests ``GET /`` every ~2.2 minutes and has
+        done since long before this deployment — visible in the old server.log.
+        With raw-request idleness that alone kept COA permanently "busy", so an
+        idle-gated deploy could never have fired. The path cannot decide it,
+        because ``/`` is also exactly what a real reviewer opens. Having a
+        session can: a monitor carries no cookie, and a reviewer with work in
+        progress always does.
+        """
         import app as app_module
 
         app_module._last_request_time = time.time() - 600
+        before = app_module._last_request_time
+
         anon_client.get("/")
-        assert app_module._last_request_time > time.time() - 5
+
+        assert app_module._last_request_time == before, (
+            "an unauthenticated GET / counted as a reviewer using the app"
+        )
+
+    def test_a_request_from_a_real_session_does_count(self, anon_client):
+        """The guard must not have switched activity tracking off entirely."""
+        import app as app_module
+        from app import UserState
+
+        uid = "test-uid-activity"
+        with app_module._sessions_lock:
+            app_module.user_sessions[uid] = UserState(uid, "RC")
+        try:
+            with anon_client.session_transaction() as sess:
+                sess["uid"] = uid
+            app_module._last_request_time = time.time() - 600
+            anon_client.get("/")
+            assert app_module._last_request_time > time.time() - 5
+        finally:
+            with app_module._sessions_lock:
+                app_module.user_sessions.pop(uid, None)
 
 
 def test_client_records_reachability_on_success_and_failure():
