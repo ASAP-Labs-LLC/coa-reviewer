@@ -874,9 +874,13 @@ def stage(app: App, release: dict, token: Optional[str]) -> None:
              "PASSED" if healthy else "FAILED", notes)
     write_staged(app.data_dir, tag=tag, healthy=healthy, notes=notes)
     if healthy:
-        log.info("[%s] %s is staged and waiting for a human. Switch with: "
-                 "updater.py switch --app %s --tag %s",
-                 app.name, tag, app.name, tag)
+        if app.auto_switch:
+            log.info("[%s] %s is staged and healthy; it will deploy itself once "
+                     "nobody is using the app", app.name, tag)
+        else:
+            log.info("[%s] %s is staged and waiting for a human. Switch with: "
+                     "updater.py switch --app %s --tag %s",
+                     app.name, tag, app.name, tag)
 
 
 def switch(app: App, tag: str, *, force: bool = False) -> bool:
