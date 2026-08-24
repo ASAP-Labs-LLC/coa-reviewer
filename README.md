@@ -38,3 +38,5 @@ Virtualenvs, `__pycache__`, instrument data, logs, and credential files were exc
 <!-- Deployment smoke test: v1.0.2 exercises the staged-release path end to end. -->
 
 <!-- v1.0.4: exercises the unattended idle deploy end to end. -->
+
+<!-- v1.0.6: unattended idle deploy, end to end. -->
