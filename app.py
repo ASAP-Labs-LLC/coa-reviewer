@@ -1803,10 +1803,20 @@ def _handle_qbench_error(exc):
     return _qbench_error_response(exc)
 
 
+# Health endpoints are machines asking after the app, not people using it.
+# Counting them as activity would make the app look permanently busy: the
+# updater polls /healthz to decide whether anyone would be interrupted by a
+# deploy, and the frontend polls /api/health while waiting for a restart.
+# Either would also suppress the 3 AM auto-restart, which is gated on the same
+# timestamp — so a monitoring call would silently disable a token refresh.
+_NON_ACTIVITY_PATHS = frozenset({"/healthz", "/api/health"})
+
+
 @app.before_request
 def track_activity():
     global _last_request_time
-    _last_request_time = time.time()
+    if request.path not in _NON_ACTIVITY_PATHS:
+        _last_request_time = time.time()
     # Log non-static, non-polling requests for debugging
     if not request.path.startswith("/static/") and request.path != "/api/events":
         logger.debug("REQUEST %s %s from %s", request.method, request.path, request.remote_addr)
@@ -1850,11 +1860,18 @@ def healthz():
     """
     last = getattr(getattr(state, "labcore", None), "last_reachable", None)
     labcore = "unknown" if last is None else ("reachable" if last else "unreachable")
+    with _sessions_lock:
+        active_sessions = len(user_sessions)
     return jsonify({
         "status": "ok",
         "version": APP_VERSION,
         "labcore": labcore,
         "pid": os.getpid(),
+        # Whether a deploy would interrupt anyone. A session is a reviewer with
+        # records and a PDF cache in memory; restarting loses that and makes
+        # them re-pull, so sessions matter more here than raw request age.
+        "active_sessions": active_sessions,
+        "idle_seconds": round(time.time() - _last_request_time, 1),
     })
 
 

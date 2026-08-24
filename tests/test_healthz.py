@@ -16,6 +16,7 @@ deployment rather than the app:
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -131,6 +132,75 @@ def test_healthz_reports_last_known_reachability(
     monkeypatch.setattr(app_module.state, "labcore", stub)
 
     assert anon_client.get("/healthz").get_json()["labcore"] == expected
+
+
+# ── idleness, for unattended deploys ────────────────────────────────────────
+
+class TestIdleReporting:
+    """/healthz reports whether anyone is using the app.
+
+    The updater switches releases automatically when nobody is, so this is the
+    signal that decides whether a reviewer gets interrupted mid-review.
+    """
+
+    def test_healthz_reports_sessions_and_idle(self, anon_client):
+        body = anon_client.get("/healthz").get_json()
+        assert "active_sessions" in body and "idle_seconds" in body
+        assert isinstance(body["active_sessions"], int)
+        assert isinstance(body["idle_seconds"], (int, float))
+
+    def test_active_sessions_counts_real_sessions(self, anon_client, monkeypatch):
+        import app as app_module
+        from app import UserState
+
+        uid = "test-uid-idle"
+        with app_module._sessions_lock:
+            app_module.user_sessions[uid] = UserState(uid, "RC")
+        try:
+            assert anon_client.get("/healthz").get_json()["active_sessions"] >= 1
+        finally:
+            with app_module._sessions_lock:
+                app_module.user_sessions.pop(uid, None)
+
+    def test_healthz_does_not_count_as_activity(self, anon_client):
+        """The decisive one.
+
+        The updater polls /healthz to ask "is anyone using this?". If asking
+        the question counted as activity, the answer would always be "yes" and
+        an idle-gated deploy could never fire. Worse, it would also suppress
+        COA's own 3 AM auto-restart, which is gated on the same timestamp — so
+        a monitoring call would silently disable a token refresh the app
+        depends on.
+        """
+        import app as app_module
+
+        app_module._last_request_time = time.time() - 600
+        before = app_module._last_request_time
+
+        anon_client.get("/healthz")
+
+        assert app_module._last_request_time == before, (
+            "/healthz reset the activity clock"
+        )
+        assert anon_client.get("/healthz").get_json()["idle_seconds"] > 500
+
+    def test_api_health_also_does_not_count_as_activity(self, anon_client):
+        """Same reasoning: the frontend polls it during a restart, and that is
+        the app waiting for itself, not a person using it."""
+        import app as app_module
+
+        app_module._last_request_time = time.time() - 600
+        before = app_module._last_request_time
+        anon_client.get("/api/health")
+        assert app_module._last_request_time == before
+
+    def test_a_real_request_does_count_as_activity(self, anon_client):
+        """The guard must not have switched activity tracking off entirely."""
+        import app as app_module
+
+        app_module._last_request_time = time.time() - 600
+        anon_client.get("/")
+        assert app_module._last_request_time > time.time() - 5
 
 
 def test_client_records_reachability_on_success_and_failure():

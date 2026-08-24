@@ -200,6 +200,42 @@ def may_switch(*, staged: Optional[dict], requested_tag: str) -> tuple[bool, str
     return True, ""
 
 
+def should_auto_switch(*, enabled: bool, staged: Optional[dict],
+                       current: Optional[str], health: Optional[dict],
+                       min_idle_seconds: float) -> tuple[bool, str]:
+    """Whether to deploy a staged release without asking anyone.
+
+    Every unknown resolves to "no". This runs unattended against the app the
+    lab is using, and the cost of a wrong "yes" is a reviewer losing an
+    in-progress review — their records and PDF cache live in the process being
+    restarted. The cost of a wrong "no" is that a deploy waits for the next
+    poll, or for a person.
+    """
+    if not enabled:
+        return False, "auto-switch is not enabled for this app"
+    if not staged:
+        return False, "nothing staged"
+    tag = staged.get("tag")
+    if not staged.get("healthy"):
+        return False, f"staged release {tag!r} did not pass its health check"
+    if not differs_from(current, tag):
+        return False, "already on the staged release"
+    if not health:
+        return False, ("could not read /healthz, so cannot tell whether anyone "
+                       "is using it — leaving it alone")
+
+    sessions = health.get("active_sessions")
+    idle = health.get("idle_seconds")
+    if sessions is None or idle is None:
+        return False, ("/healthz does not report idleness (an older release?) "
+                       "— cannot deploy unattended without it")
+    if sessions > 0:
+        return False, f"{sessions} active session(s)"
+    if idle < min_idle_seconds:
+        return False, f"only idle {idle:.0f}s of {min_idle_seconds:.0f}s required"
+    return True, ""
+
+
 def supervision_decision(*, has_listener: bool, paused: bool,
                          starts_in_window: int, max_starts: int) -> str:
     """Whether to (re)start an app this cycle.
@@ -714,6 +750,13 @@ class App:
         self.port_arg = cfg.get("port_arg") or ""
         self.args = list(cfg.get("args") or [])
         self.health_args = list(cfg.get("health_args") or [])
+        # Deploy without asking, once nobody is using the app. Off unless the
+        # config says otherwise: the brief's default is a human click, and
+        # turning this on is a deliberate decision about who finds out first
+        # when a release is subtly wrong.
+        self.auto_switch = bool(cfg.get("auto_switch", False))
+        self.min_idle_seconds = float(
+            cfg.get("min_idle_seconds", defaults.get("min_idle_seconds", 600)))
         self.keep = int(cfg.get("keep_releases", defaults.get("keep_releases", DEFAULT_KEEP)))
         self.browsers_path = defaults.get("playwright_browsers_path")
 
@@ -1060,7 +1103,32 @@ def poll_once(app: App, token: Optional[str]) -> str:
         except UpdaterError as exc:
             log.error("[%s] staging failed: %s", app.name, exc)
             write_staged(app.data_dir, tag=latest or "?", healthy=False, notes=str(exc))
+
+    if app.auto_switch:
+        try_auto_switch(app)
     return action
+
+
+def try_auto_switch(app: App) -> bool:
+    """Deploy a staged release if nobody is using the app."""
+    staged = read_staged(app.data_dir)
+    if not staged or is_paused(app.data_dir):
+        return False
+    health = _http_get_json(f"http://127.0.0.1:{app.port}/healthz")
+    ok, why = should_auto_switch(
+        enabled=app.auto_switch, staged=staged, current=app.current_version(),
+        health=health, min_idle_seconds=app.min_idle_seconds,
+    )
+    if not ok:
+        # Only worth saying when there is actually something waiting to go.
+        if staged.get("healthy") and differs_from(app.current_version(),
+                                                  staged.get("tag")):
+            log.info("[%s] holding %s back: %s", app.name, staged.get("tag"), why)
+        return False
+    log.warning("[%s] nobody is using it (idle %ss, %s sessions) — deploying %s "
+                "automatically", app.name, health.get("idle_seconds"),
+                health.get("active_sessions"), staged.get("tag"))
+    return switch(app, staged["tag"])
 
 
 def load_config(path: Path) -> tuple[list[App], dict]:

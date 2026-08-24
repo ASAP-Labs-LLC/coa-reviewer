@@ -234,6 +234,88 @@ def test_write_staged_is_atomic(tmp_path):
     assert json.loads((tmp_path / "staged.json").read_text(encoding="utf-8"))["tag"] == "v1.0.1"
 
 
+# ── auto-switch when idle ───────────────────────────────────────────────────
+
+class TestAutoSwitch:
+    """Deploying without a human means the idle check is the only thing
+    standing between a reviewer and losing their in-progress review.
+
+    A COA session holds records and a PDF cache in memory; a restart makes the
+    reviewer re-pull everything. So "nobody is using it" has to be answered
+    conservatively: anything unknown counts as in use.
+    """
+
+    def test_switches_when_idle_and_a_healthy_release_is_staged(self):
+        assert updater.should_auto_switch(
+            enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
+            health={"active_sessions": 0, "idle_seconds": 600},
+            min_idle_seconds=300,
+        ) == (True, "")
+
+    def test_disabled_never_switches(self):
+        ok, why = updater.should_auto_switch(
+            enabled=False, staged={"tag": "v2", "healthy": True}, current="v1",
+            health={"active_sessions": 0, "idle_seconds": 600},
+            min_idle_seconds=300,
+        )
+        assert ok is False and "not enabled" in why
+
+    def test_never_switches_with_an_active_session(self):
+        ok, why = updater.should_auto_switch(
+            enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
+            health={"active_sessions": 1, "idle_seconds": 9999},
+            min_idle_seconds=300,
+        )
+        assert ok is False and "session" in why.lower()
+
+    def test_never_switches_before_the_idle_threshold(self):
+        ok, why = updater.should_auto_switch(
+            enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
+            health={"active_sessions": 0, "idle_seconds": 10},
+            min_idle_seconds=300,
+        )
+        assert ok is False and "idle" in why.lower()
+
+    def test_never_switches_an_unhealthy_release(self):
+        ok, _ = updater.should_auto_switch(
+            enabled=True, staged={"tag": "v2", "healthy": False}, current="v1",
+            health={"active_sessions": 0, "idle_seconds": 9999},
+            min_idle_seconds=300,
+        )
+        assert ok is False
+
+    def test_nothing_to_do_when_already_on_the_staged_release(self):
+        ok, _ = updater.should_auto_switch(
+            enabled=True, staged={"tag": "v2", "healthy": True}, current="v2",
+            health={"active_sessions": 0, "idle_seconds": 9999},
+            min_idle_seconds=300,
+        )
+        assert ok is False
+
+    def test_unreadable_health_is_treated_as_in_use(self):
+        """If /healthz cannot be read we do not know whether anyone is there.
+
+        Guessing "idle" here deploys on top of whoever is mid-review, so the
+        unknown case must resolve to "leave it alone" — the app is up (the
+        supervisor would have restarted it otherwise), we simply cannot see
+        inside it.
+        """
+        ok, why = updater.should_auto_switch(
+            enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
+            health=None, min_idle_seconds=300,
+        )
+        assert ok is False and "could not" in why.lower()
+
+    def test_missing_idle_fields_are_treated_as_in_use(self):
+        """An older release that predates the idle fields must not be read as
+        idle just because the key is absent."""
+        ok, _ = updater.should_auto_switch(
+            enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
+            health={"status": "ok"}, min_idle_seconds=300,
+        )
+        assert ok is False
+
+
 # ── supervision ─────────────────────────────────────────────────────────────
 
 class TestSupervisionDecision:
