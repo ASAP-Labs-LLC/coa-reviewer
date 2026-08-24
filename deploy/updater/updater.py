@@ -202,7 +202,8 @@ def may_switch(*, staged: Optional[dict], requested_tag: str) -> tuple[bool, str
 
 def should_auto_switch(*, enabled: bool, staged: Optional[dict],
                        current: Optional[str], health: Optional[dict],
-                       min_idle_seconds: float) -> tuple[bool, str]:
+                       min_idle_seconds: float,
+                       latest: Optional[str]) -> tuple[bool, str]:
     """Whether to deploy a staged release without asking anyone.
 
     Every unknown resolves to "no". This runs unattended against the app the
@@ -220,6 +221,17 @@ def should_auto_switch(*, enabled: bool, staged: Optional[dict],
         return False, f"staged release {tag!r} did not pass its health check"
     if not differs_from(current, tag):
         return False, "already on the staged release"
+    # The staged record can outlive the reason it was made. Staging is driven
+    # by whatever GitHub called "latest" at the time, and that can move
+    # backwards — marking the deployed release as a prerelease does exactly
+    # that. Found live: it staged the *previous* release and was one poll from
+    # silently rolling the lab back a version.
+    if not latest:
+        return False, ("cannot confirm the staged release is still the latest "
+                       "(GitHub unreachable) — leaving it alone")
+    if differs_from(tag, latest):
+        return False, (f"staged release {tag!r} is no longer the latest "
+                       f"({latest!r}); refusing to deploy it unattended")
     if not health:
         return False, ("could not read /healthz, so cannot tell whether anyone "
                        "is using it — leaving it alone")
@@ -1109,19 +1121,19 @@ def poll_once(app: App, token: Optional[str]) -> str:
             write_staged(app.data_dir, tag=latest or "?", healthy=False, notes=str(exc))
 
     if app.auto_switch:
-        try_auto_switch(app)
+        try_auto_switch(app, latest=latest)
     return action
 
 
-def try_auto_switch(app: App) -> bool:
-    """Deploy a staged release if nobody is using the app."""
+def try_auto_switch(app: App, *, latest: Optional[str]) -> bool:
+    """Deploy a staged release if it is still the latest and nobody is on it."""
     staged = read_staged(app.data_dir)
     if not staged or is_paused(app.data_dir):
         return False
     health = _http_get_json(f"http://127.0.0.1:{app.port}/healthz")
     ok, why = should_auto_switch(
         enabled=app.auto_switch, staged=staged, current=app.current_version(),
-        health=health, min_idle_seconds=app.min_idle_seconds,
+        health=health, min_idle_seconds=app.min_idle_seconds, latest=latest,
     )
     if not ok:
         # Only worth saying when there is actually something waiting to go.

@@ -249,14 +249,41 @@ class TestAutoSwitch:
         assert updater.should_auto_switch(
             enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
             health={"active_sessions": 0, "idle_seconds": 600},
-            min_idle_seconds=300,
+            min_idle_seconds=300, latest="v2",
         ) == (True, "")
+
+    def test_never_deploys_a_staged_release_that_is_no_longer_latest(self):
+        """A stale staged.json must not cause a downgrade.
+
+        Found live: marking the deployed release as a prerelease moved
+        GitHub's "latest" back to the previous tag, the updater staged that
+        older release, and because staged != current it was one poll away from
+        deploying it — silently rolling the lab back a version. Staging is
+        driven by "latest", so the staged record can outlive the reason it was
+        made.
+        """
+        ok, why = updater.should_auto_switch(
+            enabled=True, staged={"tag": "v1", "healthy": True}, current="v2",
+            health={"active_sessions": 0, "idle_seconds": 9999},
+            min_idle_seconds=300, latest="v2",
+        )
+        assert ok is False and "latest" in why.lower()
+
+    def test_refuses_when_latest_is_unknown(self):
+        """A failed GitHub call means we cannot confirm the staged release is
+        still the one to deploy, so we do not deploy it."""
+        ok, why = updater.should_auto_switch(
+            enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
+            health={"active_sessions": 0, "idle_seconds": 9999},
+            min_idle_seconds=300, latest=None,
+        )
+        assert ok is False
 
     def test_disabled_never_switches(self):
         ok, why = updater.should_auto_switch(
             enabled=False, staged={"tag": "v2", "healthy": True}, current="v1",
             health={"active_sessions": 0, "idle_seconds": 600},
-            min_idle_seconds=300,
+            min_idle_seconds=300, latest="v2",
         )
         assert ok is False and "not enabled" in why
 
@@ -264,7 +291,7 @@ class TestAutoSwitch:
         ok, why = updater.should_auto_switch(
             enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
             health={"active_sessions": 1, "idle_seconds": 9999},
-            min_idle_seconds=300,
+            min_idle_seconds=300, latest="v2",
         )
         assert ok is False and "session" in why.lower()
 
@@ -272,7 +299,7 @@ class TestAutoSwitch:
         ok, why = updater.should_auto_switch(
             enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
             health={"active_sessions": 0, "idle_seconds": 10},
-            min_idle_seconds=300,
+            min_idle_seconds=300, latest="v2",
         )
         assert ok is False and "idle" in why.lower()
 
@@ -280,7 +307,7 @@ class TestAutoSwitch:
         ok, _ = updater.should_auto_switch(
             enabled=True, staged={"tag": "v2", "healthy": False}, current="v1",
             health={"active_sessions": 0, "idle_seconds": 9999},
-            min_idle_seconds=300,
+            min_idle_seconds=300, latest="v2",
         )
         assert ok is False
 
@@ -288,7 +315,7 @@ class TestAutoSwitch:
         ok, _ = updater.should_auto_switch(
             enabled=True, staged={"tag": "v2", "healthy": True}, current="v2",
             health={"active_sessions": 0, "idle_seconds": 9999},
-            min_idle_seconds=300,
+            min_idle_seconds=300, latest="v2",
         )
         assert ok is False
 
@@ -302,8 +329,7 @@ class TestAutoSwitch:
         """
         ok, why = updater.should_auto_switch(
             enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
-            health=None, min_idle_seconds=300,
-        )
+            health=None, min_idle_seconds=300, latest="v2",)
         assert ok is False and "could not" in why.lower()
 
     def test_missing_idle_fields_are_treated_as_in_use(self):
@@ -311,8 +337,7 @@ class TestAutoSwitch:
         idle just because the key is absent."""
         ok, _ = updater.should_auto_switch(
             enabled=True, staged={"tag": "v2", "healthy": True}, current="v1",
-            health={"status": "ok"}, min_idle_seconds=300,
-        )
+            health={"status": "ok"}, min_idle_seconds=300, latest="v2",)
         assert ok is False
 
 

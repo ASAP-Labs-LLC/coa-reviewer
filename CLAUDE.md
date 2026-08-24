@@ -10,6 +10,19 @@ Flask web app that lets ASAP Labs reviewers QC QBench Certificates of Analysis (
 
 The server is multi-user: one Flask process serves the LAN, each browser session gets its own `UserState` (records, results, PDF cache, SSE queue), while shared resources (QBench API client, Playwright session, LabCore client, upload queue) live in a single `AppState`.
 
+## Releasing
+
+**See `RELEASING.md`.** Short version: push a `v*` tag and CI builds a release;
+the updater on ASAPSV1 stages it, health-checks it, and **deploys it by itself
+once no reviewer is using the app**. Nothing else is needed and no credential is
+involved — the repo is public.
+
+Two things to know before tagging: the updater tracks whatever GitHub calls
+*latest* (equality, not ordering — publishing an older tag deploys it, which is
+how a rollback-by-release works), and an idle-gated health check proves the app
+starts, never that it renders a COA correctly. `updater.py rollback --app coa`
+is the counterweight.
+
 ## Run / develop
 
 Windows — one-time setup, then launch separately:
