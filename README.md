@@ -36,3 +36,5 @@ templates
 Virtualenvs, `__pycache__`, instrument data, logs, and credential files were excluded during import. See `.gitignore`.
 
 <!-- Deployment smoke test: v1.0.2 exercises the staged-release path end to end. -->
+
+<!-- v1.0.4: exercises the unattended idle deploy end to end. -->
