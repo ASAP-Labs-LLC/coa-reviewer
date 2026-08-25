@@ -28,6 +28,14 @@ let lastActivity = Date.now();
 let inactivityTimer = null;
 let heartbeatTimer = null;
 const INACTIVITY_MS = 10 * 60 * 1000;  // 10 minutes
+
+// How long a pull may go without any sample reporting before it counts as
+// stalled rather than working. Under it, the inactivity timeout is deferred so
+// a waiting reviewer is not logged out mid-pull; past it, the session releases
+// normally. Comfortably longer than the ~3s poll cadence a single preview
+// settles into, short enough that an abandoned browser still times out.
+const PULL_STALL_MS = 90 * 1000;
+let _lastPullProgress = 0;
 const SLOW_LOGIN_MS = 90 * 1000;        // 90 seconds before showing manual login option
 
 // ── DOM refs ─────────────────────────────────────────────────────────
@@ -646,6 +654,22 @@ function startInactivityTimer() {
 
     inactivityTimer = setInterval(() => {
         if (Date.now() - lastActivity > INACTIVITY_MS) {
+            // A reviewer waiting on their own pull is not idle. Waiting resets
+            // nothing — the timer only listens for mousemove/click/keydown/
+            // scroll — so a long pull times out precisely the person waiting
+            // on it. And triggerTimeout() closes the EventSource, which is the
+            // only channel carrying sample_status: the outstanding samples can
+            // then never be reported ready to this browser at all.
+            //
+            // Measured against the real preview path: at an 8s QBench render a
+            // 250-sample pull is still going at 630s and the reviewer is locked
+            // out two samples short; at 16s, 115 samples are stranded.
+            //
+            // Bounded by progress, not merely by being unfinished — a pull that
+            // stalls outright must still release the session.
+            const pulling = _anyUnfinished()
+                && (Date.now() - _lastPullProgress) < PULL_STALL_MS;
+            if (pulling) return;
             triggerTimeout();
         }
     }, 30000);  // check every 30 seconds
@@ -863,6 +887,15 @@ function handleSSE(data) {
         case "tab_loaded":
             loadTab(data.tab);
             break;
+        case "resync":
+            // The server shed queued events because this browser fell behind,
+            // so some statuses on screen are stale and no further event will
+            // correct them. Reload tab state instead of trusting what's shown.
+            // Debounced: overflow happens during the heaviest part of a pull,
+            // which is the worst moment to fire a reload per dropped event.
+            clearTimeout(state._resyncTimer);
+            state._resyncTimer = setTimeout(() => restoreAllTabs(), 1500);
+            break;
         case "sample_status":
             updateSampleStatus(data.tab, data.lab_id, data.status);
             break;
@@ -949,10 +982,39 @@ function clearSampleSelection() {
     hideContextMenu();
 }
 
+// Which lab_ids currently carry .selected because of the MULTI-selection.
+// Tracked so clearing costs the size of the selection rather than the size of
+// the list — a plain click clears an empty selection and should be free.
+let _paintedIds = new Set();
+
+// The row carrying .selected because it is the single current sample.
+let _highlightedEl = null;
+
+function _rowFor(labId) {
+    return document.querySelector(
+        `#sample-list .sample-item[data-lab="${CSS.escape(labId)}"]`);
+}
+
 function paintSelection() {
-    $$("#sample-list .sample-item").forEach(el => {
-        el.classList.toggle("selected", SEL.ids.has(el.dataset.lab));
-    });
+    // Single- and multi-select share the .selected class. The old full sweep
+    // implicitly cleared a single highlight that wasn't part of the
+    // selection; do that explicitly now that nothing sweeps.
+    if (_highlightedEl && !SEL.ids.has(_highlightedEl.dataset.lab)) {
+        _highlightedEl.classList.remove("selected");
+        _highlightedEl = null;
+    }
+    for (const lab of _paintedIds) {
+        if (!SEL.ids.has(lab)) {
+            const el = _rowFor(lab);
+            if (el) el.classList.remove("selected");
+        }
+    }
+    for (const lab of SEL.ids) {
+        const el = _rowFor(lab);
+        if (el) el.classList.add("selected");
+    }
+    _paintedIds = new Set(SEL.ids);
+
     const n = SEL.ids.size;
     const label = $("#sample-count");
     if (label) {
@@ -1138,7 +1200,31 @@ async function loadTab(tabName) {
     } catch(e) { /* ignore */ }
 }
 
+// Is any sample anywhere still pending or loading?
+//
+// This runs on every sample_status event, and a 250-sample pull now delivers
+// ~500 of them (most used to be dropped silently, which hid the cost). The
+// old form built a flattened array of every sample on every tab and then ran
+// every() over it — an allocation plus a full pass, per event, during the
+// busiest moment of a pull. Walking in place and returning at the first
+// unfinished sample makes the common case — early in a pull, when nearly
+// everything is unfinished — effectively O(1).
+function _anyUnfinished() {
+    for (const tab in state.samples) {
+        const list = state.samples[tab];
+        if (!list) continue;
+        for (let i = 0; i < list.length; i++) {
+            const s = list[i].status;
+            if (s === "pending" || s === "loading") return true;
+        }
+    }
+    return false;
+}
+
 function updateSampleStatus(tab, labId, status) {
+    // Proof the pull is still working, used to defer the idle timeout while a
+    // reviewer waits on it.
+    _lastPullProgress = Date.now();
     const samples = state.samples[tab];
     if (!samples) return;
     const sample = samples.find(s => s.lab_id === labId);
@@ -1172,9 +1258,7 @@ function updateSampleStatus(tab, labId, status) {
         }
     }
 
-    const allDone = Object.values(state.samples).flat()
-        .every(s => s.status !== "pending" && s.status !== "loading");
-    if (allDone) {
+    if (!_anyUnfinished()) {
         $("#start-btn").disabled = false;
         $("#export-btn").disabled = false;
         $("#good-links-btn").disabled = false;
@@ -1250,10 +1334,21 @@ function renderSampleList() {
     }
 }
 
+// Changing which single row is highlighted is a two-element operation, not a
+// list traversal. The old form toggled a class on every .sample-item, so a
+// keyboard switch cost one full-list style invalidation and a click cost two
+// (paintSelection ran first). At 250 rows on a throttled machine that is the
+// per-interaction cost that lifts the whole latency distribution.
+//
+// A re-render detaches the tracked node; removing a class from a detached
+// element is harmless, and the fresh node gets the class below.
 function highlightSample(labId) {
-    $$(".sample-item").forEach(el => {
-        el.classList.toggle("selected", el.dataset.lab === labId);
-    });
+    const el = _rowFor(labId);
+    if (_highlightedEl && _highlightedEl !== el) {
+        _highlightedEl.classList.remove("selected");
+    }
+    _highlightedEl = el;
+    if (el) el.classList.add("selected");
 }
 
 function selectSample(sample) {
@@ -1347,9 +1442,13 @@ function updateActionButtons() {
 function updateTabActionButtons() {
     const rpBtn = $("#regen-pending-btn");
     if (!rpBtn) return;
-    const pending = (state.samples[state.currentTab] || [])
-        .filter(x => !["good", "bad"].includes(x.status));
-    rpBtn.disabled = pending.length === 0;
+    // some() stops at the first pending sample and allocates nothing; the old
+    // filter() built a whole array just to ask whether it was empty, on every
+    // status event. The status literal is hoisted so it isn't rebuilt per
+    // element visited.
+    const hasPending = (state.samples[state.currentTab] || [])
+        .some(x => x.status !== "good" && x.status !== "bad");
+    rpBtn.disabled = !hasPending;
 }
 
 
