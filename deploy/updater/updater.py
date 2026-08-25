@@ -1050,11 +1050,21 @@ _START_HISTORY: dict = {}
 def supervise(app: App) -> str:
     """Restart ``app`` if it has stopped serving.
 
+    This is a backstop, not the primary mechanism, and it is worth being
+    precise about which is which.
+
     COA exits on purpose — ``_auto_restart_worker`` at 3 AM to refresh
     long-lived Playwright and QBench tokens, and ``/api/restart`` when a
-    reviewer clicks Restart. Run.pyw used to respawn it; the deployed layout
-    has no Run.pyw, so without this COA would exit at 3 AM and never return,
-    and a reviewer clicking Restart would end the service for the day.
+    reviewer clicks Restart — but it **spawns its own replacement** before
+    ``os._exit(0)`` and has done since the initial import. Those paths recover
+    without help: verified 2026-08-25, shutdown 03:00:06 and back at 03:00:11,
+    with this function logging nothing.
+
+    What self-respawn cannot cover is what this is for: a hard kill
+    (``taskkill``/``Stop-Process``), a crash that never reaches
+    ``_graceful_shutdown``, or the respawn itself failing — there is a
+    ``Self-respawn failed`` path in the app for exactly that. It earned its
+    place on 2026-08-21, restarting COA twice after hard kills.
 
     Probing is by connecting, never by binding: on Windows ``SO_REUSEADDR``
     lets a bind succeed against a port that is already being served, which is
