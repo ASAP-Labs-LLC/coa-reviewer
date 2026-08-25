@@ -1991,7 +1991,11 @@ def no_cache(response):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # The version is rendered into the page rather than fetched: /api/config
+    # only runs after portal login and the review-mode picker, which left the
+    # badge blank on the login and boot screens — exactly when someone is
+    # asking which build this is.
+    return render_template("index.html", app_version=APP_VERSION)
 
 
 @app.route("/api/health")
@@ -2250,6 +2254,11 @@ def get_config():
         "has_password": bool(cfg.get("qbench_password")),
         "logged_in": state.logged_in,
         "has_data": len(ustate.records) > 0,
+        # Which build is this? A self-deploying app makes that a question
+        # reviewers have to answer out loud. It rides /api/config because the
+        # frontend fetches that at boot anyway; /healthz is deliberately not
+        # the source, being unauthenticated and meant for the updater.
+        "version": APP_VERSION,
     })
 
 

@@ -632,6 +632,10 @@
         </div>
     </div>
 
+    <!-- Which build is running. Outside #app so it shows on the login and
+         boot screens too, which is exactly when someone is asking. -->
+    <div id="app-version" aria-hidden="true">v{{ app_version|default("dev", true)|replace("v", "", 1) }}</div>
+
     <script src="/static/js/app.js"></script>
 </body>
 </html>

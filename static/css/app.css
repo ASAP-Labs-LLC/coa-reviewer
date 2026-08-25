@@ -2620,3 +2620,31 @@ body.dark .sync-slot-warn { color: #fbbf24; }
     font-weight: 600;
 }
 body.dark .sif-placeholder.sif-missing { color: #f87171; }
+
+/* ── Version stamp ────────────────────────────────────────────────────
+   Which build is running, bottom-right. Deliberately quiet: a reviewer
+   should never notice it, and whoever is debugging with them should never
+   have to ask. pointer-events:none because it sits above the pane layout
+   and must not eat a click meant for the app underneath. Colours come from
+   the same tokens as the surrounding chrome so it works in both themes. */
+#app-version {
+    position: fixed;
+    bottom: 6px;
+    right: 10px;
+    z-index: 60;
+    pointer-events: none;
+    user-select: none;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted, #8a9199);
+    opacity: 0.55;
+}
+
+body.dark #app-version {
+    opacity: 0.4;
+}
+
+@media print {
+    #app-version { display: none; }
+}

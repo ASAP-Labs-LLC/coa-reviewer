@@ -417,6 +417,7 @@ async function initQBenchApp() {
             return;
         }
         const cfg = await resp.json();
+        setAppVersion(cfg.version);
         if (cfg.username) $("#login-username").value = cfg.username;
         if (cfg.has_password) $("#login-password").placeholder = "(saved)";
 
@@ -873,6 +874,15 @@ function connectSSE() {
     state.eventSource.onerror = () => {
         // Auto-reconnect is built into EventSource
     };
+}
+
+// The running build, shown bottom-right. "dev" on a working checkout, the
+// release tag on a deployed one — CI writes it into VERSION and app.py reads
+// it. Silent if the server did not send one, rather than showing "undefined".
+function setAppVersion(version) {
+    const el = $("#app-version");
+    if (!el) return;
+    el.textContent = version ? `v${String(version).replace(/^v/, "")}` : "";
 }
 
 function handleSSE(data) {
