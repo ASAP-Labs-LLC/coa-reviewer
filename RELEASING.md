@@ -144,6 +144,9 @@ Two things about that, both learned the hard way:
   rely on that as a workflow: if you want to pull a bad release, use
   `rollback`, not the prerelease flag.
 
+Every command and flag the updater accepts is catalogued in
+[`docs/UPDATER-FLAGS.md`](docs/UPDATER-FLAGS.md).
+
 **Stopping deploys entirely** while you work:
 
 ```

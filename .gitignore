@@ -71,3 +71,7 @@ qbench.json
 # checkout has no VERSION and reports "dev"; committing one would make every
 # dev box claim to be a release.
 VERSION
+
+# Benchmark output: regenerable, machine-specific, and rewritten on every run.
+# The harness that produces it is tracked; its numbers are not.
+bench/results/
