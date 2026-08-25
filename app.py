@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1077,6 +1077,111 @@ state = AppState()
 # Per-User Session State
 # ══════════════════════════════════════════════════════════════════════════════
 
+# 750 KB is a realistic rendered COA, so this holds roughly 130 of them —
+# far more than a reviewer's working set, since reviewing walks the list in
+# order and rarely doubles back. Measured on the benchmark harness at 250
+# samples: uncapped peak RSS was 363 MB, a 64 MB cap brought it to 286 MB with
+# no measurable latency cost. 192 MB was the first default tried and never
+# evicted at that size, which is why it is lower now.
+# Override per-machine with COA_PDF_CACHE_MB.
+PDF_CACHE_MAX_BYTES = int(os.environ.get("COA_PDF_CACHE_MB", "96")) * 1024 * 1024
+
+# Each sample emits ~5.5 events (sample_status loading→ready, sif_status
+# loading→resolved, plus a status line), measured at N=20. The old 200 slots
+# therefore overflowed at ~36 samples and badly past 70 — squarely where
+# reviewers report the app breaking down. Overflow is survivable now
+# (_shed_oldest keeps the subscriber and sends `resync`), but a resync reloads
+# every tab mid-pull, so it is recovery rather than a working state. Sized for
+# a 300-sample day instead; these are small dicts, well under a megabyte per
+# connected browser.
+SSE_QUEUE_MAXSIZE = 2000
+
+
+class PdfCache:
+    """A byte-budgeted LRU of rendered COA PDFs, keyed by lab_id.
+
+    This was a plain dict, which made it unbounded: one whole PDF per sample
+    viewed, per browser session, with nothing evicting. Measured on the
+    benchmark harness, peak server RSS went 117 MB at 20 samples to 364 MB at
+    250 — a linear 1.07 MB per sample — and several reviewers work the same
+    day's samples at once on a modest lab server.
+
+    Least-recently-used is the right order: reviewing walks the list roughly
+    in order and rarely returns to a sample already cleared, and the COA on
+    screen is by definition the most recently used, so it is evicted last.
+    Eviction costs a re-fetch from QBench on revisit, which is why the budget
+    is generous rather than tight.
+
+    Locked rather than relying on the GIL: `move_to_end` plus the byte
+    accounting is several operations, and background IO_POOL workers write
+    while request threads read.
+    """
+
+    def __init__(self, max_bytes: int = PDF_CACHE_MAX_BYTES) -> None:
+        self.max_bytes = max_bytes
+        self._items: "OrderedDict[str, bytes]" = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    @property
+    def total_bytes(self) -> int:
+        with self._lock:
+            return self._bytes
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def __contains__(self, key: str) -> bool:
+        # get_pdf tests membership before serving, so this counts as a use.
+        with self._lock:
+            if key in self._items:
+                self._items.move_to_end(key)
+                return True
+            return False
+
+    def __getitem__(self, key: str) -> bytes:
+        with self._lock:
+            value = self._items[key]
+            self._items.move_to_end(key)
+            return value
+
+    def __setitem__(self, key: str, value: bytes) -> None:
+        size = len(value)
+        with self._lock:
+            previous = self._items.pop(key, None)
+            if previous is not None:
+                self._bytes -= len(previous)
+            if size > self.max_bytes:
+                # Storing it would evict everything else for an entry we would
+                # then have to evict anyway. Serve it and move on.
+                return
+            self._items[key] = value
+            self._bytes += size
+            while self._bytes > self.max_bytes and len(self._items) > 1:
+                _, evicted = self._items.popitem(last=False)
+                self._bytes -= len(evicted)
+
+    def get(self, key: str, default: Optional[bytes] = None) -> Optional[bytes]:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def pop(self, key: str, default: Optional[bytes] = None) -> Optional[bytes]:
+        with self._lock:
+            value = self._items.pop(key, None)
+            if value is None:
+                return default
+            self._bytes -= len(value)
+            return value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self._bytes = 0
+
+
 class UserState:
     """Holds COA review state for one browser session (one person)."""
 
@@ -1086,7 +1191,7 @@ class UserState:
         self.last_active = time.time()
         self.records: Dict[Tuple[str, str], SampleRecord] = {}
         self.session_results: List[dict] = []
-        self.pdf_cache: Dict[str, bytes] = {}
+        self.pdf_cache = PdfCache()
         self.pdf_loading: set = set()
         self.status_log: List[str] = []
         self._lock = threading.Lock()
@@ -1102,16 +1207,43 @@ class UserState:
         self.emit_sse({"type": "status", "message": msg})
 
     def emit_sse(self, data: dict) -> None:
-        dead = []
-        for q in self._sse_queues:
+        # Iterate a snapshot: sse_stream appends and removes from request
+        # threads while background workers emit.
+        for q in list(self._sse_queues):
             try:
                 q.put_nowait(data)
             except queue.Full:
-                dead.append(q)
-        for q in dead:
+                self._shed_oldest(q, data)
+
+    @staticmethod
+    def _shed_oldest(q: "queue.Queue", data: dict) -> None:
+        """Make room for `data` by discarding the oldest events.
+
+        A full queue means the browser fell behind, which a large pull makes
+        easy: every sample emits several events and `/api/start` fans out
+        across tabs at once. The old behaviour dropped the *queue* instead —
+        and nothing ever re-added it, while the generator went on yielding
+        keepalives. The connection stayed healthy from the browser's side, so
+        `onerror` never fired, EventSource never reconnected, and the UI went
+        permanently deaf: samples stuck on "loading", and marking (which waits
+        for the `sample_status` event rather than setting it locally) looked
+        like it did nothing.
+
+        Shedding the oldest events keeps the subscriber attached and keeps the
+        terminal statuses, which are the ones that matter. `resync` tells the
+        client it has a gap so it can reload rather than trust stale state.
+        """
+        dropped = 0
+        for _ in range(max(1, q.maxsize // 2)):
             try:
-                self._sse_queues.remove(q)
-            except ValueError:
+                q.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+        for item in ({"type": "resync", "dropped": dropped}, data):
+            try:
+                q.put_nowait(item)
+            except queue.Full:
                 pass
 
     def add_record(self, rec: SampleRecord) -> None:
@@ -1835,8 +1967,23 @@ def track_activity():
 
 @app.after_request
 def no_cache(response):
-    """Prevent Cloudflare (or any proxy) from caching API responses."""
+    """Prevent Cloudflare (or any proxy) from caching API responses.
+
+    A view that has already declared itself ``private`` is left alone. That
+    directive is precisely what forbids a *shared* cache from storing the
+    response, so the reason this hook exists is already satisfied — while
+    ``no-store`` would additionally forbid the reviewer's own browser from
+    keeping it. The PDF routes depend on that distinction: they serve tens of
+    megabytes per session and carry an ETag so a revisited COA costs a 304
+    instead of the whole file. Blanket ``no-store`` made their ETag, their
+    ``immutable`` hint and the frontend's ``?v=`` buster all dead code, and
+    forced Chrome — which refetches the bytes for its PDF viewer after the
+    iframe navigation commits — to pull every COA twice, over the network,
+    on every pane switch.
+    """
     if request.path.startswith("/api/"):
+        if "private" in response.headers.get("Cache-Control", ""):
+            return response
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         response.headers["Pragma"] = "no-cache"
     return response
@@ -2248,6 +2395,10 @@ def search_samples():
 
     keys_to_del = [k for k in ustate.records if k[0] == "Search"]
     for k in keys_to_del:
+        # Drop the rendered COA with the record, as Custom Day does. Keeping
+        # it strands whole PDFs in a cache nothing can reach again.
+        lab_id = ustate.records[k].lab_id
+        ustate.pdf_cache.pop(lab_id, None)
         del ustate.records[k]
 
     multi_ids = _parse_search_query(query)
@@ -2356,7 +2507,13 @@ def load_custom_day():
 
 # ── PDF ──────────────────────────────────────────────────────────────────────
 
-_RANGE_RE = re.compile(r"bytes=(\d+)-(\d*)")
+# Two forms, and a PDF viewer uses both: `bytes=N-` / `bytes=N-M` to read
+# forward, and `bytes=-N` (a *suffix* range) to grab the trailer and xref off
+# the end of the file before deciding whether it can stream the document.
+# Matching only the first form meant answering the suffix probe with a full
+# 200 while still advertising Accept-Ranges — the blank-render trap described
+# below.
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
 def _inline_pdf_response(
@@ -2398,9 +2555,20 @@ def _inline_pdf_response(
     range_header = request.headers.get("Range")
     if range_header:
         m = _RANGE_RE.match(range_header.strip())
-        if m:
-            start = int(m.group(1))
-            end = int(m.group(2)) if m.group(2) else total - 1
+        if m and (m.group(1) or m.group(2)):
+            if not m.group(1):
+                # Suffix range: the last N bytes. More than the file holds
+                # means the whole file, not an error.
+                suffix = int(m.group(2))
+                if suffix == 0:
+                    resp = Response(status=416)
+                    resp.headers["Content-Range"] = f"bytes */{total}"
+                    return resp
+                start = max(0, total - suffix)
+                end = total - 1
+            else:
+                start = int(m.group(1))
+                end = int(m.group(2)) if m.group(2) else total - 1
             if start >= total or start < 0:
                 resp = Response(status=416)
                 resp.headers["Content-Range"] = f"bytes */{total}"
@@ -3642,7 +3810,7 @@ def export_csv():
 @require_portal
 def sse_stream():
     ustate = get_user_state()
-    q: queue.Queue = queue.Queue(maxsize=200)
+    q: queue.Queue = queue.Queue(maxsize=SSE_QUEUE_MAXSIZE)
     ustate._sse_queues.append(q)
 
     def generate():
