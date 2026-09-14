@@ -1105,6 +1105,17 @@ PDF_CACHE_MAX_BYTES = int(os.environ.get("COA_PDF_CACHE_MB", "96")) * 1024 * 102
 # connected browser.
 SSE_QUEUE_MAXSIZE = 2000
 
+# How many samples render ahead of the one on screen. A pull used to submit
+# every sample on every tab to PREVIEW_POOL as soon as the list arrived;
+# renders serialise on the one COASession, so a 100-sample day queued 100
+# Playwright renders (plus a PDF download and a SIF fetch each) before the
+# reviewer had clicked anything, and the sample they wanted could be 80th in
+# line. Now nothing renders until a tab is being looked at, and then only
+# this many forward from the selected sample; the window slides with the
+# selection and renders that fall out of it before starting are cancelled.
+# Whatever the day's size, the server is only ever working on this many.
+PREVIEW_WINDOW = max(1, int(os.environ.get("COA_PREVIEW_WINDOW", "20")))
+
 
 class PdfCache:
     """A byte-budgeted LRU of rendered COA PDFs, keyed by lab_id.
@@ -1202,6 +1213,12 @@ class UserState:
         self.session_results: List[dict] = []
         self.pdf_cache = PdfCache()
         self.pdf_loading: set = set()
+        # Renders waiting in PREVIEW_POOL, keyed like `records`, so a window
+        # move can cancel the ones that have not started and a refocus does
+        # not queue a sample twice. A render removes its own entry when it
+        # starts (generate_preview_for_sample), after which it owns the record.
+        self.preview_futures: Dict[Tuple[str, str], Any] = {}
+        self._focus_lock = threading.Lock()
         self.status_log: List[str] = []
         self._lock = threading.Lock()
         self._persist_lock = threading.Lock()
@@ -1653,12 +1670,10 @@ def fetch_samples_for_tab(tab_name: str, target_date: date, ustate: UserState) -
         # The pulled list is worth keeping before the first mark, so a
         # session lost mid-pull comes back as a list rather than a blank tab.
         ustate.persist()
+        # Nothing renders yet. The browser answers `tab_loaded` with
+        # /api/focus for the tab it is looking at, and the window renders
+        # from the sample it selects; tabs nobody is looking at stay pending.
         ustate.emit_sse({"type": "tab_loaded", "tab": tab_name, "count": len(samples)})
-
-        if state.coa_session and state.logged_in:
-            for info in samples:
-                lab_id = info.get("lab_id") or str(info.get("sample_id", "?"))
-                PREVIEW_POOL.submit(generate_preview_for_sample, tab_name, lab_id, ustate)
 
     except Exception as exc:
         ustate.emit_status(f"[{tab_name}] Error: {exc}")
@@ -1816,19 +1831,93 @@ def fetch_re_review_samples(ustate: UserState) -> None:
         save_re_review_state(new_state)
         ustate.persist()
         ustate.emit_status(f"[Re-review] Found {count} entries.")
+        # Renders wait for /api/focus, as with any other tab.
         ustate.emit_sse({"type": "tab_loaded", "tab": "Re-review", "count": count})
-
-        if state.coa_session and state.logged_in:
-            for lab_id in new_state:
-                PREVIEW_POOL.submit(generate_preview_for_sample, "Re-review", lab_id, ustate)
 
     except Exception as exc:
         ustate.emit_status(f"[Re-review] Error: {exc}")
 
 
+def _preview_window(ustate: UserState, tab: str, lab_id: Optional[str]) -> List[SampleRecord]:
+    """PREVIEW_WINDOW positions of `tab`, starting AT the selected sample.
+
+    Forward only: reviewing walks the list in order, and what came before the
+    selection has either been rendered already or been skipped on purpose.
+    An unknown or missing selection starts at the top.
+    """
+    records = ustate.get_tab_records(tab)
+    start = 0
+    if lab_id:
+        for i, rec in enumerate(records):
+            if rec.lab_id == lab_id:
+                start = i
+                break
+    return records[start:start + PREVIEW_WINDOW]
+
+
+def _queue_preview(ustate: UserState, rec: SampleRecord) -> bool:
+    """Submit one pending render unless it is already waiting. True if queued."""
+    key = (rec.tab, rec.lab_id)
+    with ustate._focus_lock:
+        if rec.status != STATUS_PENDING:
+            return False
+        existing = ustate.preview_futures.get(key)
+        if existing is not None and not existing.done():
+            return False
+        ustate.preview_futures[key] = PREVIEW_POOL.submit(
+            generate_preview_for_sample, rec.tab, rec.lab_id, ustate)
+    return True
+
+
+def _cancel_queued(ustate: UserState, keep: Optional[set] = None) -> int:
+    """Cancel every waiting render whose key is not in `keep`.
+
+    Only renders that have not started can be cancelled; one mid-render is
+    left to finish. Returns how many were cancelled. Done or cancelled
+    entries are dropped from the bookkeeping either way.
+    """
+    keep = keep or set()
+    cancelled = 0
+    with ustate._focus_lock:
+        for key, fut in list(ustate.preview_futures.items()):
+            if fut.done():
+                # Finished or already cancelled: stale bookkeeping.
+                ustate.preview_futures.pop(key, None)
+            elif key in keep:
+                continue
+            elif fut.cancel():
+                ustate.preview_futures.pop(key, None)
+                cancelled += 1
+            # else: mid-render. It took the record over when it started and
+            # clears its own entry; it is left to finish.
+    return cancelled
+
+
+def _drop_queued(ustate: UserState, key: Tuple[str, str]) -> None:
+    """Cancel one waiting render (a regenerate is about to submit its own)."""
+    with ustate._focus_lock:
+        fut = ustate.preview_futures.pop(key, None)
+    if fut is not None:
+        fut.cancel()
+
+
+def focus_previews(ustate: UserState, tab: str, lab_id: Optional[str]) -> Tuple[int, List[str]]:
+    """The reviewer is looking at `lab_id` on `tab`: render the window from
+    there and drop whatever else was waiting. Returns (queued, window ids)."""
+    window = _preview_window(ustate, tab, lab_id)
+    _cancel_queued(ustate, keep={(r.tab, r.lab_id) for r in window})
+    if not (state.coa_session and state.logged_in):
+        return 0, [r.lab_id for r in window]
+    queued = sum(1 for rec in window if _queue_preview(ustate, rec))
+    return queued, [r.lab_id for r in window]
+
+
 def generate_preview_for_sample(tab: str, lab_id: str, ustate: UserState) -> None:
     """Generate a COA preview for a single sample (runs in background thread)."""
     key = (tab, lab_id)
+    # From here the render owns the record; the queue entry has done its job.
+    with ustate._focus_lock:
+        ustate.preview_futures.pop(key, None)
     rec = ustate.records.get(key)
     if not rec or not state.coa_session:
         return
@@ -2473,6 +2562,7 @@ def start_pulling():
         return jsonify({"error": "Not logged in to QBench"}), 401
 
     ustate = get_user_state()
+    _cancel_queued(ustate)
     ustate.records.clear()
     ustate.session_results.clear()
     ustate.pdf_cache.clear()
@@ -2523,6 +2613,30 @@ def get_tab(tab_name: str):
     })
 
 
+@app.route("/api/focus", methods=["POST"])
+@require_portal
+def focus():
+    """The browser says which tab and sample it is looking at; the window
+    from there renders and anything else waiting is dropped.
+
+    Called on every selection (debounced client-side) and when a tab finishes
+    loading while on screen. Cheap to repeat: a sample already waiting,
+    rendering, rendered or judged is left alone. Before QBench is logged in
+    there is nothing to render with, so it answers ok with nothing queued
+    rather than failing the selection.
+    """
+    ustate = get_user_state()
+    body = request.get_json(silent=True) or {}
+    tab = str(body.get("tab") or "").strip()
+    if not tab:
+        return jsonify({"error": "tab required"}), 400
+    lab_id = body.get("lab_id")
+    lab_id = str(lab_id).strip() if lab_id else None
+
+    queued, window = focus_previews(ustate, tab, lab_id)
+    return jsonify({"ok": True, "queued": queued, "window": window})
+
+
 def _parse_search_query(query: str) -> List[str]:
     """Parse a search query that may contain comma-separated values and/or ranges.
 
@@ -2570,6 +2684,7 @@ def search_samples():
     for k in keys_to_del:
         # Drop the rendered COA with the record, as Custom Day does. Keeping
         # it strands whole PDFs in a cache nothing can reach again.
+        _drop_queued(ustate, k)
         lab_id = ustate.records[k].lab_id
         ustate.pdf_cache.pop(lab_id, None)
         del ustate.records[k]
@@ -2643,11 +2758,7 @@ def search_samples():
     ustate.persist()
     ustate.emit_status(f"Found {len(samples)} sample(s) for '{query}'.")
 
-    if state.coa_session and state.logged_in:
-        for info in samples:
-            lab_id = info.get("lab_id") or str(info.get("sample_id", "?"))
-            PREVIEW_POOL.submit(generate_preview_for_sample, "Search", lab_id, ustate)
-
+    # Renders wait for /api/focus, as with any other tab.
     records = ustate.get_tab_records("Search")
     return jsonify({
         "tab": "Search",
@@ -2671,6 +2782,7 @@ def load_custom_day():
 
     keys_to_del = [k for k in ustate.records if k[0] == "Custom Day"]
     for k in keys_to_del:
+        _drop_queued(ustate, k)
         lab_id = ustate.records[k].lab_id
         ustate.pdf_cache.pop(lab_id, None)
         del ustate.records[k]
@@ -3809,6 +3921,9 @@ def regenerate_preview():
     if not rec:
         return jsonify({"error": "Sample not found"}), 404
 
+    # An explicit regenerate submits its own render; one already waiting in
+    # the window for the same sample would make it render twice.
+    _drop_queued(ustate, key)
     _reset_for_regenerate(ustate, rec)
     ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_LOADING})
     PREVIEW_POOL.submit(generate_preview_for_sample, tab, lab_id, ustate)
@@ -3849,26 +3964,37 @@ def regenerate_pending():
 
     Returns immediately; each sample reports back over the existing
     sample_status SSE events as it finishes, so the reviewer keeps working.
+
+    Every unjudged sample is reset, but only the window from the reviewer's
+    current sample is rendered now — on a big day this button used to queue
+    every unjudged sample at once, the same herd a pull used to be. The rest
+    go back to `pending` (not `loading`: nothing is working on them yet) and
+    render as the window reaches them.
     """
     ustate = get_user_state()
-    tab = (request.json or {}).get("tab", "")
+    body = request.json or {}
+    tab = body.get("tab", "")
+    lab_id = body.get("lab_id") or None
 
     stale = [r for r in ustate.get_tab_records(tab)
              if r.status not in (STATUS_GOOD, STATUS_BAD)]
 
     for rec in stale:
         _reset_for_regenerate(ustate, rec)
+        rec.status = STATUS_PENDING
         ustate.emit_sse({
             "type": "sample_status", "tab": tab,
-            "lab_id": rec.lab_id, "status": STATUS_LOADING,
+            "lab_id": rec.lab_id, "status": STATUS_PENDING,
         })
 
-    if stale and state.coa_session and state.logged_in:
-        for rec in stale:
-            PREVIEW_POOL.submit(generate_preview_for_sample, tab, rec.lab_id, ustate)
+    queued = 0
+    if stale:
+        queued, _ = focus_previews(ustate, tab, lab_id)
 
-    ustate.emit_status(f"[{tab}] Regenerating {len(stale)} pending sample(s)…")
-    return jsonify({"ok": True, "count": len(stale)})
+    ustate.emit_status(
+        f"[{tab}] Reset {len(stale)} pending sample(s); rendering {queued} "
+        f"from {lab_id or 'the top'}…")
+    return jsonify({"ok": True, "count": len(stale), "queued": queued})
 
 
 @app.route("/api/regenerate-selected", methods=["POST"])
@@ -3893,6 +4019,7 @@ def regenerate_selected():
             picked.append(rec)
 
     for rec in picked:
+        _drop_queued(ustate, (rec.tab, rec.lab_id))
         _reset_for_regenerate(ustate, rec)
         ustate.emit_sse({
             "type": "sample_status", "tab": tab,

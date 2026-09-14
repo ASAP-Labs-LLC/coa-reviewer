@@ -344,10 +344,17 @@ class BenchDriver:
         if not resp.ok:
             raise RuntimeError(f"card login failed: {resp.status} {resp.text()[:200]}")
 
-    def open_app(self, expected: int) -> float:
-        """Load the page, choose Tests, Start, and wait for N ready samples.
+    def open_app(self, expected: int, window: Optional[int] = None) -> float:
+        """Load the page, choose Tests, Start, and wait for the first window
+        of previews.
 
-        Returns the seconds from clicking Start to the last preview landing.
+        The server renders only ``window`` samples forward from the selected
+        one (app.py's PREVIEW_WINDOW; the rest render as the list is walked),
+        so "the pull is done" means the list has N rows and
+        ``min(N, window)`` of them have reached a terminal state. Pass
+        ``window=None`` to wait for every sample, the pre-window behaviour.
+
+        Returns the seconds from clicking Start to the last of those landing.
         """
         self.page.goto(self.base_url + "/", wait_until="domcontentloaded")
         self.page.wait_for_selector('button.review-pill[data-mode="tests"]', timeout=30_000)
@@ -373,7 +380,8 @@ class BenchDriver:
         while True:
             state = self.page.evaluate(PULL_STATE_JS)
             elapsed = time.time() - started
-            if state["total"] > 0 and state["terminal"] >= state["total"]:
+            target = state["total"] if window is None else min(state["total"], window)
+            if state["total"] > 0 and state["terminal"] >= target:
                 return PullOutcome(True, elapsed, state["ready"], state["total"])
             if state["overlay"]:
                 return PullOutcome(
@@ -386,8 +394,8 @@ class BenchDriver:
                 return PullOutcome(
                     False, elapsed, state["ready"], state["total"],
                     reason=f"gave up after {self.timeout_s:.0f}s with "
-                           f"{state['total'] - state['terminal']} sample(s) still "
-                           f"pending or loading")
+                           f"{target - state['terminal']} of the first {target} "
+                           f"sample(s) still pending or loading")
             self.page.wait_for_timeout(500)
 
     def served_count(self) -> int:

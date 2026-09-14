@@ -300,7 +300,11 @@ def _drive(args, lab, app_url: str, hello: dict, proc) -> RunResult:
         driver = BenchDriver(page, context, cdp, app_url, lab, timeout_s=args.timeout)
         try:
             driver.login()
-            pull = driver.open_app(args.samples)
+            # The app renders a window forward from the selected sample, not
+            # the whole day; the child inherits COA_PREVIEW_WINDOW, so read the
+            # same value here to know how many previews a finished pull has.
+            window = max(1, int(os.environ.get("COA_PREVIEW_WINDOW", "20")))
+            pull = driver.open_app(args.samples, window=window)
             result.served_count = driver.served_count()
             ready = driver.ready_count()
 
@@ -330,10 +334,11 @@ def _drive(args, lab, app_url: str, hello: dict, proc) -> RunResult:
                 # overlay over the UI — they would measure neither.
                 return result
 
-            if ready != args.samples:
+            expected_ready = min(args.samples, window)
+            if ready < expected_ready:
                 result.notes.append(
-                    f"{args.samples - ready} of {args.samples} previews did not "
-                    f"reach 'ready'; their timings are excluded")
+                    f"{expected_ready - ready} of the first {expected_ready} previews "
+                    f"did not reach 'ready'; their timings are excluded")
 
             n = args.samples if args.max_interactions <= 0 else min(args.samples, args.max_interactions)
             driver.settle()

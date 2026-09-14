@@ -916,7 +916,12 @@ function handleSSE(data) {
             }
             break;
         case "tab_loaded":
-            loadTab(data.tab);
+            loadTab(data.tab).then(() => {
+                // renderSampleList() only re-selects when the current sample
+                // is on another tab, so a same-tab reload (Custom Day again)
+                // would never ask for its window. Nothing renders until asked.
+                if (data.tab === state.currentTab) requestPreviewWindow();
+            });
             break;
         case "resync":
             // The server shed queued events because this browser fell behind,
@@ -1382,10 +1387,40 @@ function highlightSample(labId) {
     if (el) el.classList.add("selected");
 }
 
+// ── Preview window ───────────────────────────────────────────────────
+// The server renders nothing on its own after a pull. This tells it what the
+// reviewer is looking at — the current tab and the selected sample — and it
+// renders a window of samples forward from there, cancelling renders that
+// fell out of the window before they started. So a 300-sample day costs the
+// same as a 20-sample day at any moment. Debounced: holding ArrowDown calls
+// selectSample once per row passed, and the server only needs to know where
+// the reviewer landed.
+let _focusTimer = null;
+const FOCUS_DEBOUNCE_MS = 150;
+
+function requestPreviewWindow() {
+    clearTimeout(_focusTimer);
+    _focusTimer = setTimeout(async () => {
+        const tab = state.currentTab;
+        const s = state.currentSample;
+        const body = { tab };
+        if (s && s.tab === tab) body.lab_id = s.lab_id;
+        try {
+            const resp = await fetch("/api/focus", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            if (resp.status === 401) triggerTimeout();
+        } catch (e) { /* the next selection asks again */ }
+    }, FOCUS_DEBOUNCE_MS);
+}
+
 function selectSample(sample) {
     state.currentSample = sample;
     highlightSample(sample.lab_id);
     updateActionButtons();
+    requestPreviewWindow();
 
     $("#sample-info").textContent = `Lab ID: ${sample.lab_id}  |  Tab: ${sample.tab}  |  Status: ${sample.status}`;
 
@@ -3196,16 +3231,21 @@ async function handleRegeneratePending() {
         .filter(s => !["good", "bad"].includes(s.status))
         .forEach(s => { _pdfVersion[s.lab_id] = (_pdfVersion[s.lab_id] || 0) + 1; });
 
+    // The server renders the window from the selected sample; without it,
+    // it can only start from the top of the tab.
+    const cur = state.currentSample;
+    const lab_id = (cur && cur.tab === tab) ? cur.lab_id : undefined;
+
     try {
         const resp = await fetch("/api/regenerate-pending", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tab }),
+            body: JSON.stringify({ tab, lab_id }),
         });
         if (resp.status === 401) { triggerTimeout(); return; }
         const data = await resp.json();
         if (data.ok) {
-            setStatus(`Regenerating ${data.count} pending sample(s) on ${tab}…`);
+            setStatus(`Reset ${data.count} pending sample(s) on ${tab}; rendering ${data.queued} from here, the rest as you reach them…`);
             // Results arrive as sample_status SSE events — no polling, and the
             // reviewer can keep working while they come back.
             if (state.currentSample &&
