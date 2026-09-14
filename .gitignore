@@ -60,6 +60,7 @@ desktop.ini
 # Copy web_app_config.default.json -> web_app_config.json and fill it in.
 web_app_config.json
 re_review_state.json
+review_state/
 login.log
 install.log
 

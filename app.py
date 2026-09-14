@@ -163,6 +163,15 @@ REPORT_LEVEL = "sample"
 LOGIN_LOG_FILE = DATA_DIR / "login.log"
 SESSION_TIMEOUT_SECONDS = 600   # 10 min – frontend timer threshold
 SESSION_CLEANUP_SECONDS = 720   # 12 min – server-side cleanup (grace period for reauth)
+
+# A reviewer's marks are written here, one file per LabLink account, so they
+# outlive the in-memory UserState. The 12-minute cleanup above fires two
+# minutes after the screen locks, and a deploy restarts the process outright;
+# either used to discard a morning's review (2026-09-14: 40 marks gone while
+# the browser still showed them). Snapshots older than this are ignored, so
+# yesterday's half-finished list does not greet today's login.
+REVIEW_STATE_DIR = DATA_DIR / "review_state"
+REVIEW_STATE_MAX_AGE_SECONDS = 12 * 3600
 AUTO_RESTART_HOUR = 3           # 3 AM – daily auto-restart target
 AUTO_RESTART_IDLE_SECONDS = 300 # 5 min – must be idle this long before auto-restart
 AUTO_RESTART_MIN_UPTIME_SECONDS = 3600  # 1 h – a just-respawned process must not re-restart (storm guard)
@@ -1195,6 +1204,7 @@ class UserState:
         self.pdf_loading: set = set()
         self.status_log: List[str] = []
         self._lock = threading.Lock()
+        self._persist_lock = threading.Lock()
         self._sse_queues: List[queue.Queue] = []
 
     def emit_status(self, msg: str) -> None:
@@ -1289,6 +1299,124 @@ class UserState:
         recs.sort(key=lambda r: _lab_sort_key(r.lab_id))
         return recs
 
+    # ── durable review state ─────────────────────────────────────────────
+    # Marks are the expensive human work; sample lists and previews are cheap
+    # to regenerate. So the snapshot keeps every record's identity and its
+    # verdict, and nothing that a re-render produces: a restored sample that
+    # was never judged comes back `pending` with no preview URL, and a judged
+    # one keeps its verdict but also reports no preview — claiming one would
+    # put a 404 in the viewer.
+
+    def snapshot(self) -> dict:
+        records = []
+        for rec in list(self.records.values()):
+            records.append({
+                "tab": rec.tab,
+                "lab_id": rec.lab_id,
+                "sample_id": rec.sample_id,
+                "test_ids": list(rec.test_ids),
+                "order_id": rec.order_id,
+                "status": rec.status if rec.status in (STATUS_GOOD, STATUS_BAD) else STATUS_PENDING,
+                "reason": rec.reason,
+                "cc_task_id": rec.cc_task_id,
+                "cc_task": rec.cc_task,
+                "info": rec.info,
+            })
+        return {
+            "version": 1,
+            "name": self.name,
+            "saved_at": time.time(),
+            "records": records,
+            "session_results": [dict(r) for r in list(self.session_results)],
+        }
+
+    def persist(self) -> None:
+        """Write the review to disk. Never raises: like the change log, a
+        dropped share costs a snapshot, not a reviewer's mark."""
+        try:
+            path = _review_state_path(self.name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            with self._persist_lock:
+                tmp.write_text(json.dumps(self.snapshot(), default=str), encoding="utf-8")
+                os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning("Could not save review state for %s: %s", self.name, exc)
+
+    def hydrate(self, doc: dict) -> int:
+        """Rebuild records and results from a snapshot. Returns records added."""
+        added = 0
+        for r in doc.get("records") or []:
+            if not isinstance(r, dict) or not r.get("lab_id") or not r.get("tab"):
+                continue
+            rec = SampleRecord(
+                lab_id=str(r["lab_id"]),
+                tab=str(r["tab"]),
+                sample_id=r.get("sample_id"),
+                test_ids=list(r.get("test_ids") or []),
+                order_id=r.get("order_id"),
+                cc_task=r.get("cc_task"),
+                info=r.get("info") or {},
+            )
+            status = r.get("status")
+            rec.status = status if status in (STATUS_GOOD, STATUS_BAD) else STATUS_PENDING
+            rec.reason = r.get("reason") or ""
+            rec.cc_task_id = r.get("cc_task_id")
+            self.add_record(rec)
+            added += 1
+        self.session_results = [dict(x) for x in (doc.get("session_results") or [])
+                                if isinstance(x, dict)]
+        return added
+
+
+def _review_state_path(name: str) -> Path:
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower()).strip("-") or "reviewer"
+    return REVIEW_STATE_DIR / f"{slug}.json"
+
+
+def load_review_state(name: str, now: Optional[float] = None) -> Optional[dict]:
+    """The saved review for a LabLink account, or None if there is none, it
+    is unreadable, it is too old, or it was written by a different account
+    whose name happens to slug the same."""
+    try:
+        path = _review_state_path(name)
+        if not path.exists():
+            return None
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read review state for %s: %s", name, exc)
+        return None
+    if not isinstance(doc, dict):
+        return None
+    saved_at = doc.get("saved_at")
+    if not isinstance(saved_at, (int, float)):
+        return None
+    if (now if now is not None else time.time()) - saved_at > REVIEW_STATE_MAX_AGE_SECONDS:
+        return None
+    if str(doc.get("name", "")).strip().lower() != (name or "").strip().lower():
+        return None
+    return doc
+
+
+def restore_review(ustate: "UserState") -> bool:
+    """Bring a freshly built session back to the review its owner last had.
+
+    True if anything came back. Used wherever a UserState is created for an
+    account that may have been mid-review: the timeout overlay's re-auth
+    after the idle cleanup reaped the session, and a plain login after a
+    restart. Both used to hand the reviewer an empty session while the
+    browser went on showing the old list.
+    """
+    doc = load_review_state(ustate.name)
+    if not doc:
+        return False
+    added = ustate.hydrate(doc)
+    recovered = added > 0 or bool(ustate.session_results)
+    if recovered:
+        logger.info("Restored review for %s: %d sample(s), %d result(s)",
+                    ustate.name, added, len(ustate.session_results))
+    return recovered
+
 
 # ── Session registry ─────────────────────────────────────────────────────────
 user_sessions: Dict[str, UserState] = {}
@@ -1318,20 +1446,35 @@ def require_portal(f):
     return wrapper
 
 
+def _reap_idle_sessions(now: float) -> List[UserState]:
+    """Drop sessions idle longer than SESSION_CLEANUP_SECONDS, writing each
+    one's review down first so a re-auth or re-login can bring it back.
+
+    Split out of the worker loop so it can be tested without the sleep. The
+    snapshot is written after the pop, outside the lock: once popped nothing
+    can reach the state through a request, so there is no writer to race.
+    """
+    with _sessions_lock:
+        expired = [
+            uid for uid, us in user_sessions.items()
+            if now - us.last_active > SESSION_CLEANUP_SECONDS
+        ]
+        reaped = [user_sessions.pop(uid) for uid in expired]
+    for us in reaped:
+        us.persist()
+        log_login_event("TIMEOUT", us.name, "server")
+        logger.info("Session timed out: %s", us.name)
+    return reaped
+
+
 def _session_cleanup_worker() -> None:
     """Background thread: remove sessions idle longer than SESSION_CLEANUP_SECONDS."""
     while True:
         time.sleep(30)
-        now = time.time()
-        with _sessions_lock:
-            expired = [
-                uid for uid, us in user_sessions.items()
-                if now - us.last_active > SESSION_CLEANUP_SECONDS
-            ]
-            for uid in expired:
-                us = user_sessions.pop(uid)
-                log_login_event("TIMEOUT", us.name, "server")
-                logger.info("Session timed out: %s", us.name)
+        try:
+            _reap_idle_sessions(time.time())
+        except Exception:
+            logger.exception("session cleanup failed")
 
 
 threading.Thread(target=_session_cleanup_worker, daemon=True).start()
@@ -1507,6 +1650,9 @@ def fetch_samples_for_tab(tab_name: str, target_date: date, ustate: UserState) -
             )
             ustate.add_record(rec)
 
+        # The pulled list is worth keeping before the first mark, so a
+        # session lost mid-pull comes back as a list rather than a blank tab.
+        ustate.persist()
         ustate.emit_sse({"type": "tab_loaded", "tab": tab_name, "count": len(samples)})
 
         if state.coa_session and state.logged_in:
@@ -1668,6 +1814,7 @@ def fetch_re_review_samples(ustate: UserState) -> None:
             count += 1
 
         save_re_review_state(new_state)
+        ustate.persist()
         ustate.emit_status(f"[Re-review] Found {count} entries.")
         ustate.emit_sse({"type": "tab_loaded", "tab": "Re-review", "count": count})
 
@@ -2098,6 +2245,9 @@ def portal_login():
 
     uid = str(uuid.uuid4())
     ustate = UserState(uid, name)
+    # A login after a restart is the other way a reviewer reaches an empty
+    # session mid-review; bring back whatever they last had.
+    recovered = restore_review(ustate)
     with _sessions_lock:
         user_sessions[uid] = ustate
     session["uid"] = uid
@@ -2106,7 +2256,7 @@ def portal_login():
     state.change_log.session("login", user=name, method="password",
                              ip=request.remote_addr)
     logger.info("Portal login: %s", name)
-    return jsonify({"ok": True, "name": name})
+    return jsonify({"ok": True, "name": name, "recovered": recovered})
 
 
 @app.route("/api/portal-card-login", methods=["POST"])
@@ -2136,6 +2286,7 @@ def portal_card_login():
 
     uid = str(uuid.uuid4())
     ustate = UserState(uid, username)
+    recovered = restore_review(ustate)
     with _sessions_lock:
         user_sessions[uid] = ustate
     session["uid"] = uid
@@ -2147,7 +2298,7 @@ def portal_card_login():
     state.change_log.session("login", user=username, method="card",
                              ip=request.remote_addr)
     logger.info("Portal card login: %s", username)
-    return jsonify({"ok": True, "name": username})
+    return jsonify({"ok": True, "name": username, "recovered": recovered})
 
 
 @app.route("/api/portal-logout", methods=["POST"])
@@ -2191,19 +2342,29 @@ def portal_reauth():
                 }), 403
             ustate.last_active = time.time()
             log_login_event("REAUTH", ustate.name, request.remote_addr)
-            return jsonify({"ok": True, "restored": True, "name": ustate.name})
+            return jsonify({"ok": True, "restored": True, "recovered": False,
+                            "name": ustate.name})
 
-    # Session was already cleaned up server-side — create a fresh one under
-    # whoever just authenticated. There is nothing left to match against, but
-    # the identity is still LabCore's answer rather than a client-sent name.
+    # Session was already cleaned up server-side (idle reap, or a restart) —
+    # create a fresh one under whoever just authenticated and bring back the
+    # review they had. There is nothing live to match against, but the
+    # identity is still LabCore's answer rather than a client-sent name.
+    #
+    # `restored` (same UserState) and `recovered` (rebuilt from disk) are
+    # reported separately: either way the browser's copy of the list is no
+    # longer the truth and must be reloaded, but the reviewer is told which
+    # of the three things happened. Before this, an empty session answered
+    # `ok` and the browser carried on showing marks the server did not have.
     new_uid = str(uuid.uuid4())
     ustate = UserState(new_uid, name)
+    recovered = restore_review(ustate)
     with _sessions_lock:
         user_sessions[new_uid] = ustate
     session["uid"] = new_uid
     session.permanent = True
     log_login_event("RELOGIN", ustate.name, request.remote_addr)
-    return jsonify({"ok": True, "restored": False, "name": ustate.name})
+    return jsonify({"ok": True, "restored": False, "recovered": recovered,
+                    "name": ustate.name})
 
 
 @app.route("/api/heartbeat", methods=["POST"])
@@ -2316,6 +2477,9 @@ def start_pulling():
     ustate.session_results.clear()
     ustate.pdf_cache.clear()
     ustate.pdf_loading.clear()
+    # Start Pulling is the reviewer saying "new day": the saved review must
+    # follow, or the old list resurrects on the next login.
+    ustate.persist()
     # Drop cached SIF PDFs on each daily pull so the shared cache can't grow
     # unbounded across the process lifetime.
     with state._sif_cache_lock:
@@ -2476,6 +2640,7 @@ def search_samples():
         )
         ustate.add_record(rec)
 
+    ustate.persist()
     ustate.emit_status(f"Found {len(samples)} sample(s) for '{query}'.")
 
     if state.coa_session and state.logged_in:
@@ -2509,6 +2674,7 @@ def load_custom_day():
         lab_id = ustate.records[k].lab_id
         ustate.pdf_cache.pop(lab_id, None)
         del ustate.records[k]
+    ustate.persist()
 
     threading.Thread(target=fetch_samples_for_tab, args=("Custom Day", target, ustate), daemon=True).start()
     return jsonify({"ok": True})
@@ -3310,6 +3476,9 @@ def mark_sample():
         cc_task_id=rec.cc_task_id,
         ip=request.remote_addr,
     )
+    # Every verdict is written down as it is made; this is the human work
+    # that must survive the session being reaped or the process restarting.
+    ustate.persist()
 
     ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": rec.status})
     labels = {"good": "Good", "bad": "Bad", "uncheck": "un-marked"}

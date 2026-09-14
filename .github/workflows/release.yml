@@ -42,6 +42,7 @@ jobs:
             --exclude 'venv/' \
             --exclude 'archive/' \
             --exclude 'changelog/' \
+            --exclude 'review_state/' \
             --exclude 'web_app_config.json' \
             --exclude 're_review_state.json' \
             --exclude '.secret_key' \
@@ -71,7 +72,7 @@ jobs:
           for f in web_app_config.json re_review_state.json .secret_key login.log install.log; do
             if [ -e "$f" ]; then echo "LEAKED: $f"; leaked=1; fi
           done
-          for d in archive changelog .venv venv __pycache__; do
+          for d in archive changelog review_state .venv venv __pycache__; do
             if [ -e "$d" ]; then echo "LEAKED: $d/"; leaked=1; fi
           done
           if find . -name '*.pyc' -o -name '*.log' | grep -q .; then

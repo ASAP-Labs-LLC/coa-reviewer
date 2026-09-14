@@ -750,9 +750,30 @@ async function submitReauth(body) {
             startHeartbeat();
             connectSSE();
 
-            setStatus(data.restored
-                ? "Welcome back, " + data.name + "!"
-                : "Logged back in. You may need to restart pulling.");
+            // The list on screen is not the truth any more. If the server
+            // still holds the same session, previews may have finished while
+            // SSE was closed; if it rebuilt the session from disk, unjudged
+            // samples are back to pending with no preview; and if there was
+            // nothing to rebuild, the tabs are empty. In every case the server
+            // decides — carrying on with the in-memory copy is how 40 marks
+            // were shown for a session the server no longer had (2026-09-14).
+            const focused = state.currentSample ? state.currentSample.lab_id : null;
+            await restoreAllTabs();
+            if (focused) {
+                const fresh = (state.samples[state.currentTab] || [])
+                    .find(s => s.lab_id === focused);
+                if (fresh) selectSample(fresh);
+            }
+
+            if (data.restored) {
+                setStatus("Welcome back, " + data.name + "!");
+            } else if (data.recovered) {
+                setStatus("Welcome back, " + data.name + " — your review was restored from the last save. " +
+                          "Unjudged samples will re-render as you reach them.");
+            } else {
+                setStatus("Your session was reset and nothing was saved to restore. " +
+                          "The list has been reloaded from the server — Start Pulling to continue.");
+            }
         } else {
             $("#reauth-error").textContent = data.labcore_down
                 ? "Can't reach LabCore to check your sign-in. Try again shortly."
@@ -3336,7 +3357,9 @@ function scrollSampleIntoView(labId) {
 // ══════════════════════════════════════════════════════════════════════
 
 async function restoreAllTabs() {
-    const allTabs = ["Yesterday", "Due Out", "Re-review", "Search", "Custom Day"];
+    // Every tab the server can hold. Intaked (info mode) was missing here, so
+    // a reload silently dropped it.
+    const allTabs = ["Yesterday", "Due Out", "Re-review", "Search", "Custom Day", "Intaked"];
     await Promise.all(allTabs.map(tab => loadTab(tab)));
     renderSampleList();
     $("#export-btn").disabled = false;

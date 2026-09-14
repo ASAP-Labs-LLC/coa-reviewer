@@ -62,7 +62,7 @@ def test_app_paths_are_children_of_data_dir() -> None:
     for attr in (
         "CONFIG_FILE", "RE_REVIEW_STATE_FILE", "ARCHIVE_DIR",
         "LOGIN_LOG_FILE", "_SECRET_KEY_FILE", "_LOG_FILE",
-        "FIELD_SETTINGS_FILE",
+        "FIELD_SETTINGS_FILE", "REVIEW_STATE_DIR",
     ):
         path: Path = getattr(app, attr)
         assert path.resolve().parent == app.DATA_DIR.resolve(), (
@@ -82,6 +82,7 @@ def test_no_state_path_is_bound_to_app_dir_in_source() -> None:
     for name in (
         "web_app_config.json", "re_review_state.json", '"archive"',
         "login.log", '".secret_key"', '"app.log"', '"changelog"',
+        '"review_state"',
     ):
         # field_settings.json is deliberately excluded from this loop: APP_DIR /
         # "field_settings.json" is the legitimate *template* path. The test

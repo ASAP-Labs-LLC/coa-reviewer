@@ -36,6 +36,7 @@ STATE_PATHS = [
     ".secret_key",
     "archive",
     "changelog",
+    "review_state/",
     "login.log",
 ]
 
