@@ -108,3 +108,15 @@ def test_user_state_uses_a_bounded_cache() -> None:
     ustate = UserState("test-uid-bounded", "RC")
     assert isinstance(ustate.pdf_cache, PdfCache)
     assert ustate.pdf_cache.max_bytes > 0
+
+
+def test_retain_keeps_only_the_named_entries_and_their_bytes() -> None:
+    """The preview window trims the cache to what is near the selection."""
+    c = _cache(10_000)
+    for lab in ("a", "b", "c", "d"):
+        c[lab] = b"z" * 100
+    dropped = c.retain({"b", "d", "not-cached"})
+    assert dropped == 2
+    assert "a" not in c and "c" not in c
+    assert "b" in c and "d" in c
+    assert c.total_bytes == 200

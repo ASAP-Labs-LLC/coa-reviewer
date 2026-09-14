@@ -346,3 +346,76 @@ def test_regenerating_one_sample_replaces_its_queued_render(windowed) -> None:
 
     assert queued[0].cancelled
     assert pool.submitted_lab_ids().count(IDS[3]) == 1
+
+
+# ── the PDF cache follows the window ─────────────────────────────────────
+#
+# Rendering in a window is only half of "consistent on big and small days".
+# The PDF cache is a byte-capped LRU, so on a 300-sample day it still filled
+# to the cap (~100 COAs) before evicting anything. Now each focus keeps the
+# COAs for PREVIEW_WINDOW samples behind the selection (going back is free)
+# and PREVIEW_WINDOW ahead (the render window), and drops the rest. The byte
+# cap stays as a ceiling; the window is the working bound.
+
+def _fill_cache(ustate, ids):
+    for lab in ids:
+        ustate.pdf_cache[lab] = b"%" + lab.encode()
+
+
+def test_focus_drops_cached_pdfs_outside_the_window(windowed) -> None:
+    client, ustate, pool = windowed
+    _fill_cache(ustate, IDS)
+
+    _focus(client, IDS[30])
+
+    kept = {lab for lab in IDS if lab in ustate.pdf_cache}
+    assert kept == set(IDS[10:50]), sorted(kept)
+
+
+def test_focus_keeps_twenty_behind_the_selection_for_going_back(windowed) -> None:
+    client, ustate, pool = windowed
+    _fill_cache(ustate, IDS)
+
+    _focus(client, IDS[25])
+
+    kept = {lab for lab in IDS if lab in ustate.pdf_cache}
+    assert kept == set(IDS[5:45]), sorted(kept)
+    assert ustate.pdf_cache.total_bytes == sum(len(b"%" + l.encode()) for l in IDS[5:45])
+
+
+def test_focus_at_the_top_keeps_only_the_window_ahead(windowed) -> None:
+    client, ustate, pool = windowed
+    _fill_cache(ustate, IDS)
+
+    _focus(client, IDS[0])
+
+    kept = {lab for lab in IDS if lab in ustate.pdf_cache}
+    assert kept == set(IDS[0:20])
+
+
+def test_looking_at_another_tab_drops_the_old_tabs_pdfs(windowed) -> None:
+    """Only the page being looked at — the same rule as the render queue."""
+    from app import SampleRecord
+    client, ustate, pool = windowed
+    other = [f"091026-{70001 + i:05d}" for i in range(5)]
+    for i, lab in enumerate(other):
+        ustate.add_record(SampleRecord(lab_id=lab, tab="Yesterday", sample_id=70001 + i,
+                                       test_ids=[1], order_id=8))
+    _fill_cache(ustate, IDS[:10] + other)
+
+    _focus(client, other[0], tab="Yesterday")
+
+    assert all(lab not in ustate.pdf_cache for lab in IDS[:10])
+    assert all(lab in ustate.pdf_cache for lab in other)
+
+
+def test_the_cache_is_trimmed_even_when_nothing_can_render(windowed, monkeypatch) -> None:
+    """Memory is the point; it must not wait for QBench to be logged in."""
+    import app as app_module
+    client, ustate, pool = windowed
+    monkeypatch.setattr(app_module.state, "coa_session", None)
+    _fill_cache(ustate, IDS)
+
+    _focus(client, IDS[30])
+
+    assert all(lab not in ustate.pdf_cache for lab in IDS[:10])

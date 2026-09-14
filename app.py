@@ -1093,6 +1093,11 @@ state = AppState()
 # no measurable latency cost. 192 MB was the first default tried and never
 # evicted at that size, which is why it is lower now.
 # Override per-machine with COA_PDF_CACHE_MB.
+#
+# Since the preview window (PREVIEW_WINDOW below) this is a ceiling, not the
+# working size: every focus trims the cache to the COAs within PREVIEW_WINDOW
+# of the selection on the tab being looked at (~40), so a 300-sample day
+# never gets near it.
 PDF_CACHE_MAX_BYTES = int(os.environ.get("COA_PDF_CACHE_MB", "96")) * 1024 * 1024
 
 # Each sample emits ~5.5 events (sample_status loading→ready, sif_status
@@ -1200,6 +1205,21 @@ class PdfCache:
         with self._lock:
             self._items.clear()
             self._bytes = 0
+
+    def retain(self, keys) -> int:
+        """Drop every entry whose key is not in `keys`. Returns how many went.
+
+        The preview window calls this on every focus so the cache holds the
+        COAs near the selection and nothing else; the byte cap above is then
+        a ceiling rather than the working size.
+        """
+        keep = set(keys)
+        dropped = 0
+        with self._lock:
+            for key in [k for k in self._items if k not in keep]:
+                self._bytes -= len(self._items.pop(key))
+                dropped += 1
+        return dropped
 
 
 class UserState:
@@ -1838,6 +1858,15 @@ def fetch_re_review_samples(ustate: UserState) -> None:
         ustate.emit_status(f"[Re-review] Error: {exc}")
 
 
+def _anchor(records: List[SampleRecord], lab_id: Optional[str]) -> int:
+    """Index of the selected sample in a tab's sorted records; 0 if unknown."""
+    if lab_id:
+        for i, rec in enumerate(records):
+            if rec.lab_id == lab_id:
+                return i
+    return 0
+
+
 def _preview_window(ustate: UserState, tab: str, lab_id: Optional[str]) -> List[SampleRecord]:
     """PREVIEW_WINDOW positions of `tab`, starting AT the selected sample.
 
@@ -1846,13 +1875,21 @@ def _preview_window(ustate: UserState, tab: str, lab_id: Optional[str]) -> List[
     An unknown or missing selection starts at the top.
     """
     records = ustate.get_tab_records(tab)
-    start = 0
-    if lab_id:
-        for i, rec in enumerate(records):
-            if rec.lab_id == lab_id:
-                start = i
-                break
+    start = _anchor(records, lab_id)
     return records[start:start + PREVIEW_WINDOW]
+
+
+def _cached_window_ids(ustate: UserState, tab: str, lab_id: Optional[str]) -> set:
+    """Which COAs stay in the PDF cache: PREVIEW_WINDOW behind the selection
+    (going back is free) and PREVIEW_WINDOW ahead (the render window), on the
+    tab being looked at. Everything else — earlier samples, other tabs — is
+    dropped, so the cache holds ~40 COAs whatever the day's size. Only the
+    rendered bytes go; the record, its verdict and its preview URL stay, and
+    a dropped COA is re-fetched from that URL if it is opened again.
+    """
+    records = ustate.get_tab_records(tab)
+    start = _anchor(records, lab_id)
+    return {r.lab_id for r in records[max(0, start - PREVIEW_WINDOW):start + PREVIEW_WINDOW]}
 
 
 def _queue_preview(ustate: UserState, rec: SampleRecord) -> bool:
@@ -1906,6 +1943,8 @@ def focus_previews(ustate: UserState, tab: str, lab_id: Optional[str]) -> Tuple[
     there and drop whatever else was waiting. Returns (queued, window ids)."""
     window = _preview_window(ustate, tab, lab_id)
     _cancel_queued(ustate, keep={(r.tab, r.lab_id) for r in window})
+    # Memory follows the window regardless of whether anything can render.
+    ustate.pdf_cache.retain(_cached_window_ids(ustate, tab, lab_id))
     if not (state.coa_session and state.logged_in):
         return 0, [r.lab_id for r in window]
     queued = sum(1 for rec in window if _queue_preview(ustate, rec))
