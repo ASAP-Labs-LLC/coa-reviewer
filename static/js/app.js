@@ -1708,6 +1708,13 @@ function renderLabVisionInfo(box, pairs) {
 // token; only the most recent load handler is allowed to bring opacity back
 // up. This prevents rapid sample-switching from leaving a fade-in stuck on
 // a stale navigation.
+// Chrome's PDF viewer takes its opening zoom from this fragment and from
+// nothing else. `Fit` shows the whole page whatever the pane's aspect ratio;
+// the old `FitH` fit the width, so a tall COA opened cropped on every refresh.
+// Two-page view has no URL form in Chrome (it is a toolbar toggle only), so
+// it cannot be defaulted from here.
+const PDF_VIEW_FRAGMENT = "#view=Fit";
+
 const _pdfTokens = new Map();
 
 function _setPdfSrc(id, url) {
@@ -1758,13 +1765,13 @@ function loadPDF(labId) {
     // Which panes are up is the checkboxes' business, not the PDF loader's.
     applyPaneLayout();
 
-    _setPdfSrc("pdf-viewer", `/api/pdf/${encodeURIComponent(labId)}?v=${ver}#view=FitH`);
+    _setPdfSrc("pdf-viewer", `/api/pdf/${encodeURIComponent(labId)}?v=${ver}${PDF_VIEW_FRAGMENT}`);
 
     const sample = state.currentSample;
     if (sample && sample.has_sif) {
         sifViewer.style.display = "block";
         sifPlaceholder.style.display = "none";
-        _setPdfSrc("sif-viewer", `/api/sif/${encodeURIComponent(labId)}#view=FitH`);
+        _setPdfSrc("sif-viewer", `/api/sif/${encodeURIComponent(labId)}${PDF_VIEW_FRAGMENT}`);
         const badge = $("#sif-page-badge");
         if (badge && sample.sif_page !== null && sample.sif_page !== undefined) {
             badge.textContent = `Page ${sample.sif_page + 1} of ${sample.sif_total_pages}`;
@@ -1849,7 +1856,7 @@ function updateSifStatus(tab, labId, sifStatus, sifPage, sifTotalPages) {
             const sifPlaceholder = $("#sif-placeholder");
             sifViewer.style.display = "block";
             sifPlaceholder.style.display = "none";
-            _setPdfSrc("sif-viewer", `/api/sif/${encodeURIComponent(labId)}#view=FitH`);
+            _setPdfSrc("sif-viewer", `/api/sif/${encodeURIComponent(labId)}${PDF_VIEW_FRAGMENT}`);
             const badge = $("#sif-page-badge");
             if (badge && sifPage !== null && sifPage !== undefined) {
                 badge.textContent = `Page ${sifPage + 1} of ${sifTotalPages}`;
