@@ -297,9 +297,11 @@ def test_the_cleanup_worker_leaves_live_sessions_alone(review) -> None:
 
 # ── the snapshot follows the review ──────────────────────────────────────
 
-def test_start_pulling_clears_the_saved_review(review, monkeypatch, tmp_path) -> None:
-    """Start Pulling is the reviewer saying 'new day'; the snapshot must not
-    resurrect the old list on the next login."""
+def test_start_pulling_clears_the_list_but_keeps_the_marks(review, monkeypatch, tmp_path) -> None:
+    """Start Pulling drops the list so the snapshot cannot resurrect it on
+    the next login, but the verdicts stay in the file: the same samples
+    pulled again within 12 hours get their marks back
+    (tests/test_marks_follow_a_re_pull.py)."""
     import app as app_module
     client, ustate, _ = review
     _mark(client, "good", "090926-39363")
@@ -312,6 +314,8 @@ def test_start_pulling_clears_the_saved_review(review, monkeypatch, tmp_path) ->
     doc = json.loads(next((tmp_path / "review_state").glob("*.json")).read_text(encoding="utf-8"))
     assert doc["records"] == []
     assert doc["session_results"] == []
+    assert [(v["tab"], v["lab_id"], v["status"]) for v in doc["verdicts"]] == \
+        [("Custom Day", "090926-39363", "good")]
 
 
 def test_loading_a_tab_writes_the_list_down(review, monkeypatch, tmp_path) -> None:

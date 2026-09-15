@@ -933,7 +933,7 @@ function handleSSE(data) {
             state._resyncTimer = setTimeout(() => restoreAllTabs(), 1500);
             break;
         case "sample_status":
-            updateSampleStatus(data.tab, data.lab_id, data.status);
+            updateSampleStatus(data.tab, data.lab_id, data.status, data.has_preview);
             break;
         case "sif_status":
             updateSifStatus(data.tab, data.lab_id, data.status, data.sif_page, data.sif_total_pages);
@@ -1257,16 +1257,21 @@ function _anyUnfinished() {
     return false;
 }
 
-function updateSampleStatus(tab, labId, status) {
+function updateSampleStatus(tab, labId, status, hasPreview) {
     // Proof the pull is still working, used to defer the idle timeout while a
     // reviewer waits on it.
     _lastPullProgress = Date.now();
     const samples = state.samples[tab];
     if (!samples) return;
     const sample = samples.find(s => s.lab_id === labId);
+    // A render says outright whether a COA now exists (`has_preview` on the
+    // event); a mark does not, so fall back to deriving it from the status.
+    const nowHasPreview = (hasPreview === true || hasPreview === false)
+        ? hasPreview
+        : (status === "ready" || status === "good" || status === "bad");
     if (sample) {
         sample.status = status;
-        sample.has_preview = (status === "ready" || status === "good" || status === "bad");
+        sample.has_preview = nowHasPreview;
     }
 
     const item = document.querySelector(`.sample-item[data-lab="${labId}"][data-tab="${tab}"]`);
@@ -1280,15 +1285,17 @@ function updateSampleStatus(tab, labId, status) {
 
     if (state.currentSample && state.currentSample.lab_id === labId && state.currentSample.tab === tab) {
         state.currentSample.status = status;
-        state.currentSample.has_preview = (status === "ready" || status === "good" || status === "bad");
+        state.currentSample.has_preview = nowHasPreview;
         updateActionButtons();
 
         // Only (re)load when this lab's PDF isn't already on screen.
         // Un-marking returns a sample to `ready`, which re-enters this path —
         // without the guard it would reload the very iframe the reviewer is
         // looking at. showPDFPlaceholder() clears _currentPdfLab, so a real
-        // regenerate still reloads.
-        if (status === "ready" && _currentPdfLab !== labId) {
+        // regenerate still reloads. A judged sample's render ends in
+        // good/bad rather than ready, so the render says so itself with
+        // has_preview.
+        if ((status === "ready" || hasPreview === true) && _currentPdfLab !== labId) {
             loadPDF(labId);
             loadTests(labId);
         }

@@ -1001,6 +1001,14 @@ class SampleRecord:
         self.sif_page: Optional[int] = None
         self.sif_total_pages: Optional[int] = None
         self.sif_status: str = "pending"
+        # A render is running for this record. Pending samples show it as
+        # `loading`; a judged one keeps its verdict on show, so the window
+        # needs this to avoid queueing it again mid-render.
+        self.rendering: bool = False
+        # The last render of a judged sample failed. It keeps its verdict
+        # rather than going to `error`, so this is what stops the window
+        # queueing the same failing render on every focus; Regenerate clears it.
+        self.render_failed: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -1231,6 +1239,11 @@ class UserState:
         self.last_active = time.time()
         self.records: Dict[Tuple[str, str], SampleRecord] = {}
         self.session_results: List[dict] = []
+        # What this account has judged in the last 12 hours, keyed like
+        # `records`. It outlives the list: Start Pulling, Custom Day and
+        # Search all rebuild their records, and a sample that comes back gets
+        # its mark back from here (add_record). Written into the snapshot.
+        self.verdicts: Dict[Tuple[str, str], dict] = {}
         self.pdf_cache = PdfCache()
         self.pdf_loading: set = set()
         # Renders waiting in PREVIEW_POOL, keyed like `records`, so a window
@@ -1297,14 +1310,53 @@ class UserState:
         key = (rec.tab, rec.lab_id)
         if key not in self.records:
             self.records[key] = rec
+            self._reapply_verdict(rec)
 
-    def record_result(self, rec: SampleRecord, outcome: str, reason: str = "") -> None:
+    # ── remembered verdicts ──────────────────────────────────────────────
+
+    def remember_verdict(self, rec: SampleRecord) -> None:
+        """This account judged `rec` just now; keep that for 12 hours."""
+        self.verdicts[(rec.tab, rec.lab_id)] = _verdict_entry(
+            rec, judged_at=time.time(), date_str=date.today().isoformat())
+
+    def forget_verdict(self, tab: str, lab_id: str) -> None:
+        self.verdicts.pop((tab, lab_id), None)
+
+    def _reapply_verdict(self, rec: SampleRecord) -> None:
+        """A sample just (re)entered the list: if this account judged it
+        within 12 hours, bring the mark back with its reason, its listing
+        and its export row. The review date is the day it was judged."""
+        key = (rec.tab, rec.lab_id)
+        entry = self.verdicts.get(key)
+        if entry is None:
+            return
+        if not _verdict_is_fresh(entry):
+            self.verdicts.pop(key, None)
+            return
+        if rec.status in (STATUS_GOOD, STATUS_BAD):
+            return
+        rec.status = entry["status"]
+        rec.reason = entry.get("reason") or ""
+        rec.cc_task_id = entry.get("cc_task_id")
+        self.record_result(rec, "Good" if rec.status == STATUS_GOOD else "Bad",
+                           rec.reason, date_str=entry.get("date"))
+
+    def _result_date(self, key: Tuple[str, str]) -> Optional[str]:
+        for r in self.session_results:
+            if (r.get("tab"), r.get("lab_id")) == key:
+                return r.get("date")
+        return None
+
+    def record_result(self, rec: SampleRecord, outcome: str, reason: str = "",
+                      date_str: Optional[str] = None) -> None:
         """Record this sample's review outcome, replacing any earlier one.
 
         session_results feeds Export CSV and Good Samples. It used to be
         append-only, so a reviewer who changed their mind exported the sample
         twice with contradictory outcomes. Keyed on (tab, lab_id): the same
         lab_id on Yesterday and Search are genuinely separate reviews.
+        `date_str` is for a verdict brought back after a re-pull, which keeps
+        the day it was actually judged.
         """
         row = {
             "lab_id": rec.lab_id,
@@ -1313,7 +1365,7 @@ class UserState:
             "outcome": outcome,
             "reason": reason,
             "reviewer": self.name,
-            "date": date.today().isoformat(),
+            "date": date_str or date.today().isoformat(),
         }
         key = (rec.tab, rec.lab_id)
         for i, existing in enumerate(self.session_results):
@@ -1359,12 +1411,17 @@ class UserState:
                 "cc_task": rec.cc_task,
                 "info": rec.info,
             })
+        now = time.time()
         return {
-            "version": 1,
+            "version": 2,
             "name": self.name,
-            "saved_at": time.time(),
+            "saved_at": now,
             "records": records,
             "session_results": [dict(r) for r in list(self.session_results)],
+            # Only what is still worth bringing back; stale marks are dropped
+            # here rather than carried until someone pulls the sample again.
+            "verdicts": [dict(v) for v in list(self.verdicts.values())
+                         if _verdict_is_fresh(v, now)],
         }
 
     def persist(self) -> None:
@@ -1381,7 +1438,18 @@ class UserState:
             logger.warning("Could not save review state for %s: %s", self.name, exc)
 
     def hydrate(self, doc: dict) -> int:
-        """Rebuild records and results from a snapshot. Returns records added."""
+        """Rebuild records, results and remembered verdicts from a snapshot.
+        Returns records added."""
+        now = time.time()
+        for v in doc.get("verdicts") or []:
+            if not isinstance(v, dict) or not v.get("lab_id") or not v.get("tab"):
+                continue
+            if v.get("status") not in (STATUS_GOOD, STATUS_BAD) or not _verdict_is_fresh(v, now):
+                continue
+            self.verdicts[(str(v["tab"]), str(v["lab_id"]))] = dict(v)
+        self.session_results = [dict(x) for x in (doc.get("session_results") or [])
+                                if isinstance(x, dict)]
+        saved_at = doc.get("saved_at")
         added = 0
         for r in doc.get("records") or []:
             if not isinstance(r, dict) or not r.get("lab_id") or not r.get("tab"):
@@ -1401,9 +1469,37 @@ class UserState:
             rec.cc_task_id = r.get("cc_task_id")
             self.add_record(rec)
             added += 1
-        self.session_results = [dict(x) for x in (doc.get("session_results") or [])
-                                if isinstance(x, dict)]
+            key = (rec.tab, rec.lab_id)
+            if rec.status in (STATUS_GOOD, STATUS_BAD) and key not in self.verdicts:
+                # A snapshot written before the ledger existed (v2.2): the
+                # mark is as old as the snapshot, and no older.
+                self.verdicts[key] = _verdict_entry(
+                    rec,
+                    judged_at=saved_at if isinstance(saved_at, (int, float)) else now,
+                    date_str=self._result_date(key) or date.today().isoformat())
         return added
+
+
+def _verdict_entry(rec: SampleRecord, judged_at: float, date_str: str) -> dict:
+    return {
+        "tab": rec.tab,
+        "lab_id": rec.lab_id,
+        "status": rec.status,
+        "reason": rec.reason,
+        "cc_task_id": rec.cc_task_id,
+        "judged_at": judged_at,
+        "date": date_str,
+    }
+
+
+def _verdict_is_fresh(entry: dict, now: Optional[float] = None) -> bool:
+    """A remembered verdict is worth bringing back for 12 hours from the
+    moment it was made (REVIEW_STATE_MAX_AGE_SECONDS, the same window as the
+    snapshot itself)."""
+    judged_at = entry.get("judged_at")
+    if not isinstance(judged_at, (int, float)):
+        return False
+    return (now if now is not None else time.time()) - judged_at <= REVIEW_STATE_MAX_AGE_SECONDS
 
 
 def _review_state_path(name: str) -> Path:
@@ -1892,11 +1988,21 @@ def _cached_window_ids(ustate: UserState, tab: str, lab_id: Optional[str]) -> se
     return {r.lab_id for r in records[max(0, start - PREVIEW_WINDOW):start + PREVIEW_WINDOW]}
 
 
+def _wants_render(rec: SampleRecord) -> bool:
+    """Pending samples, and judged ones that came back (re-pull, restored
+    snapshot) without a COA. A judged sample keeps its verdict through the
+    render, so `rendering` is what stops it being queued twice."""
+    if rec.status == STATUS_PENDING:
+        return True
+    return (rec.status in (STATUS_GOOD, STATUS_BAD) and not rec.preview_url
+            and not rec.rendering and not rec.render_failed)
+
+
 def _queue_preview(ustate: UserState, rec: SampleRecord) -> bool:
-    """Submit one pending render unless it is already waiting. True if queued."""
+    """Submit one render unless it is already waiting. True if queued."""
     key = (rec.tab, rec.lab_id)
     with ustate._focus_lock:
-        if rec.status != STATUS_PENDING:
+        if not _wants_render(rec):
             return False
         existing = ustate.preview_futures.get(key)
         if existing is not None and not existing.done():
@@ -1960,19 +2066,39 @@ def generate_preview_for_sample(tab: str, lab_id: str, ustate: UserState) -> Non
     rec = ustate.records.get(key)
     if not rec or not state.coa_session:
         return
-    if rec.status not in (STATUS_PENDING, STATUS_ERROR, STATUS_LOADING):
+    rec.rendering = True
+    try:
+        _render_preview(rec, tab, lab_id, ustate)
+    finally:
+        rec.rendering = False
+
+
+def _render_preview(rec: SampleRecord, tab: str, lab_id: str, ustate: UserState) -> None:
+    # A judged sample rendering after a re-pull or a restore keeps its
+    # verdict: it is never shown as `loading`, and a failed render costs the
+    # preview, not the mark. An unjudged one goes loading -> ready / error.
+    verdict = rec.status if rec.status in (STATUS_GOOD, STATUS_BAD) else None
+    if verdict is None:
+        if rec.status not in (STATUS_PENDING, STATUS_ERROR, STATUS_LOADING):
+            return
+        rec.status = STATUS_LOADING
+        ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_LOADING})
+    elif rec.preview_url:
         return
 
-    rec.status = STATUS_LOADING
-    ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_LOADING})
+    def _render_failed() -> None:
+        if verdict is not None:
+            rec.render_failed = True
+            return
+        rec.status = STATUS_ERROR
+        ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_ERROR})
 
     sample_id = rec.sample_id
     test_ids = rec.test_ids
     order_id = rec.order_id
 
     if not sample_id or not test_ids:
-        rec.status = STATUS_ERROR
-        ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_ERROR})
+        _render_failed()
         return
 
     all_attachments: List[dict] = []
@@ -2000,8 +2126,7 @@ def generate_preview_for_sample(tab: str, lab_id: str, ustate: UserState) -> Non
                 skip_attachments=skip_atts,
             )
             if not url:
-                rec.status = STATUS_ERROR
-                ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_ERROR})
+                _render_failed()
                 return
 
             viewable_url = url
@@ -2014,8 +2139,12 @@ def generate_preview_for_sample(tab: str, lab_id: str, ustate: UserState) -> Non
                 pass
 
             rec.preview_url = viewable_url
-            rec.status = STATUS_READY
-            ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_READY})
+            rec.render_failed = False
+            rec.status = verdict or STATUS_READY
+            # `has_preview` tells the browser a COA now exists even when the
+            # status is a verdict rather than `ready`.
+            ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id,
+                             "status": rec.status, "has_preview": True})
             ustate.emit_status(f"Preview ready: {lab_id}")
 
             IO_POOL.submit(cache_pdf, lab_id, viewable_url, ustate)
@@ -2037,12 +2166,10 @@ def generate_preview_for_sample(tab: str, lab_id: str, ustate: UserState) -> Non
                 try:
                     state.coa_session.relogin()
                 except Exception:
-                    rec.status = STATUS_ERROR
-                    ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_ERROR})
+                    _render_failed()
                     return
                 continue
-            rec.status = STATUS_ERROR
-            ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_ERROR})
+            _render_failed()
             ustate.emit_status(f"Preview error for {lab_id}: session expired")
             return
 
@@ -2052,12 +2179,10 @@ def generate_preview_for_sample(tab: str, lab_id: str, ustate: UserState) -> Non
                 try:
                     state.coa_session.relogin()
                 except Exception:
-                    rec.status = STATUS_ERROR
-                    ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_ERROR})
+                    _render_failed()
                     return
             else:
-                rec.status = STATUS_ERROR
-                ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_ERROR})
+                _render_failed()
                 ustate.emit_status(f"Preview error for {lab_id}: {exc}")
                 return
 
@@ -2606,8 +2731,9 @@ def start_pulling():
     ustate.session_results.clear()
     ustate.pdf_cache.clear()
     ustate.pdf_loading.clear()
-    # Start Pulling is the reviewer saying "new day": the saved review must
-    # follow, or the old list resurrects on the next login.
+    # Start Pulling drops the list, so the snapshot must not resurrect it on
+    # the next login. The remembered verdicts stay: the same samples pulled
+    # again within 12 hours get their marks back as they arrive (add_record).
     ustate.persist()
     # Drop cached SIF PDFs on each daily pull so the shared cache can't grow
     # unbounded across the process lifetime.
@@ -2660,7 +2786,9 @@ def focus():
 
     Called on every selection (debounced client-side) and when a tab finishes
     loading while on screen. Cheap to repeat: a sample already waiting,
-    rendering, rendered or judged is left alone. Before QBench is logged in
+    rendering, or rendered is left alone, and so is a judged sample that has
+    its COA; a judged one without a COA (re-pulled, or restored from the
+    snapshot) renders and keeps its verdict. Before QBench is logged in
     there is nothing to render with, so it answers ok with nothing queued
     rather than failing the selection.
     """
@@ -3583,6 +3711,7 @@ def mark_sample():
         rec.status = STATUS_GOOD
         rec.reason = ""
         ustate.record_result(rec, "Good")
+        ustate.remember_verdict(rec)
 
     elif outcome == "bad":
         reason = reason.strip()
@@ -3599,6 +3728,7 @@ def mark_sample():
             except (TypeError, ValueError):
                 rec.cc_task_id = None
         ustate.record_result(rec, "Bad", reason)
+        ustate.remember_verdict(rec)
 
     elif outcome == "uncheck":
         # Back to "rendered, awaiting review" — NOT pending. The frontend
@@ -3612,6 +3742,7 @@ def mark_sample():
         rec.reason = ""
         rec.cc_task_id = None
         ustate.clear_result(tab, lab_id)
+        ustate.forget_verdict(tab, lab_id)
 
     else:
         return jsonify({"error": "Invalid outcome"}), 400
@@ -3970,9 +4101,23 @@ def regenerate_preview():
 
 
 def _reset_for_regenerate(ustate: UserState, rec: SampleRecord) -> None:
-    """Clear every cached artefact for one sample so it re-renders from scratch."""
+    """Clear every cached artefact for one sample so it re-renders from scratch.
+
+    A regenerated COA is a new document, so the verdict goes with the old
+    render: from the list (it always did), from the export row (it used to
+    linger, so Export disagreed with the list) and from the remembered marks
+    a re-pull would otherwise bring back.
+    """
+    judged = rec.status in (STATUS_GOOD, STATUS_BAD)
     rec.status = STATUS_LOADING
     rec.preview_url = None
+    rec.render_failed = False
+    rec.reason = ""
+    rec.cc_task_id = None
+    if judged:
+        ustate.clear_result(rec.tab, rec.lab_id)
+        ustate.forget_verdict(rec.tab, rec.lab_id)
+        ustate.persist()
     rec.attachments = None
     rec.tests_data = None
     rec.sif_pdf_bytes = None

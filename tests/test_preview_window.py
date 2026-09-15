@@ -196,9 +196,12 @@ def test_the_window_is_shorter_at_the_end_of_the_list(windowed) -> None:
 
 def test_focus_skips_samples_that_are_already_rendered_or_judged(windowed) -> None:
     """Twenty positions, not twenty renders: a sample that already has a
-    verdict or a preview costs nothing and is left alone."""
+    preview, judged or not, costs nothing and is left alone. (A judged
+    sample *without* a preview is the re-pull case and does render:
+    tests/test_marks_follow_a_re_pull.py.)"""
     client, ustate, pool = windowed
     ustate.records[(TAB, IDS[0])].status = "good"
+    ustate.records[(TAB, IDS[0])].preview_url = "http://x"
     ustate.records[(TAB, IDS[1])].status = "ready"
     ustate.records[(TAB, IDS[1])].preview_url = "http://x"
     ustate.records[(TAB, IDS[2])].status = "loading"
