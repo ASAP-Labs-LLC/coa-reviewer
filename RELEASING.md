@@ -174,6 +174,11 @@ python C:\ASAPApps\updater\updater.py resume --app coa
 - **`/healthz` must keep reporting `active_sessions` and `idle_seconds`.** If a
   release stops reporting them the updater refuses to deploy it unattended and
   says so — it will not guess that nobody is there.
+- **The staging health check runs the release for real, tray icon included.**
+  From v3.2.0 COA puts an icon in the tray of whichever desktop session
+  started it. Give the updater `"health_args": ["--no-tray"]` in the `coa`
+  entry of `C:\ASAPApps\updater\config.json`, or every staging run flashes an
+  icon for a few seconds and may leave a ghost of it in the tray.
 - **A release that only changes docs still deploys**, restarting the app. That
   is usually fine, but it is not a no-op.
 

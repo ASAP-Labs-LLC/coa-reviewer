@@ -44,6 +44,7 @@ from flask import Flask, Response, jsonify, render_template, request, send_file,
 from qbench_client import QBenchAPIClient, QBenchAPIError
 from labcore_client import LabCoreClient, LabCoreUnavailable
 from change_log import ChangeLog
+import tray
 
 # ── Playwright ──────────────────────────────────────────────────────────────
 try:
@@ -1679,6 +1680,20 @@ def _auto_restart_worker() -> None:
 threading.Thread(target=_auto_restart_worker, daemon=True).start()
 
 
+def request_restart(source: str) -> None:
+    """Restart because someone clicked: the Restart button in the UI or the
+    tray icon's menu. Delayed a moment so the caller gets its answer first.
+    `_graceful_shutdown` respawns the app itself; the updater's supervision
+    on ASAPSV1 is the backstop if that fails."""
+    logger.info("Manual restart requested via %s", source)
+
+    def _go() -> None:
+        time.sleep(1)
+        _graceful_shutdown("manual restart")
+
+    threading.Thread(target=_go, daemon=True).start()
+
+
 def _graceful_shutdown(reason: str = "unknown") -> None:
     """Shut down cleanly: flush logs, close sockets, then exit."""
     logger.info("Graceful shutdown initiated (reason: %s)", reason)
@@ -1706,6 +1721,9 @@ def _graceful_shutdown(reason: str = "unknown") -> None:
         except Exception as _spawn_err:
             logger.error("Self-respawn failed: %s", _spawn_err)
 
+    # Take the tray icon down with the process, or Windows leaves a ghost of
+    # it until the mouse passes over.
+    tray.stop_tray()
     time.sleep(0.5)
     # Use os._exit to avoid hanging on daemon threads
     os._exit(0)
@@ -2629,15 +2647,9 @@ def heartbeat():
 @app.route("/api/restart", methods=["POST"])
 @require_portal
 def restart_server():
-    """Restart the server process. Run.pyw will auto-restart it."""
+    """Restart the server process; it respawns itself (see request_restart)."""
     ustate = get_user_state()
-    logger.info("Manual restart requested by %s", ustate.name if ustate else "unknown")
-
-    def _do_restart():
-        time.sleep(1)  # let the response reach the client
-        _graceful_shutdown("manual restart")
-
-    threading.Thread(target=_do_restart, daemon=True).start()
+    request_restart(f"the Restart button ({ustate.name if ustate else 'unknown'})")
     return jsonify({"ok": True, "message": "Server is restarting...", "old_pid": os.getpid()})
 
 
@@ -4469,6 +4481,12 @@ if __name__ == "__main__":
         logger.error("Port %d is still in use after 15s — cannot start. Exiting.", port)
         print(f"  ERROR: Port {port} is still in use. Cannot start.")
         sys.exit(1)
+
+    # The tray icon (Open / Restart / Show Log) lives in this process now that
+    # the updater launches app.py directly; Run.pyw used to own it. After the
+    # port check, so a duplicate that is about to exit never shows one.
+    tray.start_tray(version=APP_VERSION, port=port, pid=os.getpid(), log_path=_LOG_FILE,
+                    restart=lambda: request_restart("the tray icon"))
 
     if not PLAYWRIGHT_AVAILABLE:
         logger.warning("Playwright unavailable: %s", _playwright_error)
