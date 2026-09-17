@@ -3121,13 +3121,17 @@ def download_pdf(lab_id: str):
 @require_portal
 def get_sif(lab_id: str):
     ustate = get_user_state()
-    rec = None
-    for r in ustate.records.values():
-        if r.lab_id == lab_id:
-            rec = r
-            break
+    # Resolve by lab_id, but serve from whichever copy has the SIF. The same
+    # lab_id sits on two tabs more often than not (Due Out and Re-review,
+    # Yesterday and Search), and since previews render on demand the copy
+    # nobody looked at has no SIF bytes. Taking the first match by insertion
+    # order answered 404 while the copy on screen held the document — the
+    # browser only asks once that copy reports `found`. Same rule /api/pdf
+    # already applies with `preview_url`.
+    rec = next((r for r in ustate.records.values()
+                if r.lab_id == lab_id and r.sif_pdf_bytes), None)
 
-    if not rec or not rec.sif_pdf_bytes:
+    if not rec:
         return jsonify({"error": "SIF not available"}), 404
 
     pdf_bytes = rec.sif_pdf_bytes
