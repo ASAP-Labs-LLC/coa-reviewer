@@ -4237,18 +4237,27 @@ def regenerate_selected():
 
 # ── Good Samples Links ───────────────────────────────────────────────────────
 
+# Every tab a mark can be recorded under, in export order. Intaked is Info
+# mode's tab; it was missing from both lists, so a reviewer who checked
+# sample information all morning found nothing in Good Samples or the export.
+REVIEW_TABS = ["Yesterday", "Due Out", "Intaked", "Re-review", "Search", "Custom Day"]
+# Tabs whose Good samples get a QBench filter link. Re-review is left out, as
+# it always was: a passed re-review is closed through Command Center, not
+# worked from a QBench list.
+LINK_TABS = {"Yesterday", "Due Out", "Intaked", "Search", "Custom Day"}
+
+
 @app.route("/api/good-links", methods=["POST"])
 @require_portal
 def good_links():
     ustate = get_user_state()
     body = request.json or {}
-    selected_tabs = body.get("tabs", ["Yesterday", "Due Out", "Re-review", "Search", "Custom Day"])
-    link_eligible = {"Yesterday", "Due Out", "Search", "Custom Day"}
+    selected_tabs = body.get("tabs", REVIEW_TABS)
     links = []
 
     for tab in selected_tabs:
         tab_rows = [r for r in ustate.session_results if r["tab"] == tab]
-        if not tab_rows or tab not in link_eligible:
+        if not tab_rows or tab not in LINK_TABS:
             continue
         good_ids = [str(r["sample_id"]) for r in tab_rows if r["outcome"] == "Good" and r["sample_id"]]
         if good_ids:
@@ -4269,7 +4278,7 @@ def export_csv():
         return jsonify({"error": "Nothing to export"}), 400
 
     body = request.json or {}
-    selected_tabs = body.get("tabs", ["Yesterday", "Due Out", "Re-review", "Search", "Custom Day"])
+    selected_tabs = body.get("tabs", REVIEW_TABS)
     include_links = body.get("include_links", True)
 
     buf = io.StringIO()
@@ -4289,7 +4298,7 @@ def export_csv():
         writer.writeheader()
         writer.writerows(tab_rows)
 
-        if include_links and tab in ("Yesterday", "Due Out", "Search", "Custom Day"):
+        if include_links and tab in LINK_TABS:
             good_ids = [str(r["sample_id"]) for r in tab_rows if r["outcome"] == "Good" and r["sample_id"]]
             if good_ids:
                 params = "&".join(f"sample_ids={sid}" for sid in good_ids)

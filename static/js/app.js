@@ -3283,11 +3283,10 @@ async function handleRegeneratePending() {
 // ══════════════════════════════════════════════════════════════════════
 
 function showExportModal() {
-    const allTabs = ["Yesterday", "Due Out", "Re-review", "Search", "Custom Day"];
     const container = $("#export-tabs-list");
     container.innerHTML = "";
 
-    allTabs.forEach(tab => {
+    RESULT_TABS.forEach(tab => {
         const label = document.createElement("label");
         label.className = "checkbox-label";
         const cb = document.createElement("input");
@@ -3426,20 +3425,34 @@ async function restoreAllTabs() {
 // Good Samples (open QBench links)
 // ══════════════════════════════════════════════════════════════════════
 
+// Every tab a mark can be recorded under, in export order. Intaked is Info
+// mode's tab; it was missing from both popups, so sample-information reviews
+// never reached the Good Samples list or the export.
+const RESULT_TABS = ["Yesterday", "Due Out", "Intaked", "Re-review", "Search", "Custom Day"];
+
+function goodCount(tab) {
+    return (state.samples[tab] || []).filter(s => s.status === "good").length;
+}
+
 function showGoodModal() {
-    const allTabs = ["Yesterday", "Due Out", "Re-review", "Search", "Custom Day"];
     const container = $("#good-tabs-list");
     container.innerHTML = "";
+    // Info mode reviews on Intaked, Tests mode on the day tabs; pre-tick the
+    // tabs the current mode works from. Each row says how many Good marks it
+    // holds so the choice is informed rather than remembered.
+    const preset = currentReviewMode === "info"
+        ? ["Intaked", "Yesterday", "Due Out", "Custom Day"]
+        : ["Yesterday", "Due Out", "Custom Day"];
 
-    allTabs.forEach(tab => {
+    RESULT_TABS.forEach(tab => {
         const label = document.createElement("label");
         label.className = "checkbox-label";
         const cb = document.createElement("input");
         cb.type = "checkbox";
         cb.value = tab;
-        cb.checked = ["Yesterday", "Due Out", "Custom Day"].includes(tab);
+        cb.checked = preset.includes(tab);
         label.appendChild(cb);
-        label.appendChild(document.createTextNode(` ${tab}`));
+        label.appendChild(document.createTextNode(` ${tab} (${goodCount(tab)} good)`));
         container.appendChild(label);
     });
 
