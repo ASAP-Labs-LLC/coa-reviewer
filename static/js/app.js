@@ -519,8 +519,9 @@ function setupAppHandlers() {
     // the white frame around the PDF page in Safari + dark mode.
     document.documentElement.classList.add("force-dark-pdf");
 
-    // Server restart
-    $("#restart-btn").addEventListener("click", handleRestartServer);
+    // Server restart — from the toolbar and from the mode picker, which is
+    // where a reviewer is stuck when QBench will not log in.
+    for (const btn of restartButtons()) btn.addEventListener("click", handleRestartServer);
     initRestartConfirm();
     initFieldSettings();
 
@@ -4172,6 +4173,27 @@ function initAntigravity() {
 let _restartOldPid = null;
 let _restartPollCount = 0;
 
+// Every control that restarts the app: the toolbar icon and the sentence
+// under the mode picker's two choices. They share one handler and go busy
+// together, so whichever one the reviewer can see tells the truth.
+function restartButtons() {
+    return Array.from(document.querySelectorAll("#restart-btn, #review-mode-restart-btn"));
+}
+
+function setRestartButtonsBusy(busy) {
+    for (const btn of restartButtons()) {
+        if (busy) {
+            // Remember each button's own label (icon vs sentence) so a failed
+            // restart hands back what was there, not a third wording.
+            if (btn.dataset.idleLabel === undefined) btn.dataset.idleLabel = btn.textContent;
+            btn.textContent = "Restarting...";
+        } else if (btn.dataset.idleLabel !== undefined) {
+            btn.textContent = btn.dataset.idleLabel;
+        }
+        btn.disabled = busy;
+    }
+}
+
 async function handleRestartServer() {
     // Populate the confirm modal with live uptime + active-user counts, then
     // show it. The actual restart only fires when the user clicks the
@@ -4209,11 +4231,7 @@ function initRestartConfirm() {
 }
 
 async function triggerServerRestart() {
-    const btn = $("#restart-btn");
-    if (btn) {
-        btn.disabled = true;
-        btn.textContent = "Restarting...";
-    }
+    setRestartButtonsBusy(true);
     setStatus("Application is restarting...");
 
     _restartOldPid = null;
@@ -4267,9 +4285,7 @@ function pollForRestart() {
             if (_restartPollCount > 30) {
                 // 60+ seconds — something is wrong
                 setStatus("Application hasn't come back after 60s. Try refreshing manually.");
-                const btn = $("#restart-btn");
-                btn.disabled = false;
-                btn.textContent = "\u21bb Restart";
+                setRestartButtonsBusy(false);
                 return;
             }
             setTimeout(pollForRestart, 2000);

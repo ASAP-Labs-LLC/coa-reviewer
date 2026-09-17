@@ -1919,6 +1919,17 @@ body.mode-tests [data-show-mode="info"]  { display: none !important; }
     gap: 14px;
 }
 
+/* Restart sits under the pills as a quiet escape hatch, not a third choice. */
+.review-mode-footer {
+    margin-top: 26px;
+    display: flex;
+    justify-content: center;
+}
+.review-mode-restart {
+    font-size: 12px;
+    padding: 6px 14px;
+}
+
 /* The pills themselves — tall, generous, accent-tinted on hover. */
 .review-pill {
     -webkit-appearance: none;
