@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -317,6 +318,65 @@ class LabCoreClient:
             return {}
         data = self._get("/api/sample", params={"id": lab_id})
         return data if isinstance(data, dict) else {}
+
+    def reruns(self, lab_id: str) -> List[Dict[str, Any]]:
+        """Re-run and add-on flags on one sample's tests, newest work day first.
+
+        LabCore keeps these in their own table (`test_reruns`) and serves the
+        lab-wide list from ``/api/reruns``; they are not part of
+        ``/api/sample``'s test list. The request is narrowed to days since the
+        sample came in (its lab ID encodes the intake date), because a re-run
+        cannot predate the sample and the table grows forever. A lab ID that
+        is not ``MMDDYY-…`` asks for every day. Only this sample's rows are
+        returned, normalised to test_name / kind / work_date / by / reason.
+        """
+        lab_id = str(lab_id).strip()
+        if not lab_id:
+            return []
+        params: Dict[str, Any] = {}
+        prefix = lab_id.split("-", 1)[0]
+        try:
+            params["start"] = datetime.strptime(prefix, "%m%d%y").date().isoformat()
+        except ValueError:
+            pass
+        data = self._get("/api/reruns", params=params or None)
+        rows = data.get("reruns") if isinstance(data, dict) else None
+        out: List[Dict[str, Any]] = []
+        for r in rows if isinstance(rows, list) else []:
+            if not isinstance(r, dict) or str(r.get("lab_id", "")).strip() != lab_id:
+                continue
+            kind = str(r.get("run_kind") or "rerun").strip().lower()
+            out.append({
+                "test_name": str(r.get("test_name") or "").strip(),
+                "kind": kind if kind in ("rerun", "addon") else "rerun",
+                "work_date": str(r.get("work_date") or "").strip(),
+                "by": str(r.get("created_by") or "").strip(),
+                "reason": str(r.get("reason") or "").strip(),
+            })
+        return out
+
+    def result_history(self, lab_id: str, test_name: str) -> List[Dict[str, Any]]:
+        """Every recorded result for one (lab_id, test_name), oldest first.
+
+        ``/api/results`` is per pair and answers newest-first by *update*
+        time, which for a backfilled original can put it ahead of the re-run
+        that replaced it; ordering by when each result was created tells the
+        story in the order it happened.
+        """
+        lab_id = str(lab_id).strip()
+        test_name = str(test_name).strip()
+        if not lab_id or not test_name:
+            return []
+        data = self._get("/api/results", params={"lab_id": lab_id, "test_name": test_name})
+        rows = data.get("results") if isinstance(data, dict) else None
+        out = [{
+            "value": str(r.get("value") if r.get("value") is not None else "").strip(),
+            "at": str(r.get("created_at") or r.get("updated_at") or "").strip(),
+            "by": str(r.get("operator") or "").strip(),
+            "source": str(r.get("source") or "").strip(),
+        } for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)]
+        out.sort(key=lambda r: r["at"])
+        return out
 
     def customers(self) -> List[str]:
         """Customer names, for the listing form's datalist."""

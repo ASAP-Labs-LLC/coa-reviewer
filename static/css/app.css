@@ -2437,6 +2437,32 @@ body.dark .lv-note { color: #fbbf24; }
 .lv-test-row--noresult .lv-test-result { color: #b45309; }
 body.dark .lv-test-row--noresult .lv-test-result { color: #fbbf24; }
 
+/* A test that was re-run or added on in LabVision. The flag line and the
+   result history span the row under the three columns, so the current cell
+   still lines up with its neighbours. */
+.lv-test-row--flagged { background: color-mix(in srgb, var(--accent, #3b82f6) 8%, transparent); }
+.lv-test-flags,
+.lv-test-history {
+    grid-column: 1 / -1;
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+.lv-flag {
+    display: inline-block;
+    padding: 0 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-inverse, #fff);
+    background: var(--accent, #3b82f6);
+}
+.lv-flag--addon { background: #7c3aed; }
+.lv-hist-value { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text); }
+.lv-hist-meta { color: var(--text-subtle); }
+
 /* ══════════════════════════════════════════════════════════════════════
    Sync Data dialog
    ══════════════════════════════════════════════════════════════════════ */

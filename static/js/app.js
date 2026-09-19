@@ -1685,12 +1685,30 @@ function renderLabVisionTests(box, tests) {
     }
     // A test with no result renders an em dash, never an empty cell: a blank
     // reads as a rendering fault, and a missing result is exactly the thing
-    // the reviewer is here to catch.
+    // the reviewer is here to catch. A test that was re-run or added on is
+    // marked and says when, by whom and why, and lists the results behind it
+    // in the order they were measured, so the reviewer can see which one the
+    // COA is carrying.
+    const kindLabel = k => (k === "addon" ? "Add-on" : "Re-run");
+    const flagsLine = t => (t.reruns && t.reruns.length)
+        ? `<div class="lv-test-flags">${t.reruns.map(f =>
+            `<span class="lv-flag lv-flag--${escapeHtml(f.kind)}">${kindLabel(f.kind)}</span>` +
+            ` ${escapeHtml(f.work_date || "")}` +
+            (f.by ? ` · ${escapeHtml(f.by)}` : "") +
+            (f.reason ? ` · ${escapeHtml(f.reason)}` : "")).join("<br>")}</div>`
+        : "";
+    const historyLine = t => (t.history && t.history.length > 1)
+        ? `<div class="lv-test-history">Results: ${t.history.map(h =>
+            `<span class="lv-hist-value">${escapeHtml(h.value || "—")}</span>` +
+            ` <span class="lv-hist-meta">(${escapeHtml((h.at || "").slice(0, 16))}${h.by ? ", " + escapeHtml(h.by) : ""})</span>`
+          ).join(" → ")}</div>`
+        : "";
     box.innerHTML = tests.map(t => `
-        <div class="lv-test-row${t.result ? "" : " lv-test-row--noresult"}">
+        <div class="lv-test-row${t.result ? "" : " lv-test-row--noresult"}${(t.reruns && t.reruns.length) ? " lv-test-row--flagged" : ""}">
             <div class="lv-test-name">${escapeHtml(t.test)}</div>
             <div class="lv-test-result">${t.result ? escapeHtml(t.result) : "—"}</div>
             <div class="lv-test-op">${escapeHtml(t.operator || "")}</div>
+            ${flagsLine(t)}${historyLine(t)}
         </div>`).join("");
 }
 

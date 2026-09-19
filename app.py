@@ -3576,23 +3576,48 @@ def qbench_field_rows(current: Dict[str, Any]) -> List[dict]:
     return editable + read_only
 
 
-def lab_vision_tests(raw: Any) -> List[dict]:
-    """LabVision's test list, normalised to exactly test/result/operator.
+def lab_vision_tests(raw: Any, flags: Any = None, histories: Any = None) -> List[dict]:
+    """LabVision's test list, normalised to test/result/operator/reruns/history.
 
     LabCore drops the `operator` key entirely against an older database, so
     the shape is pinned here rather than left for the pane to defend against.
+
+    `flags` are the sample's re-run / add-on flags (LabCoreClient.reruns) and
+    `histories` maps a test name to its recorded results
+    (LabCoreClient.result_history); both attach to the matching test row.
+    A flag on a test the sample does not list yet becomes a row with no
+    result: an add-on nobody has run is exactly the outstanding work a
+    reviewer should see. Anything that is not a list/dict is treated as
+    absent, so a LabCore hiccup costs the flags, not the pane.
     """
     if not isinstance(raw, list):
-        return []
+        raw = []
+    flag_rows = [f for f in flags if isinstance(f, dict)] if isinstance(flags, list) else []
+    hist = histories if isinstance(histories, dict) else {}
+
+    def _extras(name: str) -> dict:
+        mine = [f for f in flag_rows if str(f.get("test_name", "")).strip() == name]
+        h = hist.get(name)
+        return {"reruns": mine, "history": h if isinstance(h, list) else []}
+
     out: List[dict] = []
+    seen: set = set()
     for entry in raw:
         if not isinstance(entry, dict):
             continue
+        name = _display_value(entry.get("test"))
+        seen.add(name)
         out.append({
-            "test": _display_value(entry.get("test")),
+            "test": name,
             "result": _display_value(entry.get("result")),
             "operator": _display_value(entry.get("operator")),
+            **_extras(name),
         })
+    for f in flag_rows:
+        name = str(f.get("test_name", "")).strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append({"test": name, "result": "", "operator": "", **_extras(name)})
     return out
 
 
@@ -4026,13 +4051,33 @@ def sync_preview(lab_id: str):
         except Exception as exc:
             logger.warning("sync-preview: could not read QBench sample %s: %s", sid, exc)
 
+    # Re-run / add-on flags and the results behind them live outside the
+    # sample record in LabCore. Best-effort: a hiccup here costs the flags,
+    # never the pane. History is fetched only for flagged tests, one call
+    # each, so an unflagged sample costs one extra request.
+    flags: List[dict] = []
+    histories: Dict[str, list] = {}
+    try:
+        flags = state.labcore.reruns(lab_id)
+    except Exception as exc:
+        logger.warning("sync-preview: could not read re-run flags for %s: %s", lab_id, exc)
+    if isinstance(flags, list):
+        for name in {str(f.get("test_name", "")).strip() for f in flags if isinstance(f, dict)}:
+            if not name:
+                continue
+            try:
+                histories[name] = state.labcore.result_history(lab_id, name)
+            except Exception as exc:
+                logger.warning("sync-preview: could not read result history for %s / %s: %s",
+                               lab_id, name, exc)
+
     return jsonify({
         "lab_id": lab_id,
         "pairs": pair_sample_fields(source, SAMPLE_EDITABLE_FIELDS, current),
         "targets": sorted(SAMPLE_EDITABLE_FIELDS),
         "lv_fields": lab_vision_field_rows(source),
         "qb_fields": qbench_field_rows(current),
-        "tests": lab_vision_tests(source.get("tests")),
+        "tests": lab_vision_tests(source.get("tests"), flags=flags, histories=histories),
         "qbench_read": qbench_read,
     })
 
