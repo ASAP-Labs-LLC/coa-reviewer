@@ -16,6 +16,7 @@ import atexit
 import csv
 import functools
 import io
+from urllib.parse import quote
 import json
 import logging
 import logging.handlers
@@ -2816,6 +2817,26 @@ def focus():
     return jsonify({"ok": True, "queued": queued, "window": window})
 
 
+_LAB_ID_SHAPE = re.compile(r"^(\d{6})-\d+$")
+
+
+def _looks_like_lab_id(part: str) -> bool:
+    """``MMDDYY-NNNNN`` is a lab ID, not "NNNNN through MMDDYY".
+
+    The range parser below reads any ``digits-digits`` as a span, so a pasted
+    list of full lab IDs was swallowed by its 500-span guard and found
+    nothing. Six digits that are not a date (``100000-100002``) stay a range.
+    """
+    m = _LAB_ID_SHAPE.match(part)
+    if not m:
+        return False
+    try:
+        datetime.strptime(m.group(1), "%m%d%y")
+    except ValueError:
+        return False
+    return True
+
+
 def _parse_search_query(query: str) -> List[str]:
     """Parse a search query that may contain comma-separated values and/or ranges.
 
@@ -2824,6 +2845,7 @@ def _parse_search_query(query: str) -> List[str]:
         "32217,32219"     → ["32217", "32219"]
         "32217-32222"     → ["32217", "32218", "32219", "32220", "32221", "32222"]
         "32217-32219,32225" → ["32217", "32218", "32219", "32225"]
+        "091626-50001,091626-50003" → both, as lab IDs (see _looks_like_lab_id)
     Returns an empty list if the query doesn't look like a multi-ID query.
     """
     import re
@@ -2833,6 +2855,9 @@ def _parse_search_query(query: str) -> List[str]:
     parts = [p.strip() for p in query.split(",") if p.strip()]
     result: List[str] = []
     for part in parts:
+        if _looks_like_lab_id(part):
+            result.append(part)
+            continue
         range_match = re.match(r"^(\d+)\s*-\s*(\d+)$", part)
         if range_match:
             start, end = int(range_match.group(1)), int(range_match.group(2))
@@ -2855,9 +2880,21 @@ def search_samples():
 
     ustate = get_user_state()
     body = request.json or {}
-    query = body.get("query", "").strip()
-    if not query:
+    query = str(body.get("query") or "").strip()
+    # An explicit list bypasses the query parser. It is how a colleague's
+    # double-check link (/?check=<lab ids>) arrives: exact lab IDs, looked up
+    # one by one, never read as ranges.
+    lab_ids: List[str] = []
+    if isinstance(body.get("lab_ids"), list):
+        seen_lab: set = set()
+        for x in body["lab_ids"]:
+            lid = str(x or "").strip()
+            if lid and lid not in seen_lab:
+                seen_lab.add(lid)
+                lab_ids.append(lid)
+    if not query and not lab_ids:
         return jsonify({"error": "Query required"}), 400
+    shown = query or f"{len(lab_ids)} lab ID(s)"
 
     keys_to_del = [k for k in ustate.records if k[0] == "Search"]
     for k in keys_to_del:
@@ -2868,7 +2905,7 @@ def search_samples():
         ustate.pdf_cache.pop(lab_id, None)
         del ustate.records[k]
 
-    multi_ids = _parse_search_query(query)
+    multi_ids = lab_ids or _parse_search_query(query)
     samples_raw: List[Dict[str, Any]] = []
 
     if multi_ids:
@@ -2895,7 +2932,7 @@ def search_samples():
                 pass
 
     if not samples_raw:
-        ustate.emit_status(f"No samples found for '{query}'.")
+        ustate.emit_status(f"No samples found for '{shown}'.")
         return jsonify({"tab": "Search", "samples": []})
 
     sample_test_map: Dict[int, Dict[str, Any]] = {}
@@ -2935,7 +2972,7 @@ def search_samples():
         ustate.add_record(rec)
 
     ustate.persist()
-    ustate.emit_status(f"Found {len(samples)} sample(s) for '{query}'.")
+    ustate.emit_status(f"Found {len(samples)} sample(s) for '{shown}'.")
 
     # Renders wait for /api/focus, as with any other tab.
     records = ustate.get_tab_records("Search")
@@ -4246,6 +4283,31 @@ REVIEW_TABS = ["Yesterday", "Due Out", "Intaked", "Re-review", "Search", "Custom
 # worked from a QBench list.
 LINK_TABS = {"Yesterday", "Due Out", "Intaked", "Search", "Custom Day"}
 
+_BARE_ORIGIN = re.compile(r"^https?://[A-Za-z0-9.\-]+(?::\d+)?$")
+
+
+def _review_origin(body: dict) -> str:
+    """The address a colleague should open this app at.
+
+    The browser sends its own `location.origin`, because behind the
+    Cloudflare tunnel this server cannot tell which hostname it is being
+    reached by. Anything that is not a bare ``http(s)://host[:port]`` is
+    ignored in favour of the request's own host, so the link can never be
+    pointed somewhere else.
+    """
+    sent = str(body.get("origin") or "").strip().rstrip("/")
+    if _BARE_ORIGIN.match(sent):
+        return sent
+    return request.host_url.rstrip("/")
+
+
+def double_check_url(origin: str, lab_ids: List[str]) -> str:
+    """A link into this app that loads `lab_ids` into the opener's Search
+    tab, so someone else can double-check a reviewer's Good samples. Their
+    marks are their own: Search rows are a separate review of the same lab
+    ID, and the verdict ledger is per account."""
+    return f"{origin}/?check={quote(','.join(lab_ids), safe=',-')}"
+
 
 @app.route("/api/good-links", methods=["POST"])
 @require_portal
@@ -4253,17 +4315,22 @@ def good_links():
     ustate = get_user_state()
     body = request.json or {}
     selected_tabs = body.get("tabs", REVIEW_TABS)
+    origin = _review_origin(body)
     links = []
 
     for tab in selected_tabs:
         tab_rows = [r for r in ustate.session_results if r["tab"] == tab]
         if not tab_rows or tab not in LINK_TABS:
             continue
-        good_ids = [str(r["sample_id"]) for r in tab_rows if r["outcome"] == "Good" and r["sample_id"]]
+        good_rows = [r for r in tab_rows if r["outcome"] == "Good" and r["sample_id"]]
+        good_ids = [str(r["sample_id"]) for r in good_rows]
         if good_ids:
             params = "&".join(f"sample_ids={sid}" for sid in good_ids)
             url = f"https://asaplabs.qbench.net/tests?{params}&sort_order=DESC&view_config_id=17&page_size=700"
-            links.append({"tab": tab, "count": len(good_ids), "url": url})
+            lab_ids = [str(r["lab_id"]) for r in good_rows if r.get("lab_id")]
+            links.append({"tab": tab, "count": len(good_ids), "url": url,
+                          "lab_ids": lab_ids,
+                          "review_url": double_check_url(origin, lab_ids)})
 
     return jsonify({"links": links})
 
@@ -4280,11 +4347,13 @@ def export_csv():
     body = request.json or {}
     selected_tabs = body.get("tabs", REVIEW_TABS)
     include_links = body.get("include_links", True)
+    origin = _review_origin(body)
 
     buf = io.StringIO()
     fieldnames = ["lab_id", "sample_id", "tab", "outcome", "reason", "reviewer", "date"]
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     link_urls = []
+    review_links = []
 
     first = True
     for tab in selected_tabs:
@@ -4299,12 +4368,16 @@ def export_csv():
         writer.writerows(tab_rows)
 
         if include_links and tab in LINK_TABS:
-            good_ids = [str(r["sample_id"]) for r in tab_rows if r["outcome"] == "Good" and r["sample_id"]]
+            good_rows = [r for r in tab_rows if r["outcome"] == "Good" and r["sample_id"]]
+            good_ids = [str(r["sample_id"]) for r in good_rows]
             if good_ids:
                 params = "&".join(f"sample_ids={sid}" for sid in good_ids)
                 url = f"https://asaplabs.qbench.net/tests?{params}&sort_order=DESC&view_config_id=17&page_size=700"
                 buf.write(f"# QBench link: {url}\n")
                 link_urls.append(url)
+                review = double_check_url(origin, [str(r["lab_id"]) for r in good_rows if r.get("lab_id")])
+                buf.write(f"# COA Reviewer double-check link: {review}\n")
+                review_links.append(review)
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     out_path = ARCHIVE_DIR / f"review_{ustate.name}_{timestamp}.csv"
@@ -4314,6 +4387,7 @@ def export_csv():
         "ok": True,
         "csv": buf.getvalue(),
         "links": link_urls,
+        "review_links": review_links,
         "filename": out_path.name,
     })
 

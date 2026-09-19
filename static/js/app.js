@@ -67,6 +67,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     $$(".theme-pip").forEach(b => b.addEventListener("click", () => applyTheme(b.dataset.theme)));
     initAntigravity();
     initReviewModeModal();
+    initDoubleCheckLink();
 
     // Step 1: Check portal session (POST so Cloudflare never caches the result).
     // The try/catch here is strictly for NETWORK errors — its reload-in-3s
@@ -3313,7 +3314,7 @@ async function handleExport() {
         const resp = await fetch("/api/export", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tabs, include_links: includeLinks }),
+            body: JSON.stringify({ tabs, include_links: includeLinks, origin: location.origin }),
         });
         if (resp.status === 401) { triggerTimeout(); return; }
         const data = await resp.json();
@@ -3334,6 +3335,17 @@ async function handleExport() {
                 });
                 navigator.clipboard.writeText(data.links.join("\n")).catch(() => {});
             }
+            // One per QBench link: opens this app on those samples for a
+            // colleague's double-check.
+            (data.review_links || []).forEach(url => {
+                const a = document.createElement("a");
+                a.href = url;
+                a.target = "_blank";
+                a.textContent = "Double-check link (COA Reviewer)";
+                a.style.display = "block";
+                a.style.marginTop = "4px";
+                linksDiv.appendChild(a);
+            });
             $("#export-result").classList.remove("hidden");
             setStatus(`Exported to ${data.filename}`);
         } else {
@@ -3469,7 +3481,9 @@ async function handleOpenGoodLinks() {
         const resp = await fetch("/api/good-links", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tabs }),
+            // The server builds the double-check link on the address this
+            // browser is using; behind the tunnel it cannot tell otherwise.
+            body: JSON.stringify({ tabs, origin: location.origin }),
         });
         if (resp.status === 401) { triggerTimeout(); return; }
         const data = await resp.json();
@@ -3484,10 +3498,24 @@ async function handleOpenGoodLinks() {
 
         links.forEach(l => window.open(l.url, "_blank"));
 
+        // The QBench link opens for this reviewer; the double-check link is
+        // for handing to someone else, so it is shown and copied, not opened.
         const result = $("#good-links-result");
         result.innerHTML = links.map(l =>
-            `<p>${l.tab}: ${l.count} good sample(s) — <a href="${l.url}" target="_blank">link</a></p>`
+            `<p>${escapeHtml(l.tab)}: ${l.count} good sample(s) — <a href="${escapeHtml(l.url)}" target="_blank">QBench</a>` +
+            (l.review_url
+                ? ` · <a href="${escapeHtml(l.review_url)}" target="_blank">double-check in COA Reviewer</a>` +
+                  ` <button type="button" class="btn copy-review-link" data-url="${escapeHtml(l.review_url)}">Copy link</button>`
+                : "") +
+            `</p>`
         ).join("");
+        result.querySelectorAll(".copy-review-link").forEach(btn => {
+            btn.addEventListener("click", () => {
+                navigator.clipboard.writeText(btn.dataset.url)
+                    .then(() => setStatus("Double-check link copied — send it to whoever is checking"))
+                    .catch(() => setStatus("Could not copy; use the link itself"));
+            });
+        });
         result.classList.remove("hidden");
 
         const allUrls = links.map(l => l.url).join("\n");
@@ -4176,6 +4204,81 @@ function initAntigravity() {
 
     // Kick off if #app is hidden at boot (the common case — login flow ahead).
     if (app.classList.contains("hidden")) start();
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+// Double-check link
+// ══════════════════════════════════════════════════════════════════════
+//
+// A colleague's Good Samples list arrives as /?check=<lab ids> (built by
+// /api/good-links and the export). The list is read once and dropped from
+// the address bar, so a refresh does not re-run it, then loaded into the
+// Search tab as soon as the main app is on screen. QBench may still be
+// logging in behind the splash at that point, so a "not logged in" answer
+// is retried rather than reported.
+
+let _pendingDoubleCheck = null;
+let _doubleCheckTries = 0;
+
+function readDoubleCheckParam() {
+    const params = new URLSearchParams(location.search);
+    const raw = params.get("check");
+    if (!raw) return null;
+    params.delete("check");
+    const rest = params.toString();
+    history.replaceState(null, "", location.pathname + (rest ? "?" + rest : "") + location.hash);
+    const ids = [...new Set(raw.split(",").map(s => s.trim()).filter(Boolean))];
+    return ids.length ? ids : null;
+}
+
+function initDoubleCheckLink() {
+    _pendingDoubleCheck = readDoubleCheckParam();
+    if (!_pendingDoubleCheck) return;
+    const app = document.getElementById("app");
+    if (!app) return;
+    const observer = new MutationObserver(() => {
+        if (app.classList.contains("hidden")) return;
+        observer.disconnect();
+        runPendingDoubleCheck();
+    });
+    observer.observe(app, { attributes: true, attributeFilter: ["class"] });
+    if (!app.classList.contains("hidden")) {
+        observer.disconnect();
+        runPendingDoubleCheck();
+    }
+}
+
+async function runPendingDoubleCheck() {
+    const ids = _pendingDoubleCheck;
+    if (!ids) return;
+    setStatus(`Loading ${ids.length} sample(s) to double-check…`);
+    try {
+        const resp = await fetch("/api/search", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ lab_ids: ids }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.status === 401 && data.portal_auth === false) { triggerTimeout(); return; }
+        if (resp.status === 401) {
+            if (++_doubleCheckTries < 40) setTimeout(runPendingDoubleCheck, 3000);
+            else setStatus("Could not load the double-check list: QBench is not logged in.");
+            return;
+        }
+        if (!resp.ok) {
+            _pendingDoubleCheck = null;
+            setStatus("Double-check failed: " + (data.error || `HTTP ${resp.status}`));
+            return;
+        }
+        _pendingDoubleCheck = null;
+        state.samples["Search"] = data.samples || [];
+        switchTab("Search");
+        setStatus(`Double-check: ${(data.samples || []).length} of ${ids.length} sample(s) loaded into Search`);
+    } catch (e) {
+        if (++_doubleCheckTries < 40) setTimeout(runPendingDoubleCheck, 3000);
+        else setStatus("Could not load the double-check list: " + e.message);
+    }
 }
 
 
