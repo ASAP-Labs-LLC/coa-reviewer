@@ -35,15 +35,15 @@ class _Presence:
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self.calls = []
-        self.marker_at_close = None
+        self.marker_at_flush = None
 
     def close_all(self, reason):
         self.calls.append(("close_all", reason))
-        self.marker_at_close = (self.data_dir / restart_update.MARKER_FILE).exists()
         return 0
 
-    def flush(self):
-        self.calls.append(("flush",))
+    def flush(self, blocking=False, timeout=5.0):
+        self.calls.append(("flush", blocking))
+        self.marker_at_flush = (self.data_dir / restart_update.MARKER_FILE).exists()
         return 0
 
     def touch(self, user):
@@ -89,6 +89,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "APP_VERSION", "v3.5.0")
     monkeypatch.setattr(app_module, "_restart_requested", False)
     monkeypatch.setattr(app_module, "_restart_tag", None)
+    monkeypatch.setattr(app_module, "_auto_restart_done_today", None)
     presence = _Presence(tmp_path)
     monkeypatch.setattr(app_module.state, "presence", presence)
     e.presence = presence
@@ -145,11 +146,13 @@ def test_a_staged_upgrade_writes_the_request_and_waits(env) -> None:
 
 def test_presence_is_saved_before_the_request_is_written(env) -> None:
     """The switch kills us with taskkill /F, which skips _graceful_shutdown —
-    so whatever presence has in memory must be on disk before we ask."""
+    so whatever presence has in memory must be on disk before we ask. Saved,
+    not closed: reviewers keep working for up to ~105 s while the updater
+    answers, and the next process closes open spans at their last touch."""
     env.stage()
     env.app.request_restart("x", by="Dana P")
-    assert ("close_all", "restart") in env.presence.calls
-    assert env.presence.marker_at_close is False
+    assert env.presence.calls == [("flush", True)]
+    assert env.presence.marker_at_flush is False
 
 
 def test_a_second_request_while_one_is_pending_does_nothing(env) -> None:
@@ -196,9 +199,9 @@ def test_a_failed_write_falls_back_and_leaves_no_marker(env, monkeypatch) -> Non
 def test_a_broken_presence_does_not_stop_the_restart(env, monkeypatch) -> None:
     env.stage()
 
-    def boom(_reason):
+    def boom(**_kw):
         raise RuntimeError("presence down")
-    monkeypatch.setattr(env.presence, "close_all", boom)
+    monkeypatch.setattr(env.presence, "flush", boom)
     assert env.app.request_restart("x", by="Dana P") == "v9.9.9"
 
 
@@ -322,12 +325,10 @@ def test_api_restart_update_is_null_for_a_plain_restart(env, client) -> None:
     assert body["ok"] is True and body["update"] is None
 
 
-def test_the_tray_restarts_as_tray() -> None:
-    import app as app_module
-    from pathlib import Path
-    src = Path(app_module.__file__).read_text(encoding="utf-8")
-    main = src[src.index('if __name__ == "__main__"'):]
-    assert 'request_restart("the tray icon", by="tray")' in main
+def test_the_tray_restarts_as_tray(env) -> None:
+    env.stage()
+    assert env.app._restart_from_tray() == "v9.9.9"
+    assert env.marker()["by"] == "tray"
 
 
 # ── _graceful_shutdown itself ────────────────────────────────────────────
@@ -430,3 +431,129 @@ def test_a_watcher_error_after_it_was_taken_does_not_respawn(env, monkeypatch) -
     monkeypatch.setattr(restart_update, "read_switch_outcome", flaky)
     _await(env)
     assert env.shutdowns == [("manual restart", False)]
+
+
+
+def test_a_withdrawal_that_fails_without_a_claim_still_respawns(env, monkeypatch, caplog) -> None:
+    """withdraw() also returns False on an OSError. The marker is still
+    there, so nobody claimed it: this is not "the updater has it"."""
+    env.stage()
+    env.app.request_restart("x", by="Dana P")
+    monkeypatch.setattr(restart_update, "withdraw_switch_request", lambda _d: False)
+
+    with caplog.at_level(logging.ERROR, logger="coa.restart"):
+        _await(env, pickup=2.0)
+
+    assert env.shutdowns == [("manual restart", True)]
+    assert not (env.data_dir / restart_update.MARKER_FILE).exists()
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+
+def test_a_watcher_error_with_the_marker_stuck_still_respawns(env, monkeypatch) -> None:
+    env.stage()
+    env.app.request_restart("x", by="Dana P")
+
+    def boom(_data_dir):
+        raise RuntimeError("unreadable")
+    monkeypatch.setattr(restart_update, "read_switch_outcome", boom)
+    monkeypatch.setattr(restart_update, "withdraw_switch_request", lambda _d: False)
+    _await(env)
+    assert env.shutdowns == [("manual restart", True)]
+
+
+def test_a_paused_updater_will_not_restart_us_so_we_respawn(env) -> None:
+    env.stage()
+    env.app.request_restart("x", by="Dana P")
+    (env.data_dir / "paused").write_text("", encoding="utf-8")
+    env.on_sleep = lambda n: env.claim("accepted") if n == 1 else None
+    _await(env, pickup=30.0)
+    assert env.shutdowns == [("manual restart", True)]
+
+
+def test_paused_but_mid_switch_still_does_not_respawn(env) -> None:
+    env.stage()
+    env.app.request_restart("x", by="Dana P")
+    (env.data_dir / "paused").write_text("", encoding="utf-8")
+    (env.data_dir / "switching").write_text("", encoding="utf-8")
+    env.on_sleep = lambda n: env.claim("accepted") if n == 1 else None
+    _await(env, pickup=30.0)
+    assert env.shutdowns == [("manual restart", False)]
+
+
+def test_a_thread_that_will_not_start_still_restarts(env, monkeypatch) -> None:
+    def no_threads(*_a):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(env.app, "_spawn", no_threads)
+    env.stage()
+    assert env.app.request_restart("x", by="Dana P") is None
+    assert env.shutdowns == [("manual restart", True)]      # inline
+    assert not (env.data_dir / restart_update.MARKER_FILE).exists()
+
+
+def test_when_nothing_can_restart_the_flag_is_released(env, monkeypatch) -> None:
+    def no_threads(*_a):
+        raise RuntimeError("can't start new thread")
+
+    def no_shutdown(*_a, **_k):
+        raise RuntimeError("worse")
+    monkeypatch.setattr(env.app, "_spawn", no_threads)
+    monkeypatch.setattr(env.app, "_graceful_shutdown", no_shutdown)
+    assert env.app.request_restart("x", by="Dana P") is None    # never raises
+    assert env.app._restart_requested is False                 # a retry can work
+
+
+# ── the 3 AM restart shares the single flight ────────────────────────────
+
+def test_3am_does_nothing_while_a_restart_is_pending(env, monkeypatch) -> None:
+    monkeypatch.setattr(env.app, "_should_auto_restart", lambda **_k: True)
+    env.stage()
+    env.app.request_restart("x", by="Dana P")
+    env.app._auto_restart_tick()
+    assert env.shutdowns == []
+    assert env.app._auto_restart_done_today is not None     # and not again today
+
+
+def test_3am_claims_the_single_flight(env, monkeypatch) -> None:
+    monkeypatch.setattr(env.app, "_should_auto_restart", lambda **_k: True)
+    env.app._auto_restart_tick()
+    assert env.shutdowns == [("auto-restart", True)]
+    assert env.app.request_restart("x", by="Dana P") is None
+    assert env.spawned == []                                  # the click is a no-op
+
+
+def test_3am_not_due_changes_nothing(env, monkeypatch) -> None:
+    monkeypatch.setattr(env.app, "_should_auto_restart", lambda **_k: False)
+    env.app._auto_restart_tick()
+    assert env.shutdowns == [] and env.app._restart_requested is False
+
+
+# ── _graceful_shutdown always exits ──────────────────────────────────────
+
+@pytest.mark.parametrize("name", ["switch-requested", "switch-accepted", "switching"])
+def test_nothing_respawns_while_a_switch_file_exists(real_shutdown, tmp_path, name) -> None:
+    app_module, spawned, _ = real_shutdown
+    (tmp_path / name).write_text("{}", encoding="utf-8")
+    with pytest.raises(_Exited):
+        app_module._graceful_shutdown("manual restart")
+    assert spawned == []
+
+
+def test_a_respawn_check_that_raises_still_exits_without_respawn(real_shutdown, monkeypatch) -> None:
+    app_module, spawned, _ = real_shutdown
+
+    def boom(*_a):
+        raise OSError("stat failed")
+    monkeypatch.setattr(app_module, "_switch_file_present", boom)
+    with pytest.raises(_Exited):
+        app_module._graceful_shutdown("manual restart")
+    assert spawned == []
+
+
+def test_shutdown_exits_even_if_saving_state_raises(real_shutdown, monkeypatch) -> None:
+    app_module, _, _ = real_shutdown
+
+    def boom():
+        raise RuntimeError("logging broke")
+    monkeypatch.setattr(app_module, "_save_state_for_exit", boom)
+    with pytest.raises(_Exited):
+        app_module._graceful_shutdown("manual restart")

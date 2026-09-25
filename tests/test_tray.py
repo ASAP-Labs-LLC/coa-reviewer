@@ -252,7 +252,12 @@ def test_the_tray_and_the_restart_button_share_one_restart_path() -> None:
     route = APP_PY[APP_PY.index('@app.route("/api/restart"'):]
     route = route[:route.index("\n@app.route", 1)]
     assert "request_restart(" in route
-    assert "request_restart(" in _main_block()
+    # The tray's callback is a named helper so its behaviour can be tested
+    # (tests/test_restart_switch.py); it must still go through request_restart.
+    assert "restart=_restart_from_tray" in _main_block()
+    helper = APP_PY[APP_PY.index("def _restart_from_tray"):]
+    helper = helper[:helper.index("\ndef ", 1)]
+    assert "request_restart(" in helper
 
 
 def test_shutting_down_takes_the_icon_with_it() -> None:

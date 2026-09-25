@@ -56,12 +56,7 @@ def test_state_has_a_shared_store_in_data_dir_and_a_tracker() -> None:
     assert isinstance(app_module.state.presence, PresenceTracker)
 
 
-def test_a_new_process_closes_spans_and_clears_switch_files_left_behind(
-        tmp_path, monkeypatch, isolated_app_paths, caplog) -> None:
-    """A span still open, or a switch file still lying there, belongs to a
-    process that is gone: a new one means the restart already happened."""
-    import app as app_module
-
+def _leave_a_mess(tmp_path):
     old = SharedStore(tmp_path / "coa_shared.db")
     assert old.apply_presence([{"op": "open", "user": "Dana P",
                                 "started": 1000.0, "last_seen": 1060.0}])
@@ -69,11 +64,20 @@ def test_a_new_process_closes_spans_and_clears_switch_files_left_behind(
     for name in ("switch-requested", "switch-accepted"):
         (tmp_path / name).write_text("{}", encoding="utf-8")
 
+
+def test_the_serving_process_closes_spans_and_clears_switch_files_left_behind(
+        tmp_path, monkeypatch, caplog) -> None:
+    """A span still open, or a switch file still lying there, belongs to a
+    process that is gone: a new one means the restart already happened."""
+    import app as app_module
+
+    _leave_a_mess(tmp_path)
     monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
-    with caplog.at_level(logging.INFO):
-        fresh = app_module.AppState()
+    store = SharedStore(tmp_path / "coa_shared.db")
     try:
-        span = fresh.shared.spans_between(0, 1e10)[0]
+        with caplog.at_level(logging.INFO):
+            app_module._tidy_after_last_run(store)
+        span = store.spans_between(0, 1e10)[0]
         assert span["open"] is False and span["end_reason"] == "restart"
         assert span["end"] == 1060.0
         assert not (tmp_path / "switch-requested").exists()
@@ -81,12 +85,30 @@ def test_a_new_process_closes_spans_and_clears_switch_files_left_behind(
         assert any(r.levelno == logging.WARNING and "leftover switch file" in r.getMessage()
                    for r in caplog.records)
     finally:
+        store.close()
+
+
+def test_building_state_touches_nothing_on_disk(tmp_path, monkeypatch, isolated_app_paths) -> None:
+    """AppState is built at import, before the port guard. A duplicate
+    launch that is about to exit must not close the live process's spans or
+    delete its pending switch request, and importing the app must not create
+    the database (tests/test_data_dir.py imports it with DATA_DIR = APP_DIR)."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path / "fresh")
+    (tmp_path / "fresh").mkdir()
+    (tmp_path / "fresh" / "switch-requested").write_text("{}", encoding="utf-8")
+    fresh = app_module.AppState()
+    try:
+        assert (tmp_path / "fresh" / "switch-requested").exists()
+        assert not (tmp_path / "fresh" / "coa_shared.db").exists()
+    finally:
         fresh.shared.close()
 
 
 # ── touching ─────────────────────────────────────────────────────────────
 
-def test_heartbeat_marks_the_reviewer_online(wired) -> None:
+def test_heartbeat_keeps_the_reviewer_online(wired) -> None:
     client, tracker, store, _ = wired
     assert client.post("/api/heartbeat").status_code == 200
     assert tracker.online() == ["Dana P"]
@@ -171,7 +193,7 @@ class _Recorder:
     def sweep(self):
         return self._call("sweep")
 
-    def flush(self):
+    def flush(self, blocking=False, timeout=5.0):
         return self._call("flush")
 
 
@@ -205,12 +227,41 @@ def test_a_failing_reaper_still_flushes(monkeypatch) -> None:
     assert rec.calls == ["sweep", "flush"]
 
 
-def test_the_worker_flushes_at_the_presence_cadence() -> None:
+def test_the_worker_flushes_at_the_presence_cadence(monkeypatch) -> None:
     """Presence loses at most one flush interval on a crash; the worker is
     what sets that interval."""
     import app as app_module
     from presence import FLUSH_SECONDS
-    assert app_module.SESSION_CLEANUP_INTERVAL_SECONDS <= FLUSH_SECONDS
+    rec = _Recorder()
+    monkeypatch.setattr(app_module.state, "presence", rec)
+    monkeypatch.setattr(app_module, "_reap_idle_sessions", lambda _now: [])
+    slept = []
+    app_module._session_cleanup_worker(cycles=3, sleep=slept.append)
+    assert rec.calls.count("flush") == 3
+    assert len(slept) == 3 and all(0 < s <= FLUSH_SECONDS for s in slept)
+
+
+def test_a_failing_touch_logs_once_then_rate_limits(wired, monkeypatch, caplog) -> None:
+    import app as app_module
+    client, tracker, _, _ = wired
+
+    def boom(_user):
+        raise RuntimeError("presence exploded")
+    monkeypatch.setattr(tracker, "touch", boom)
+    monkeypatch.setattr(app_module, "_touch_failures", 0)
+    monkeypatch.setattr(app_module, "_touch_fail_logged_at", None)
+    with caplog.at_level(logging.ERROR):
+        for _ in range(5):
+            client.post("/api/heartbeat")
+    failures = [r for r in caplog.records if "presence touch failed" in r.getMessage()]
+    assert len(failures) == 1 and failures[0].exc_info
+
+    monkeypatch.setattr(app_module, "TOUCH_FAIL_LOG_INTERVAL_SECONDS", 0.0)
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        client.post("/api/heartbeat")
+    again = [r for r in caplog.records if "presence touch failed" in r.getMessage()]
+    assert len(again) == 1 and "6" in again[0].getMessage()
 
 
 # ── /api/health ──────────────────────────────────────────────────────────

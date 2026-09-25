@@ -225,6 +225,8 @@ _console_handler.setLevel(logging.INFO)
 
 logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, handlers=[_file_handler, _console_handler])
 logger = logging.getLogger(__name__)
+# The restart flow (plain restart, staged-release switch, fallbacks).
+restart_log = logging.getLogger("coa.restart")
 
 
 def log_login_event(event: str, name: str, ip: str) -> None:
@@ -1039,16 +1041,19 @@ class SampleRecord:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _tidy_after_last_run(shared: SharedStore) -> None:
-    """A new process means the last one is gone: whatever it left open or
-    half-asked is over, one way or another."""
+    """The serving process's first act: the last one is gone, so whatever it
+    left open or half-asked is over, one way or another.
+
+    Called from ``__main__`` after the port guard, never at import: a
+    duplicate launch that is about to exit (port held) must not close the
+    live process's spans or delete its pending switch request."""
     closed = shared.close_open_spans("restart")
     if closed:
         logger.info("Closed %d presence span(s) left open by the last run", closed)
     removed = restart_update.clear_switch_files(DATA_DIR)
     if removed:
-        logging.getLogger("coa.restart").warning(
-            "Removed %d leftover switch file(s) — a new process means the "
-            "restart already happened", removed)
+        restart_log.warning("Removed %d leftover switch file(s) — a new process means "
+                            "the restart already happened", removed)
 
 
 class AppState:
@@ -1085,10 +1090,10 @@ class AppState:
         # Shared, durable review state (verdicts, per-sample history,
         # presence). DATA_DIR, never APP_DIR: it must survive release swaps.
         # The store opens lazily and never raises on I/O, so a bad disk costs
-        # history, not startup.
+        # history, not startup. Nothing here touches the disk: tidying up
+        # after the last run waits for the port guard (_tidy_after_last_run).
         self.shared = SharedStore(DATA_DIR / "coa_shared.db")
         self.presence = PresenceTracker(self.shared)
-        _tidy_after_last_run(self.shared)
 
     def broadcast_sse(self, data: dict) -> None:
         """Send an SSE event to ALL currently connected users."""
@@ -1627,13 +1632,33 @@ def _reap_idle_sessions(now: float) -> List[UserState]:
     return reaped
 
 
+# A failing touch would otherwise log on every request: the first failure
+# gets a traceback, then one line (with a count) at most this often.
+TOUCH_FAIL_LOG_INTERVAL_SECONDS = 60.0
+_touch_failures = 0
+_touch_fail_logged_at: Optional[float] = None
+
+
 def _presence_touch(name: str) -> None:
     """Count ``name`` as here. Memory-only (no database call per request),
-    and never allowed to fail the request it rides on."""
+    and never allowed to fail the request it rides on.
+
+    Presence is per *account*, not per session: two browsers signed in as
+    the same person share one span, so logging out of one ends it and the
+    other's next request opens a new one. Accepted — the split is cosmetic."""
+    global _touch_failures, _touch_fail_logged_at
     try:
         state.presence.touch(name)
     except Exception:
-        logger.exception("presence touch failed")
+        _touch_failures += 1
+        now = time.monotonic()
+        if _touch_fail_logged_at is None:
+            logger.exception("presence touch failed")
+        elif now - _touch_fail_logged_at >= TOUCH_FAIL_LOG_INTERVAL_SECONDS:
+            logger.error("presence touch failed (%d failures so far)", _touch_failures)
+        else:
+            return
+        _touch_fail_logged_at = now
 
 
 def _presence_end(name: str, reason: str) -> None:
@@ -1669,13 +1694,17 @@ def _session_cleanup_cycle(now: float) -> None:
         logger.exception("presence flush failed")
 
 
-def _session_cleanup_worker() -> None:
+def _session_cleanup_worker(cycles: Optional[int] = None,
+                            sleep: Callable[[float], None] = time.sleep) -> None:
     """Background thread: remove sessions idle longer than
     SESSION_CLEANUP_SECONDS and keep presence flushed. Runs for the life of
-    the process by design (a daemon); each cycle is bounded."""
-    while True:
-        time.sleep(SESSION_CLEANUP_INTERVAL_SECONDS)
+    the process by design (a daemon; ``cycles`` bounds it for tests); each
+    cycle is bounded."""
+    done = 0
+    while cycles is None or done < cycles:
+        sleep(SESSION_CLEANUP_INTERVAL_SECONDS)
         _session_cleanup_cycle(time.time())
+        done += 1
 
 
 threading.Thread(target=_session_cleanup_worker, daemon=True).start()
@@ -1714,34 +1743,46 @@ def _should_auto_restart(
     return True
 
 
+def _auto_restart_tick() -> None:
+    """One check of the daily auto-restart. Shares the restart single flight
+    with the Restart button and tray: while one of those is under way (it may
+    be waiting on the updater to switch), 3 AM stands down for the day."""
+    global _auto_restart_done_today
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    idle_seconds = time.time() - _last_request_time
+    uptime_seconds = time.time() - _server_start_time
+    with _sessions_lock:
+        active_count = len(user_sessions)
+
+    if not _should_auto_restart(
+        hour=now.hour,
+        today_str=today_str,
+        done_today=_auto_restart_done_today,
+        uptime_seconds=uptime_seconds,
+        active_count=active_count,
+        idle_seconds=idle_seconds,
+    ):
+        return
+
+    _auto_restart_done_today = today_str
+    if not _claim_restart():
+        restart_log.info("3 AM auto-restart skipped: a restart is already under way")
+        return
+    # Idle enough (or no sessions) and long-running — restart
+    logger.info("Auto-restart triggered (idle %.0fs, %d sessions, uptime %.0fs). Exiting for restart.",
+                idle_seconds, active_count, uptime_seconds)
+    _graceful_shutdown("auto-restart")
+
+
 def _auto_restart_worker() -> None:
     """Background thread: restart the server daily at AUTO_RESTART_HOUR if idle."""
-    global _auto_restart_done_today
     while True:
         time.sleep(30)
-        now = datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-
-        idle_seconds = time.time() - _last_request_time
-        uptime_seconds = time.time() - _server_start_time
-        with _sessions_lock:
-            active_count = len(user_sessions)
-
-        if not _should_auto_restart(
-            hour=now.hour,
-            today_str=today_str,
-            done_today=_auto_restart_done_today,
-            uptime_seconds=uptime_seconds,
-            active_count=active_count,
-            idle_seconds=idle_seconds,
-        ):
-            continue
-
-        # Idle enough (or no sessions) and long-running — restart
-        _auto_restart_done_today = today_str
-        logger.info("Auto-restart triggered (idle %.0fs, %d sessions, uptime %.0fs). Exiting for restart.",
-                     idle_seconds, active_count, uptime_seconds)
-        _graceful_shutdown("auto-restart")
+        try:
+            _auto_restart_tick()
+        except Exception:
+            logger.exception("auto-restart check failed")
 
 
 threading.Thread(target=_auto_restart_worker, daemon=True).start()
@@ -1756,12 +1797,14 @@ threading.Thread(target=_auto_restart_worker, daemon=True).start()
 #   * once the updater has (or may have) taken the request, this process never
 #     spawns its own replacement — a self-respawned child can outlive the
 #     updater's port-based kill and double-bind the port (the 2026-07-31
-#     incident). The updater's supervise() restarts the app within ~20 s;
-#   * an outcome file from an earlier request is never read as this one's.
+#     incident). The updater's supervise() restarts the app within ~20 s —
+#     unless it is paused, in which case we respawn after all;
+#   * nothing respawns while a switch file exists (_may_respawn);
+#   * an outcome file from an earlier request is never read as this one's;
+#   * _graceful_shutdown always ends in os._exit, so the single-flight flag
+#     can never be left set in a process that keeps running.
 # Every wait is a fixed number of polls, and sleeps go through
 # _restart_sleep so tests can drive the updater's side from inside it.
-
-restart_log = logging.getLogger("coa.restart")
 
 RESTART_POLL_SECONDS = 1.0
 # How long to wait to be killed once the updater has accepted. Its switch()
@@ -1771,8 +1814,12 @@ ACCEPTED_WAIT_SECONDS = 45.0
 # Marker gone with no outcome file for this many polls in a row: the updater
 # took it but its claim fell back to deleting the marker.
 UNKNOWN_CLAIM_POLLS = 3
+# Tries at withdrawing an unclaimed request before clearing it by force.
+WITHDRAW_ATTEMPTS = 3
+PRESENCE_SAVE_TIMEOUT_SECONDS = 5.0
 
-_restart_lock = threading.Lock()
+# Reentrant: request_restart holds it while preparing and claims inside it.
+_restart_lock = threading.RLock()
 _restart_requested = False           # single flight: one restart per process
 _restart_tag: Optional[str] = None   # what the pending restart is installing
 
@@ -1785,14 +1832,18 @@ def _spawn(target: Callable[..., None], args: tuple, name: str) -> None:
     threading.Thread(target=target, args=args, daemon=True, name=name).start()
 
 
-def _save_state_for_exit() -> None:
-    """Flush logs and put presence on disk. Called before exiting and before
-    asking for a switch (which kills us with taskkill /F, skipping
-    _graceful_shutdown). Never raises."""
-    try:
-        state.presence.close_all("restart")   # queues every close, then flushes
-    except Exception:
-        logger.exception("could not save presence before exit")
+def _claim_restart() -> bool:
+    """Take the single restart this process gets. False if one is already
+    under way (button, tray or 3 AM)."""
+    global _restart_requested
+    with _restart_lock:
+        if _restart_requested:
+            return False
+        _restart_requested = True
+        return True
+
+
+def _flush_log_handlers() -> None:
     for h in logging.root.handlers:
         try:
             h.flush()
@@ -1800,30 +1851,53 @@ def _save_state_for_exit() -> None:
             pass
 
 
+def _save_presence_before_switch() -> None:
+    """Put presence on disk before asking for a switch, which kills us with
+    taskkill /F and skips _graceful_shutdown. Saved, not closed: people keep
+    working while the updater answers, and the next process closes any open
+    span at its last touch. Never raises."""
+    try:
+        state.presence.flush(blocking=True, timeout=PRESENCE_SAVE_TIMEOUT_SECONDS)
+    except Exception:
+        restart_log.exception("could not save presence before the switch")
+    _flush_log_handlers()
+
+
+def _save_state_for_exit() -> None:
+    """Close every presence span, write it, flush logs. Never raises."""
+    try:
+        state.presence.close_all("restart")   # queues every close, then flushes
+    except Exception:
+        logger.exception("could not save presence before exit")
+    _flush_log_handlers()
+
+
+def _restart_from_tray() -> Optional[str]:
+    """The tray icon's Restart Application: the same path as the button."""
+    return request_restart("the tray icon", by="tray")
+
+
 def request_restart(source: str, *, by: Optional[str] = None) -> Optional[str]:
     """Restart because someone clicked: the Restart button in the UI (``by``
     is the reviewer) or the tray icon (``by="tray"``).
 
     Returns the tag being installed when a newer release is staged, else
-    ``None`` for a plain restart. Either way the work happens on a thread, so
-    the caller gets its answer first. Single-flight: a second click while one
-    is pending changes nothing and reports the same answer."""
-    global _restart_requested, _restart_tag
+    ``None`` for a plain restart. The work happens on a thread, so the caller
+    gets its answer first. Single-flight: a second click while one is pending
+    changes nothing and reports the same answer. Never raises."""
+    global _restart_tag
     with _restart_lock:
-        if _restart_requested:
+        if not _claim_restart():
             restart_log.info("Restart via %s ignored: one is already under way (%s)",
                              source, _restart_tag or "plain restart")
             return _restart_tag
-        _restart_requested = True
         restart_log.info("Manual restart requested via %s", source)
         try:
             _restart_tag = _begin_restart(by or source)
         except Exception:
-            # Whatever broke, the person still gets the restart they asked for.
             restart_log.exception("Could not prepare the restart — restarting normally")
             _restart_tag = None
-            restart_update.clear_switch_files(DATA_DIR)
-            _spawn(_delayed_shutdown, ("manual restart",), "restart")
+            _restart_after_prepare_error()
         return _restart_tag
 
 
@@ -1831,7 +1905,7 @@ def _begin_restart(by: str) -> Optional[str]:
     """Ask for a switch if one is due, else schedule a plain restart."""
     tag = restart_update.staged_update(DATA_DIR, APP_VERSION)
     if tag:
-        _save_state_for_exit()
+        _save_presence_before_switch()
         at = time.time()
         if restart_update.write_switch_request(DATA_DIR, tag, by=by, now=at):
             restart_log.info("Asked the updater to install %s; waiting for its answer", tag)
@@ -1844,6 +1918,27 @@ def _begin_restart(by: str) -> Optional[str]:
         restart_log.info("No newer release staged — plain restart")
     _spawn(_delayed_shutdown, ("manual restart",), "restart")
     return None
+
+
+def _restart_after_prepare_error() -> None:
+    """Preparing failed part-way. Clear any request we may have written,
+    then restart normally — on a thread if one will start, else inline. If
+    even that returns, release the flag so a later click can try again."""
+    global _restart_requested
+    try:
+        restart_update.clear_switch_files(DATA_DIR)
+    except Exception:
+        restart_log.exception("could not clear switch files")
+    try:
+        _spawn(_delayed_shutdown, ("manual restart",), "restart")
+        return
+    except Exception:
+        restart_log.exception("could not start the restart thread — restarting inline")
+    try:
+        _graceful_shutdown("manual restart")
+    except Exception:
+        restart_log.exception("restart failed; a later request may try again")
+    _restart_requested = False
 
 
 def _delayed_shutdown(reason: str) -> None:
@@ -1896,32 +1991,39 @@ def _await_switch(tag: str, at: float, *, pickup: float = restart_update.PICKUP_
     try:
         verdict, outcome = _poll_switch(at, _polls(pickup, poll), poll)
         if verdict == "unclaimed":
-            if restart_update.withdraw_switch_request(DATA_DIR):
-                restart_log.warning(
-                    "Updater did not take the switch to %s within %.0fs — restarting "
-                    "normally (is updater.py up to date on this host?)", tag, pickup)
-                _fallback_restart()
-                return
-            # Claimed in the same instant we withdrew: its answer is coming.
-            verdict, outcome = _poll_switch(at, _polls(accepted_wait, poll), poll)
+            answer = _withdraw_after_pickup(tag, at, pickup, _polls(accepted_wait, poll), poll)
+            if answer is None:
+                return          # nobody had it; restarted normally
+            verdict, outcome = answer
         _act_on_outcome(tag, verdict, outcome, accepted_wait, poll)
     except Exception:
         restart_log.exception("Restart watcher for %s failed", tag)
         _restart_after_watcher_error()
 
 
-def _restart_after_watcher_error() -> None:
-    """The watcher broke. If the request is still ours to withdraw, nobody
-    has it: restart normally. Otherwise the updater may have it, so exit
-    without a respawn and let its supervise() bring the app back."""
-    try:
-        withdrawn = restart_update.withdraw_switch_request(DATA_DIR)
-    except Exception:
-        withdrawn = False
-    if withdrawn:
-        _fallback_restart()
-        return
-    _graceful_shutdown("manual restart", respawn=False)
+def _withdraw_after_pickup(tag: str, at: float, pickup: float, answer_polls: int,
+                           poll: float) -> Optional[Tuple[str, Optional[dict]]]:
+    """Nobody took the request in time: take it back and restart normally.
+    Returns the updater's answer instead if it claimed the marker in the
+    same instant (marker gone when we went to remove it), or None once a
+    normal restart is under way."""
+    for _ in range(WITHDRAW_ATTEMPTS):
+        if restart_update.withdraw_switch_request(DATA_DIR):
+            restart_log.warning(
+                "Updater did not take the switch to %s within %.0fs — restarting "
+                "normally (is updater.py up to date on this host?)", tag, pickup)
+            _fallback_restart()
+            return None
+        if not restart_update.marker_present(DATA_DIR):
+            restart_log.info("Updater claimed the switch to %s as we withdrew it", tag)
+            return _poll_switch(at, answer_polls, poll)
+        _restart_sleep(poll)
+    # withdraw() also returns False on an OSError. The marker is still here,
+    # so nobody claimed it: this is not "the updater has it".
+    restart_log.error("Could not withdraw the unclaimed switch request for %s — "
+                      "clearing it and restarting normally", tag)
+    _fallback_restart()
+    return None
 
 
 def _act_on_outcome(tag: str, verdict: str, outcome: Optional[dict],
@@ -1938,16 +2040,47 @@ def _act_on_outcome(tag: str, verdict: str, outcome: Optional[dict],
                             "waiting to be stopped", tag)
     for _ in range(_polls(accepted_wait, poll)):
         _restart_sleep(poll)
-    restart_log.warning("Still running %.0fs after the updater took the switch to %s — "
-                        "exiting without a respawn; the updater restarts the app",
+    restart_log.warning("Still running %.0fs after the updater took the switch to %s",
                         accepted_wait, tag)
-    restart_update.clear_switch_files(DATA_DIR)
-    _graceful_shutdown("manual restart", respawn=False)
+    _exit_for_updater()
+
+
+def _restart_after_watcher_error() -> None:
+    """The watcher broke. If the request is still ours (withdrawn now, or
+    stuck in place) nobody has it: restart normally. Only a marker that is
+    gone means the updater may have it."""
+    try:
+        if restart_update.withdraw_switch_request(DATA_DIR) or \
+                restart_update.marker_present(DATA_DIR):
+            _fallback_restart()
+            return
+    except Exception:
+        restart_log.exception("could not check the switch request after a watcher error")
+    _exit_for_updater()
 
 
 def _fallback_restart() -> None:
     restart_update.clear_switch_files(DATA_DIR)
     _graceful_shutdown("manual restart")
+
+
+def _switch_file_present(name: str) -> bool:
+    return (DATA_DIR / name).exists()
+
+
+def _exit_for_updater() -> None:
+    """The updater has (or may have) the request: exit without spawning a
+    replacement and let its supervise() start the app. A paused updater
+    supervises nothing, so then — and only when no switch is in progress —
+    respawn after all rather than leave the app down."""
+    restart_update.clear_switch_files(DATA_DIR)
+    if _switch_file_present("paused") and not _switch_file_present("switching"):
+        restart_log.warning("The updater is paused and will not restart the app — "
+                            "restarting it ourselves")
+        _graceful_shutdown("manual restart")
+        return
+    restart_log.warning("Exiting without a respawn; the updater restarts the app")
+    _graceful_shutdown("manual restart", respawn=False)
 
 
 def _self_respawn() -> None:
@@ -1968,33 +2101,45 @@ def _self_respawn() -> None:
 def _may_respawn(reason: str, respawn: bool) -> bool:
     if not respawn or reason not in ("auto-restart", "manual restart"):
         return False
-    if (DATA_DIR / "switching").exists():
-        # The updater has the app deliberately stopped and will start the
-        # new release itself; a child of ours would fight it for the port.
-        restart_log.warning("Not respawning: the updater is mid-switch (%s exists)",
-                            DATA_DIR / "switching")
-        return False
+    # The updater is switching, or has (or may yet take) a switch request: it
+    # will start the new release itself, and a child of ours would fight it
+    # for the port.
+    for name in ("switching", restart_update.MARKER_FILE, restart_update.ACCEPTED_FILE):
+        if _switch_file_present(name):
+            restart_log.warning("Not respawning: %s exists", DATA_DIR / name)
+            return False
     # Run.pyw sets COA_WATCHER_ACTIVE=1; without it we must restart ourselves.
     return not os.environ.get("COA_WATCHER_ACTIVE")
 
 
 def _graceful_shutdown(reason: str = "unknown", *, respawn: bool = True) -> None:
     """Shut down cleanly: save presence, flush logs, then exit — respawning
-    first unless told not to (see the restart notes above)."""
-    logger.info("Graceful shutdown initiated (reason: %s, respawn: %s)", reason, respawn)
-    _save_state_for_exit()
-    if _may_respawn(reason, respawn):
-        logger.info("No Run.pyw watcher — self-respawning...")
-        _self_respawn()
-    # Take the tray icon down with the process, or Windows leaves a ghost of
-    # it until the mouse passes over.
+    first unless told not to (see the restart notes above). Always exits,
+    whatever fails on the way."""
     try:
-        tray.stop_tray()
-    except Exception:
-        logger.exception("could not stop the tray icon")
-    _restart_sleep(0.5)
-    # Use os._exit to avoid hanging on daemon threads
-    os._exit(0)
+        logger.info("Graceful shutdown initiated (reason: %s, respawn: %s)", reason, respawn)
+        try:
+            _save_state_for_exit()
+        except Exception:
+            logger.exception("could not save state before exit")
+        try:
+            do_respawn = _may_respawn(reason, respawn)
+        except Exception:
+            restart_log.exception("could not decide whether to respawn — not respawning")
+            do_respawn = False
+        if do_respawn:
+            logger.info("No Run.pyw watcher — self-respawning...")
+            _self_respawn()
+        # Take the tray icon down with the process, or Windows leaves a ghost
+        # of it until the mouse passes over.
+        try:
+            tray.stop_tray()
+        except Exception:
+            logger.exception("could not stop the tray icon")
+        _restart_sleep(0.5)
+    finally:
+        # os._exit, not sys.exit: daemon threads must not hold the exit up.
+        os._exit(0)
 
 
 def _cleanup_at_exit() -> None:
@@ -2857,6 +3002,8 @@ def portal_logout():
             log_login_event("LOGOUT", ustate.name, request.remote_addr)
             state.change_log.session("logout", user=ustate.name,
                                      ip=request.remote_addr)
+            # Per account: another browser signed in as the same person
+            # reopens a span on its next request (see _presence_touch).
             _presence_end(ustate.name, "logout")
             logger.info("Portal logout: %s", ustate.name)
     session.clear()
@@ -2917,9 +3064,7 @@ def portal_reauth():
 @app.route("/api/heartbeat", methods=["POST"])
 @require_portal
 def heartbeat():
-    ustate = get_user_state()
-    if ustate is not None:
-        _presence_touch(ustate.name)
+    # Presence is touched by track_activity, like every reviewer request.
     return jsonify({"ok": True})
 
 
@@ -4895,11 +5040,17 @@ if __name__ == "__main__":
         print(f"  ERROR: Port {port} is still in use. Cannot start.")
         sys.exit(1)
 
+    # Only now are we the serving process (see _tidy_after_last_run).
+    try:
+        _tidy_after_last_run(state.shared)
+    except Exception:
+        logger.exception("Could not tidy up after the last run")
+
     # The tray icon (Open / Restart / Show Log) lives in this process now that
     # the updater launches app.py directly; Run.pyw used to own it. After the
     # port check, so a duplicate that is about to exit never shows one.
     tray.start_tray(version=APP_VERSION, port=port, pid=os.getpid(), log_path=_LOG_FILE,
-                    restart=lambda: request_restart("the tray icon", by="tray"))
+                    restart=_restart_from_tray)
 
     if not PLAYWRIGHT_AVAILABLE:
         logger.warning("Playwright unavailable: %s", _playwright_error)
