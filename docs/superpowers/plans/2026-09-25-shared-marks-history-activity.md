@@ -1902,3 +1902,20 @@ down → no raise) and route-level (GET tests/sample-info/comments with a
 monkeypatched api_client whose values changed between two reads → one
 external_change row; own PATCH then GET → none; LabVision operator becomes the
 actor). Comments: snapshot on UploadQueue success only (find `_process_comment`).
+
+### Task 5 — second-pass additions (Task 4 critic, round 2)
+
+- **N2 — never self-respawn once the updater has accepted.** After `accepted`
+  (or N3's "claimed, outcome unknown"), if this process is not killed within
+  `accepted_wait`, flush logs + presence and `os._exit(0)` **without** spawning
+  a replacement — add `respawn: bool = True` to `_graceful_shutdown` and pass
+  False. The updater's `supervise()` restarts the app within ~20 s once its
+  `switching` marker is gone; a self-respawned child could survive the
+  updater's port-based kill and double-bind the port (the 2026-07-31 incident).
+  Also: any normal-restart fallback must not respawn while `DATA_DIR/switching`
+  exists — in that case exit without respawn too.
+- **N3 — marker gone, no outcome file.** If the marker has disappeared and
+  `read_switch_outcome` returns None for 3 consecutive polls, treat it as
+  "claimed, outcome unknown": wait up to `accepted_wait`, then the N2 exit.
+- **N4 — match the outcome to this request.** Ignore any outcome whose `at`
+  differs from the `at` this process wrote (a leftover from an earlier run).
