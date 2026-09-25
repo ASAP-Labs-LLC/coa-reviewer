@@ -2448,9 +2448,15 @@ def _withdraw_after_pickup(tag: str, at: float, pickup: float, answer_polls: int
         _restart_sleep(poll)
     # withdraw() also returns False on an OSError. The marker is still here,
     # so nobody claimed it: this is not "the updater has it".
-    restart_log.error("Could not withdraw the unclaimed switch request for %s — "
-                      "clearing it and restarting normally", tag)
-    _fallback_restart()
+    restart_update.clear_switch_files(DATA_DIR)
+    if _switch_request_fresh():
+        restart_log.error("Could not remove the unclaimed switch request for %s and "
+                          "the updater could still take it — exiting without a "
+                          "respawn", tag)
+    else:
+        restart_log.error("Could not withdraw the unclaimed switch request for %s — "
+                          "restarting normally", tag)
+    _graceful_shutdown("manual restart")   # _may_respawn applies the same test
     return None
 
 
@@ -2526,16 +2532,45 @@ def _self_respawn() -> None:
         logger.error("Self-respawn failed: %s", _spawn_err)
 
 
+MARKER_READ_LIMIT_BYTES = 4096
+
+
+def _switch_request_fresh() -> bool:
+    """Whether a ``switch-requested`` marker exists that the updater could
+    still act on. It refuses any request older than its
+    MAX_REQUEST_AGE_SECONDS (45 s), so one older than PICKUP_SECONDS — or one
+    whose ``at`` cannot be read — can never trigger a switch."""
+    path = DATA_DIR / restart_update.MARKER_FILE
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(MARKER_READ_LIMIT_BYTES)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        restart_log.warning("could not read %s (treating it as stale): %s", path, exc)
+        return False
+    try:
+        at = float(json.loads(raw.decode("utf-8")).get("at"))
+    except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
+        return False
+    age = time.time() - at
+    return -5.0 <= age <= restart_update.PICKUP_SECONDS   # updater's own skew allowance
+
+
 def _may_respawn(reason: str, respawn: bool) -> bool:
     if not respawn or reason not in ("auto-restart", "manual restart"):
         return False
     # The updater is switching, or has (or may yet take) a switch request: it
     # will start the new release itself, and a child of ours would fight it
-    # for the port.
-    for name in ("switching", restart_update.MARKER_FILE, restart_update.ACCEPTED_FILE):
+    # for the port. A request too old for it to take does not count.
+    for name in ("switching", restart_update.ACCEPTED_FILE):
         if _switch_file_present(name):
             restart_log.warning("Not respawning: %s exists", DATA_DIR / name)
             return False
+    if _switch_request_fresh():
+        restart_log.warning("Not respawning: a switch request the updater could "
+                            "still take exists")
+        return False
     # Run.pyw sets COA_WATCHER_ACTIVE=1; without it we must restart ourselves.
     return not os.environ.get("COA_WATCHER_ACTIVE")
 

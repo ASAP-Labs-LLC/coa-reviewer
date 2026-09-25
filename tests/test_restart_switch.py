@@ -531,8 +531,10 @@ def test_3am_not_due_changes_nothing(env, monkeypatch) -> None:
 
 @pytest.mark.parametrize("name", ["switch-requested", "switch-accepted", "switching"])
 def test_nothing_respawns_while_a_switch_file_exists(real_shutdown, tmp_path, name) -> None:
+    import time
     app_module, spawned, _ = real_shutdown
-    (tmp_path / name).write_text("{}", encoding="utf-8")
+    (tmp_path / name).write_text(json.dumps({"tag": "v9.9.9", "at": time.time()}),
+                                 encoding="utf-8")
     with pytest.raises(_Exited):
         app_module._graceful_shutdown("manual restart")
     assert spawned == []
@@ -557,3 +559,53 @@ def test_shutdown_exits_even_if_saving_state_raises(real_shutdown, monkeypatch) 
     monkeypatch.setattr(app_module, "_save_state_for_exit", boom)
     with pytest.raises(_Exited):
         app_module._graceful_shutdown("manual restart")
+
+
+
+# ── a switch request nobody can take any more must not block a respawn ──
+
+def _stuck_marker(app_module, tmp_path, monkeypatch, age):
+    """A marker that neither withdraw nor clear can remove, ``age`` s old."""
+    import time
+    at = time.time() - age
+    (tmp_path / restart_update.MARKER_FILE).write_text(
+        json.dumps({"tag": "v9.9.9", "by": "Dana P", "at": at}), encoding="utf-8")
+    monkeypatch.setattr(restart_update, "withdraw_switch_request", lambda _d: False)
+    monkeypatch.setattr(restart_update, "clear_switch_files", lambda _d: 0)
+    return at
+
+
+def test_a_stale_undeletable_request_still_respawns(real_shutdown, tmp_path,
+                                                     monkeypatch, caplog) -> None:
+    """The updater refuses anything older than 45 s, so a marker past
+    PICKUP_SECONDS can never trigger a switch — refusing to respawn over it
+    would leave the lab with no app if the updater is down or paused."""
+    app_module, spawned, _ = real_shutdown
+    at = _stuck_marker(app_module, tmp_path, monkeypatch,
+                       age=restart_update.PICKUP_SECONDS + 5)
+    with caplog.at_level(logging.ERROR, logger="coa.restart"):
+        with pytest.raises(_Exited):
+            app_module._withdraw_after_pickup("v9.9.9", at, 60.0, 2, 1.0)
+    assert spawned == [True]
+    assert any("restarting normally" in r.getMessage() for r in caplog.records)
+
+
+def test_a_fresh_undeletable_request_does_not_respawn(real_shutdown, tmp_path,
+                                                      monkeypatch, caplog) -> None:
+    app_module, spawned, _ = real_shutdown
+    at = _stuck_marker(app_module, tmp_path, monkeypatch, age=1.0)
+    with caplog.at_level(logging.ERROR, logger="coa.restart"):
+        with pytest.raises(_Exited):
+            app_module._withdraw_after_pickup("v9.9.9", at, 60.0, 2, 1.0)
+    assert spawned == []
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("without a respawn" in m for m in msgs)
+    assert not any("restarting normally" in m for m in msgs)
+
+
+def test_an_unreadable_marker_counts_as_stale(real_shutdown, tmp_path) -> None:
+    app_module, spawned, _ = real_shutdown
+    (tmp_path / restart_update.MARKER_FILE).write_text("{not json", encoding="utf-8")
+    with pytest.raises(_Exited):
+        app_module._graceful_shutdown("manual restart")
+    assert spawned == [True]
