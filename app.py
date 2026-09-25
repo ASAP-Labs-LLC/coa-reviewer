@@ -47,7 +47,8 @@ from labcore_client import LabCoreClient, LabCoreUnavailable
 from change_log import ChangeLog
 from presence import PresenceTracker
 from shared_store import (MAX_EVENTS_PER_BATCH, MAX_MARKS_PER_BATCH, MAX_OBSERVE_FIELDS,
-                          SharedStore, same_value)
+                          MAX_RANGE_ROWS, SharedStore, same_value)
+import activity
 import restart_update
 import tray
 
@@ -3638,6 +3639,77 @@ def index():
     # badge blank on the login and boot screens — exactly when someone is
     # asking which build this is.
     return render_template("index.html", app_version=APP_VERSION)
+
+
+@app.route("/api/sample-history/<path:lab_id>")
+@require_portal
+def sample_history(lab_id: str):
+    """The History tab's data: every recorded change to one sample, newest
+    first. Clamping to MAX_HISTORY happens inside SharedStore.history; this
+    boundary only rejects a limit that isn't a number."""
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        return jsonify({"error": "limit must be a number"}), 400
+    lab_id = lab_id.strip()
+    if not lab_id:
+        return jsonify({"error": "lab_id required"}), 400
+    return jsonify({"lab_id": lab_id, "events": state.shared.history(lab_id, limit)})
+
+
+@app.route("/api/activity")
+@require_portal
+def activity_day():
+    """The Time Online day payload for ``/activity``. ``online``/``is_today``
+    are only meaningful for *today* — activity.build_day() itself zeroes
+    "online now" for any other day even if a stale value slipped through."""
+    raw = request.args.get("date") or date.today().isoformat()
+    try:
+        day = date.fromisoformat(raw)
+    except ValueError:
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    if day > date.today():
+        return jsonify({"error": "that day has not happened yet"}), 400
+    is_today = day == date.today()
+    lo, hi = activity.day_window(day)
+    started = time.perf_counter()
+    spans = state.shared.spans_between(lo, hi)
+    events = state.shared.event_marks_between(lo, hi)
+    truncated = len(spans) >= MAX_RANGE_ROWS or len(events) >= MAX_RANGE_ROWS
+    online = state.presence.online()
+    payload = activity.build_day(day, spans, events, now=time.time(),
+                                 online=online, is_today=is_today, truncated=truncated)
+    # activity.build_day() only *consumes* online/is_today (to compute
+    # summary.online_now) — it doesn't echo them back. static/js/activity.js
+    # reads them at the top level (onlineSet() checks data.is_today /
+    # data.online directly), so the route adds them itself.
+    payload["online"] = online if is_today else []
+    payload["is_today"] = is_today
+    logger.debug("activity %s built in %.1f ms (%d users, %d spans, %d events)",
+                day, (time.perf_counter() - started) * 1000,
+                len(payload["users"]), len(spans), len(events))
+    return jsonify(payload)
+
+
+@app.route("/api/activity/range")
+@require_portal
+def activity_range():
+    """First/last recorded day, for the date picker's min/max — ``None``
+    (JSON ``null``) before anything has ever been recorded."""
+    lo, hi = state.shared.recorded_range()
+    fmt = lambda t: date.fromtimestamp(t).isoformat() if t else None
+    return jsonify({"first": fmt(lo), "last": fmt(hi), "today": date.today().isoformat()})
+
+
+@app.route("/activity")
+def activity_page():
+    """Time Online. No @require_portal: the page opens in its own tab (the
+    ◷ link is target="_blank") and its own API calls carry the session
+    cookie, so a signed-out visitor still gets a usable page — one that
+    tells them to sign in on the review screen — instead of a redirect that
+    would strand a bookmark. The template has no reviewer data of its own;
+    everything it shows comes back from /api/activity."""
+    return render_template("activity.html", app_version=APP_VERSION)
 
 
 @app.route("/api/health")
