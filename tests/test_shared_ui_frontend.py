@@ -265,3 +265,41 @@ def test_waiting_for_an_update_is_bounded_and_falls_back() -> None:
     assert re.search(r"UPDATE_POLL_MAX\s*=\s*90", APP_JS)
     assert "Update not installed" in body
     assert "pollForRestart" in body
+
+
+# ── follow-ups ───────────────────────────────────────────────────────────
+
+def test_a_bulk_sample_events_message_reloads_the_selected_samples_history() -> None:
+    case = _sse_case("sample_events")
+    assert "data.lab_ids" in case
+    assert "state.currentSample" in case
+    assert "scheduleHistoryReload(" in case   # same debounce + History-showing check
+
+
+def _last_rule(selector: str) -> str:
+    """The body of the LAST rule whose selector is exactly `selector` — the
+    one that wins when specificity ties."""
+    bodies = re.findall(rf"(?:^|\n){re.escape(selector)}\s*\{{([^}}]*)\}}", APP_CSS)
+    assert bodies, f"no rule for {selector}"
+    return bodies[-1]
+
+
+@pytest.mark.parametrize("selector", [".sample-item.selected", "body.dark .sample-item.selected"])
+def test_the_selected_row_keeps_readable_text(selector: str) -> None:
+    """The winning selected-row rule is a pale accent tint; its text must be
+    the normal text colour, not --text-inverse (white on pale teal)."""
+    body = _last_rule(selector)
+    assert "color-mix(" in body, "expected the tinted selection background"
+    assert re.search(r"(?<![-\w])color:\s*var\(--text\)", body), (
+        f"{selector} leaves the text colour inverse on a pale background")
+
+
+def test_the_status_icon_is_not_forced_inverse_on_the_selected_row() -> None:
+    assert not re.search(r"\.sample-item\.selected \.status-icon\s*\{[^}]*text-inverse",
+                         APP_CSS)
+
+
+def test_the_history_list_clears_the_version_badge() -> None:
+    block = APP_CSS[APP_CSS.index(".history-list {"):][:500]
+    m = re.search(r"padding:\s*\S+\s+\S+\s+(\d+)px", block)
+    assert m and int(m.group(1)) >= 40, "the last history item sits under #app-version"

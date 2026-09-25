@@ -739,7 +739,8 @@ button { background: none; border: none; cursor: pointer; }
 .sample-item[data-status="bad"]     .status-icon { color: var(--status-bad); }
 .sample-item[data-status="error"]   .status-icon { color: var(--status-error); }
 
-.sample-item.selected .status-icon { color: var(--text-inverse) !important; }
+/* The selected row is a pale accent tint (see "Sample multi-select"), so the
+   status icon keeps its own colour rather than going inverse. */
 
 @keyframes row-in {
     from { opacity: 0; transform: translateX(-6px); }
@@ -2304,12 +2305,17 @@ body.dark .cc-listing { background: rgba(255, 255, 255, 0.04); }
 /* Dragging across rows must not paint the browser's own text selection. */
 #sample-list { user-select: none; }
 
+/* A pale tint, so the text must stay the normal text colour: the earlier
+   solid-accent rules set it to --text-inverse, which left a white lab ID on
+   pale teal (light) and a black one on grey (dark). */
 .sample-item.selected {
     background: color-mix(in srgb, var(--accent, #3b82f6) 16%, transparent);
     box-shadow: inset 2px 0 0 var(--accent, #3b82f6);
+    color: var(--text);
 }
 body.dark .sample-item.selected {
     background: color-mix(in srgb, var(--accent, #3b82f6) 26%, transparent);
+    color: var(--text);
 }
 
 .ctx-menu {
@@ -2790,7 +2796,10 @@ body.dark .seg-btn.active { background: var(--bg-elevated); }
     flex: 1 1 0;
     min-height: 0;
     overflow-y: auto;
-    padding: 2px 4px 28px 2px;   /* bottom clears the version badge */
+    /* The fixed #app-version badge sits over the panel's bottom-right
+       corner; the last item has to be able to scroll clear of it. */
+    padding: 2px 4px 44px 2px;
+    scroll-padding-bottom: 44px;
     font-size: 12.5px;
     line-height: 1.45;
 }

@@ -956,6 +956,13 @@ function handleSSE(data) {
             // screen matters, and a burst (a sync writes several) is one reload.
             scheduleHistoryReload(data.lab_id);
             break;
+        case "sample_events":
+            // One tab pull found outside changes on many samples at once.
+            if (Array.isArray(data.lab_ids) && state.currentSample
+                && data.lab_ids.includes(state.currentSample.lab_id)) {
+                scheduleHistoryReload(state.currentSample.lab_id);
+            }
+            break;
         case "sif_status":
             updateSifStatus(data.tab, data.lab_id, data.status, data.sif_page, data.sif_total_pages);
             break;
