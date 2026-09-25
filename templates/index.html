@@ -458,6 +458,13 @@
                     Switch
                 </button>
                 <button id="dark-toggle" class="btn">Dark</button>
+                <!-- Time online opens in its own tab so the review stays put. -->
+                <a id="activity-link" class="btn btn-activity" href="/activity" target="_blank" rel="noopener" title="Time online" aria-label="Time online">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="12" cy="12" r="9"/>
+                        <polyline points="12 7 12 12 15.5 14"/>
+                    </svg>
+                </a>
                 <button id="restart-btn" class="btn btn-restart" title="Restart application" aria-label="Restart application">&#x21bb;</button>
                 <span id="user-display" class="user-display"></span>
                 <button id="portal-logout-btn" class="btn btn-signout">Sign Out</button>
@@ -564,6 +571,14 @@
 
             <!-- Right Panel -->
             <div class="right-panel">
+                <!-- Review is today's contents, untouched; History is every
+                     recorded change to the selected sample. -->
+                <div class="seg" role="tablist" aria-label="Right panel">
+                    <button id="right-tab-review" class="seg-btn active" type="button" role="tab" aria-selected="true" aria-controls="review-panel-body">Review</button>
+                    <button id="right-tab-history" class="seg-btn" type="button" role="tab" aria-selected="false" aria-controls="history-panel" tabindex="-1">History</button>
+                </div>
+
+                <div id="review-panel-body" class="review-panel-body" role="tabpanel" aria-labelledby="right-tab-review">
                 <div class="panel-section">
                     <div class="panel-header">
                         <span>Attachments</span>
@@ -632,6 +647,13 @@
                     </div>
                     <div id="info-editor-fields" class="info-editor-fields">
                         <p class="info-editor-placeholder">Select a sample to view fields</p>
+                    </div>
+                </div>
+                </div>
+
+                <div id="history-panel" class="history-panel" role="tabpanel" aria-labelledby="right-tab-history" hidden>
+                    <div id="history-list" class="history-list" aria-live="polite">
+                        <p class="h-state">Select a sample to see its history.</p>
                     </div>
                 </div>
             </div>

@@ -534,6 +534,7 @@ function setupAppHandlers() {
     for (const btn of restartButtons()) btn.addEventListener("click", handleRestartServer);
     initRestartConfirm();
     initFieldSettings();
+    initRightTabs();
 
     // Change-mode button — re-opens the picker mid-session. The picker's
     // own click handler calls applyReviewMode, which (now that state is
@@ -946,6 +947,15 @@ function handleSSE(data) {
         case "sample_status":
             updateSampleStatus(data.tab, data.lab_id, data.status, data.has_preview);
             break;
+        case "tags":
+            // Someone (maybe another reviewer) checked or cleared a sample.
+            applyTagsUpdate(data.lab_id, data.tags);
+            break;
+        case "sample_event":
+            // A history row was written for some sample; only the one on
+            // screen matters, and a burst (a sync writes several) is one reload.
+            scheduleHistoryReload(data.lab_id);
+            break;
         case "sif_status":
             updateSifStatus(data.tab, data.lab_id, data.status, data.sif_page, data.sif_total_pages);
             break;
@@ -1350,7 +1360,11 @@ function renderSampleList() {
         if (idx < STAGGER_CAP) {
             div.style.animationDelay = (idx * STAGGER_MS) + "ms";
         }
-        div.innerHTML = `<span class="status-icon">${STATUS_ICONS[s.status] || "\u25CB"}</span><span>${s.lab_id}</span>`;
+        // Tags (who checked it, in either mode) sit at the row's right edge;
+        // a `tags` SSE patches just that span, never the whole list.
+        div.innerHTML = `<span class="status-icon">${STATUS_ICONS[s.status] || "\u25CB"}</span>`
+            + `<span class="sample-lab">${escapeHtml(s.lab_id)}</span>`
+            + `<span class="sample-tags">${renderTags(s.tags)}</span>`;
         // The list is rebuilt on every status event while previews render, so
         // the selection has to be re-applied rather than living in the DOM.
         if (SEL.ids.has(s.lab_id)) div.classList.add("selected");
@@ -1484,6 +1498,9 @@ function selectSample(sample) {
     if (currentReviewMode === "info") {
         loadSampleInfo(sample.lab_id);
     }
+
+    // History follows the selection, but only costs a request when showing.
+    if (rightTab === "history") loadHistory(sample.lab_id);
 }
 
 function updateActionButtons() {
@@ -1536,6 +1553,320 @@ function updateTabActionButtons() {
     const hasPending = (state.samples[state.currentTab] || [])
         .some(x => x.status !== "good" && x.status !== "bad");
     rpBtn.disabled = !hasPending;
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+// Shared tags + Sample history (right panel: Review | History)
+// ══════════════════════════════════════════════════════════════════════
+
+// Who checked a sample Good, per mode. Shared by every reviewer: a `tags`
+// SSE arrives after anyone's mark. Bad shows through status, never a tag.
+const TAG_MODES = [["info", "INFO", "Info"], ["tests", "TEST", "Tests"]];
+
+// "9:42 AM" today, "Sep 22, 9:42 AM" before that.
+function shortWhen(epochS) {
+    const d = new Date(Number(epochS) * 1000);
+    if (isNaN(d.getTime())) return "";
+    const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    if (d.toDateString() === new Date().toDateString()) return time;
+    return `${d.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, ${time}`;
+}
+
+function renderTags(tags) {
+    if (!tags || typeof tags !== "object") return "";
+    let html = "";
+    for (const [mode, label, word] of TAG_MODES) {
+        const t = tags[mode];
+        if (!t) continue;
+        const who = t.by ? ` by ${t.by}` : "";
+        const when = t.at ? ` · ${shortWhen(t.at)}` : "";
+        html += `<span class="tag tag-good" title="${escapeHtml(`${word} checked${who}${when}`)}">${label}</span>`;
+    }
+    return html;
+}
+
+// Patch every stored copy of `labId` (a sample can sit on several tabs) and
+// the visible row(s) in place. The list can be 300 rows mid-pull; this is a
+// few element writes, not a rebuild.
+function applyTagsUpdate(labId, tags) {
+    if (!labId) return;
+    const next = tags || { info: null, tests: null };
+    for (const tab in state.samples) {
+        const list = state.samples[tab];
+        if (!list) continue;
+        for (let i = 0; i < list.length; i++) {
+            if (list[i].lab_id === labId) list[i].tags = next;
+        }
+    }
+    if (state.currentSample && state.currentSample.lab_id === labId) {
+        state.currentSample.tags = next;
+    }
+    const html = renderTags(next);
+    document.querySelectorAll(
+        `#sample-list .sample-item[data-lab="${CSS.escape(labId)}"] .sample-tags`
+    ).forEach(el => { el.innerHTML = html; });
+}
+
+// ── Review | History ────────────────────────────────────────────────
+const HISTORY_LIMIT = 200;          // the server's page size, and our render cap
+const HISTORY_DEBOUNCE_MS = 300;
+let rightTab = "review";
+let _historySeq = 0;                // bumps per request; older answers are dropped
+let _historyLab = null;             // lab_id the list currently shows
+let _historyTimer = null;
+
+function initRightTabs() {
+    $("#right-tab-review")?.addEventListener("click", () => setRightTab("review"));
+    $("#right-tab-history")?.addEventListener("click", () => setRightTab("history"));
+    let saved = "review";
+    try { saved = localStorage.getItem("rightPanelTab") || "review"; }
+    catch (e) { /* blocked storage: start on Review */ }
+    setRightTab(saved === "history" ? "history" : "review", { persist: false });
+}
+
+function setRightTab(name, opts = {}) {
+    const tab = name === "history" ? "history" : "review";
+    rightTab = tab;
+    const pairs = [["review", "#right-tab-review", "#review-panel-body"],
+                   ["history", "#right-tab-history", "#history-panel"]];
+    for (const [key, btnSel, panelSel] of pairs) {
+        const on = key === tab;
+        const btn = $(btnSel);
+        const panel = $(panelSel);
+        if (btn) {
+            btn.classList.toggle("active", on);
+            btn.setAttribute("aria-selected", on ? "true" : "false");
+            btn.tabIndex = on ? 0 : -1;
+        }
+        if (panel) panel.hidden = !on;
+    }
+    if (opts.persist !== false) {
+        try { localStorage.setItem("rightPanelTab", tab); }
+        catch (e) { /* a full or blocked localStorage must not break the panel */ }
+    }
+    if (tab === "history") loadHistory(state.currentSample?.lab_id);
+}
+
+function scheduleHistoryReload(labId) {
+    if (rightTab !== "history") return;
+    if (!state.currentSample || state.currentSample.lab_id !== labId) return;
+    clearTimeout(_historyTimer);
+    _historyTimer = setTimeout(() => {
+        // Re-check: the reviewer may have moved on during the debounce.
+        if (state.currentSample && state.currentSample.lab_id === labId) loadHistory(labId);
+    }, HISTORY_DEBOUNCE_MS);
+}
+
+function historyState(text, cls = "") {
+    const list = $("#history-list");
+    if (list) list.innerHTML = `<p class="h-state ${cls}">${escapeHtml(text)}</p>`;
+}
+
+async function loadHistory(labId) {
+    if (rightTab !== "history" || !$("#history-list")) return;
+    const seq = ++_historySeq;
+    if (!labId) { _historyLab = null; historyState("Select a sample to see its history."); return; }
+    // A new sample clears the old one's list at once; a refresh of the same
+    // sample keeps it on screen until the answer arrives (no flicker).
+    if (_historyLab !== labId) historyState("Loading history…");
+    _historyLab = labId;
+    let events = null;
+    try {
+        const resp = await fetch(
+            `/api/sample-history/${encodeURIComponent(labId)}?limit=${HISTORY_LIMIT}`,
+            { cache: "no-store" });
+        if (resp.status === 401) { triggerTimeout(); return; }
+        if (resp.ok) events = (await resp.json()).events;
+    } catch (e) { /* rendered as the error state below */ }
+    // Stale answer: a newer request went out, or the selection moved on.
+    if (seq !== _historySeq || rightTab !== "history") return;
+    if (!state.currentSample || state.currentSample.lab_id !== labId) return;
+    if (!Array.isArray(events)) { historyState("History is unavailable right now.", "h-state--error"); return; }
+    renderHistory(events);
+}
+
+// ── History rendering ───────────────────────────────────────────────
+const HISTORY_SOURCES = {
+    qbench_test: "QBench test result",
+    qbench_info: "QBench sample info",
+    qbench_comments: "QBench comments",
+    labvision_test: "LabVision result",
+};
+const OUTSIDE_USER = "Outside COA Reviewer";
+const MODE_WORD = { info: "Info", tests: "Tests" };
+const OUTCOME_WORD = { good: "Good", bad: "Bad" };
+
+function historyDayLabel(d) {
+    const today = new Date();
+    const y = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+    if (d.toDateString() === today.toDateString()) return "Today";
+    if (d.toDateString() === y.toDateString()) return "Yesterday";
+    const opts = { weekday: "short", month: "short", day: "numeric" };
+    if (d.getFullYear() !== today.getFullYear()) opts.year = "numeric";
+    return d.toLocaleDateString("en-US", opts);
+}
+
+// "just now" / "12 min ago" within the hour, then the clock time — the day
+// heading already says which day.
+function historyRelTime(d) {
+    const mins = Math.floor((Date.now() - d.getTime()) / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins} min ago`;
+    return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+}
+
+function historyExact(d) {
+    return d.toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric",
+        year: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+
+function historyInitials(name) {
+    const words = String(name || "").trim().split(/\s+/).filter(Boolean).slice(0, 2);
+    const s = words.map(w => w[0]).join("").toUpperCase();
+    return s || "?";
+}
+
+// Field keys from the SIF editor read better as their labels ("fuel_type"
+// → "Sample Type"); test names are already human.
+function historyFieldName(field) {
+    const f = INFO_EDITOR_FIELDS.find(x => x.key === field);
+    return f ? f.label : String(field ?? "a field");
+}
+
+function hVal(v) {
+    if (v === null || v === undefined) {
+        return `<span class="h-val h-val--none" title="Earlier value not recorded">—</span>`;
+    }
+    const text = String(v);
+    if (text.trim() === "") return `<span class="h-val h-val--empty" title="Blank">blank</span>`;
+    return `<code class="h-val" title="${escapeHtml(text)}">${escapeHtml(text)}</code>`;
+}
+
+function hWho(user) { return `<strong>${escapeHtml(user || "Someone")}</strong>`; }
+
+function hWhen(v) {
+    if (v === null || v === undefined || v === "") return "";
+    const n = Number(v);
+    const d = isNaN(n) ? new Date(String(v)) : new Date(n * 1000);
+    if (isNaN(d.getTime())) return escapeHtml(String(v));
+    return escapeHtml(shortWhen(d.getTime() / 1000));
+}
+
+function historySentence(ev) {
+    const who = hWho(ev.user);
+    const detail = ev.detail || {};
+    const mode = escapeHtml(MODE_WORD[ev.field] || ev.field || "");
+    const field = `<em>${escapeHtml(historyFieldName(ev.field))}</em>`;
+    const change = `from ${hVal(ev.before)} to ${hVal(ev.after)}`;
+    switch (ev.kind) {
+        case "mark": {
+            const out = OUTCOME_WORD[ev.after] || escapeHtml(ev.after ?? "");
+            const was = OUTCOME_WORD[ev.before] && ev.before !== ev.after
+                ? ` <span class="h-muted">(was ${OUTCOME_WORD[ev.before]})</span>` : "";
+            return `${who} marked it <strong class="h-out h-out--${escapeHtml(ev.after)}">${out}</strong> in ${mode}${was}`;
+        }
+        case "unmark": {
+            const was = OUTCOME_WORD[ev.before] ? ` <span class="h-muted">(was ${OUTCOME_WORD[ev.before]})</span>` : "";
+            return `${who} cleared the ${mode} mark${was}`;
+        }
+        case "test_result":
+        case "sample_info":
+            return `${who} changed ${field} ${change}`;
+        case "sample_sync":
+            return `${who} changed ${field} ${change} from LabVision`;
+        case "comments":
+            return `${who} edited the comments`;
+        case "attachment_deleted":
+            return `${who} deleted <em>${escapeHtml(ev.field ?? "an attachment")}</em>`;
+        case "listing_created":
+            return `${who} filed Command Center listing #${escapeHtml(detail.task_id ?? "?")}`;
+        case "listing_completed":
+            return `${who} completed listing #${escapeHtml(detail.task_id ?? "?")}`;
+        case "external_change":
+            return ev.user && ev.user !== OUTSIDE_USER
+                ? `${who} changed ${field} ${change} outside COA Reviewer`
+                : `${field} was changed ${change} outside COA Reviewer`;
+        default:
+            return `${who} made a change <span class="h-muted">(${escapeHtml(ev.kind)})</span>`;
+    }
+}
+
+// Muted lines under the sentence: why, where from, and caveats.
+function historyNotes(ev) {
+    const detail = ev.detail || {};
+    const notes = [];
+    if (detail.cause === "regenerate") notes.push("(cleared by Regenerate)");
+    if (detail.cause === "labvision_sync") notes.push("(cleared by a LabVision sync)");
+    if (detail.superseded) notes.push("(overridden by a newer mark)");
+    if (detail.migrated) notes.push("(carried over from before v4)");
+    if (detail.unchanged) notes.push("(same value)");
+    let html = notes.length ? `<p class="h-note">${escapeHtml(notes.join(" "))}</p>` : "";
+    if (ev.kind === "mark" && detail.reason) {
+        html += `<p class="h-quote" title="${escapeHtml(detail.reason)}">${escapeHtml(detail.reason)}</p>`;
+    }
+    if ((ev.kind === "listing_created" || ev.kind === "listing_completed") && ev.after) {
+        html += `<p class="h-quote" title="${escapeHtml(ev.after)}">${escapeHtml(ev.after)}</p>`;
+    }
+    if (ev.kind === "comments") {
+        const before = ev.before == null
+            ? `<span class="h-muted" title="Earlier value not recorded">—</span>`
+            : escapeHtml(ev.before || "(empty)");
+        html += `<details class="h-details"><summary>Show the change</summary>`
+            + `<div class="h-diff"><span class="h-diff-label">Before</span>`
+            + `<pre class="h-diff-text">${before}</pre>`
+            + `<span class="h-diff-label">After</span>`
+            + `<pre class="h-diff-text">${escapeHtml(ev.after || "(empty)")}</pre></div></details>`;
+    }
+    if (ev.kind === "external_change") {
+        const src = escapeHtml(HISTORY_SOURCES[detail.source] || "Another system");
+        let when;
+        if (detail.changed_at) when = `at ${hWhen(detail.changed_at)}`;
+        else if (detail.since) when = `sometime between ${hWhen(detail.since)} and ${hWhen(detail.detected_at ?? ev.at)}`;
+        else when = `first noticed ${hWhen(detail.detected_at ?? ev.at)}`;
+        html += `<p class="h-note"><span class="h-source">${src}</span> ${when}</p>`;
+    }
+    return html;
+}
+
+function historyItemHtml(ev, d) {
+    const external = ev.kind === "external_change";
+    const avatar = external
+        ? `<span class="h-avatar h-avatar--external" title="Outside COA Reviewer" aria-hidden="true">↗</span>`
+        : `<span class="h-avatar" title="${escapeHtml(ev.user || "")}" aria-hidden="true">${escapeHtml(historyInitials(ev.user))}</span>`;
+    return `<li class="h-item${external ? " h-item--external" : ""}">${avatar}`
+        + `<div class="h-body"><p class="h-text">${historySentence(ev)}</p>`
+        + historyNotes(ev)
+        + `<time class="h-time" datetime="${escapeHtml(d.toISOString())}" title="${escapeHtml(historyExact(d))}">`
+        + `${escapeHtml(historyRelTime(d))}</time></div></li>`;
+}
+
+function renderHistory(events) {
+    const list = $("#history-list");
+    if (!list) return;
+    const shown = (Array.isArray(events) ? events : []).slice(0, HISTORY_LIMIT);
+    if (!shown.length) {
+        historyState("No changes recorded for this sample yet. Marks and edits made from v4.0.0 on appear here.");
+        return;
+    }
+    let html = "";
+    let day = null;
+    for (const ev of shown) {
+        const d = new Date(Number(ev.at) * 1000);
+        if (isNaN(d.getTime())) continue;
+        const label = historyDayLabel(d);
+        if (label !== day) {
+            html += `${day === null ? "" : "</ol></section>"}<section class="h-day">`
+                + `<h4 class="h-day-label">${escapeHtml(label)}</h4><ol class="h-items">`;
+            day = label;
+        }
+        html += historyItemHtml(ev, d);
+    }
+    if (day !== null) html += "</ol></section>";
+    if (events.length >= HISTORY_LIMIT) {
+        html += `<p class="h-state h-state--limit">Showing the latest ${HISTORY_LIMIT} changes</p>`;
+    }
+    list.innerHTML = html;
 }
 
 
@@ -4321,6 +4652,12 @@ async function runPendingDoubleCheck() {
 let _restartOldPid = null;
 let _restartPollCount = 0;
 
+// Restart can install a release the updater already staged. That takes about
+// a minute; the new build announces itself through /api/health's version.
+const UPDATE_POLL_MAX = 90;          // × 2 s = 3 minutes, then fall back
+const UPDATE_POLL_MS = 2000;
+let _updatePollCount = 0;
+
 // Every control that restarts the app: the toolbar icon and the sentence
 // under the mode picker's two choices. They share one handler and go busy
 // together, so whichever one the reviewer can see tells the truth.
@@ -4385,10 +4722,12 @@ async function triggerServerRestart() {
     _restartOldPid = null;
     _restartPollCount = 0;
 
+    let update = null;
     try {
         const resp = await fetch("/api/restart", { method: "POST" });
         const data = await resp.json();
         _restartOldPid = data.old_pid || null;
+        update = data.update || null;
     } catch(e) { /* expected — server is shutting down */ }
 
     // Close SSE so it doesn't interfere with reconnection
@@ -4397,9 +4736,54 @@ async function triggerServerRestart() {
         state.eventSource = null;
     }
 
+    if (update) {
+        const label = `Installing ${update}\u2026`;
+        for (const btn of restartButtons()) btn.textContent = label;
+        setStatus(`Installing ${update}\u2026 this takes about a minute`);
+        _updatePollCount = 0;
+        setTimeout(() => pollForUpdate(update, normalizeVersion($("#app-version")?.textContent)), 4000);
+        return;
+    }
+
     // Wait for server to die + launcher restart + Cloudflare tunnel reconnect
     setStatus("Application shutting down... waiting for restart...");
     setTimeout(() => pollForRestart(), 6000);
+}
+
+function normalizeVersion(v) {
+    return String(v || "").trim().replace(/^v/i, "");
+}
+
+// Wait for the staged release: reload once /api/health reports a version
+// other than the one this page was served by. A new pid on the SAME version
+// means the updater did not take it and the app restarted normally.
+function pollForUpdate(tag, oldVersion) {
+    _updatePollCount++;
+    if (_updatePollCount > UPDATE_POLL_MAX) {
+        setStatus("Update not installed \u2014 restarting normally");
+        _restartPollCount = 0;
+        setTimeout(pollForRestart, UPDATE_POLL_MS);
+        return;
+    }
+    const again = () => setTimeout(() => pollForUpdate(tag, oldVersion), UPDATE_POLL_MS);
+    fetch("/api/health?_t=" + Date.now(), { method: "GET", cache: "no-store" })
+        .then(resp => (resp.ok ? resp.json() : null))
+        .then(data => {
+            if (!data) { again(); return; }
+            const version = normalizeVersion(data.version);
+            if (version && version !== oldVersion) {
+                setStatus(`${tag} installed \u2014 reloading\u2026`);
+                setTimeout(() => location.reload(), 500);
+                return;
+            }
+            if (_restartOldPid && data.pid && data.pid !== _restartOldPid) {
+                setStatus("Update not installed \u2014 restarting normally");
+                setTimeout(() => location.reload(), 1500);
+                return;
+            }
+            again();
+        })
+        .catch(again);  // down while the release switches over — keep waiting
 }
 
 function pollForRestart() {
