@@ -85,12 +85,14 @@ Rules (NASA Power-of-10 applied to Python):
   - A failed before-read records `before = null` ("unknown") and **never**
     blocks the edit.
 - `GET /api/sample-history/<lab_id>?limit=200` → newest first.
-- UI: the Lab Vision pane header becomes a segmented control
-  `Lab Vision | History`. History is a vertical timeline: initials avatar,
-  one plain sentence ("**Dana P** changed *moisture* from `11.2` → `12.0`"),
-  relative time with exact timestamp on hover, day separators. Loaded when the
-  tab is shown or the selected sample changes while shown; refreshed on a
-  `sample_event` SSE for the selected lab_id. Empty state explains itself.
+- UI: the far-right review panel (Attachments / Comments / Test Results or
+  Sample Info) gets a segmented control at its top: `Review | History`.
+  Review is today's contents, untouched. History is a full-height vertical
+  timeline: initials avatar, one plain sentence ("**Dana P** changed
+  *moisture* from `11.2` → `12.0`"), relative time with exact timestamp on
+  hover, day separators. Loaded when the tab is shown or the selected sample
+  changes while shown; refreshed on a `sample_event` SSE for the selected
+  lab_id. The choice persists in localStorage. Empty state explains itself.
 
 ## 4. Time online — `/activity`
 
