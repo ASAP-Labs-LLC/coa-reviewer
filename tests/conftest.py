@@ -140,5 +140,8 @@ def _isolated_shared_store(request, tmp_path_factory, monkeypatch):
     store = SharedStore(tmp_path_factory.mktemp("shared") / "coa_shared.db")
     monkeypatch.setattr(app_module.state, "shared", store)
     monkeypatch.setattr(app_module, "pending_verdicts", app_module.PendingVerdicts())
+    # In-flight own writes and deferred observations are process-wide too.
+    monkeypatch.setattr(app_module, "OWN_WRITES", app_module.OwnWrites())
+    monkeypatch.setattr(app_module, "OBSERVE_QUEUE", app_module.ObserveQueue())
     yield
     store.close()

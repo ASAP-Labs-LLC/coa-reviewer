@@ -18,8 +18,9 @@ LAB = "073126-41552"
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
-    """(client, ustate, api, labcore, sse) — QBench, LabCore and the upload
-    queue mocked; every broadcast SSE event captured in ``sse``."""
+    """(client, ustate, api, labcore, sse) — QBench and LabCore mocked, a
+    real (worker-less, wired) UploadQueue drained by ``_drain``; every
+    broadcast SSE event captured in ``sse``."""
     import app as app_module
     from app import SampleRecord, UserState
     from change_log import ChangeLog
@@ -31,17 +32,21 @@ def env(monkeypatch, tmp_path):
     lc.sample_data.return_value = {"lab_id": LAB, "fuel_type": "Diesel #1",
                                    "work_order": "03397832", "tests": []}
     monkeypatch.setattr(app_module.state, "labcore", lc)
-    monkeypatch.setattr(app_module.state, "upload_queue", MagicMock())
     api = MagicMock()
     api.delete_attachment.return_value = {"ok": True}
     api.fetch_sample.return_value = {"id": 5, "lab_id": LAB, "fw": "FW-1",
                                      "fuel_type": "", "work_order": "OLD",
+                                     "comments": "old note",
                                      "custom_fields": {"tank": "T1"}}
+    api.fetch_tests_for_sample_ids.return_value = [
+        {"id": 9, "sample_id": 5, "results": "1.23", "assay": {"name": "Water"}}]
     api.update_sample.return_value = {"data": [{"id": 5}]}
     monkeypatch.setattr(app_module.state, "api_client", api)
     monkeypatch.setattr(app_module.state, "logged_in", True)
     sse = []
     monkeypatch.setattr(app_module.state, "broadcast_sse", lambda d: sse.append(d))
+    queue_ = app_module._wire_upload_queue(app_module.UploadQueue(api, start_worker=False))
+    monkeypatch.setattr(app_module.state, "upload_queue", queue_)
 
     uid = "test-uid-history"
     ustate = UserState(uid, "Dana P")
@@ -58,6 +63,30 @@ def env(monkeypatch, tmp_path):
     yield client, ustate, api, lc, sse
     with app_module._sessions_lock:
         app_module.user_sessions.pop(uid, None)
+
+
+def _drain(*, fail: bool = False) -> int:
+    """Process every queued upload now. ``fail`` makes each one the final
+    attempt, so a QBench error is terminal instead of scheduling a retry."""
+    import queue as _queue
+    import app as app_module
+    q = app_module.state.upload_queue
+    if fail:
+        q.MAX_ATTEMPTS = 0          # this instance only: no retries
+    done = 0
+    for _ in range(50):
+        try:
+            payload = q.queue.get_nowait()
+        except _queue.Empty:
+            break
+        q._process(payload)
+        done += 1
+    return done
+
+
+def _own_writes():
+    import app as app_module
+    return app_module.OWN_WRITES
 
 
 def _store():
@@ -82,33 +111,123 @@ def store_down(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module.state, "shared", SharedStore(blocker / "sub" / "db"))
 
 
-# ── test results ─────────────────────────────────────────────────────────
+# ── test results: recorded when QBench answers ───────────────────────────
 
-def test_a_test_result_edit_records_before_and_after(env):
+def test_a_test_result_edit_is_recorded_when_qbench_confirms(env):
     client, _, _, _, sse = env
     assert client.patch("/api/tests/9", json={"value": "4.56"}).status_code == 200
+    assert _rows("test_result") == []                   # not yet: still queued
+    assert _own_writes().fields(LAB, "qbench_test") == {"test:9"}
+    _drain()
     [row] = _rows("test_result")
     assert row["user"] == "Dana P"
     assert (row["field"], row["before"], row["after"]) == ("Water", "1.23", "4.56")
     assert row["detail"]["test_id"] == 9
-    assert _store().snapshots(LAB, "qbench_test") == {"Water": "4.56"}
+    assert _store().snapshots(LAB, "qbench_test") == {"test:9": "4.56"}
+    assert _own_writes().fields(LAB, "qbench_test") == set()
     assert _events_for(sse)[-1]["kind"] == "test_result"
+
+
+def test_before_comes_from_qbench_and_an_outside_change_is_recorded_first(env):
+    client, ustate, api, _, _ = env
+    _store().observe(LAB, "qbench_test", {"test:9": "1.00"}, seen_at=1.0)
+    ustate.records[("Yesterday", LAB)].tests_data[0]["results"] = "1.00"   # stale cache
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    _drain()
+    [ext] = _rows("external_change")
+    assert (ext["field"], ext["before"], ext["after"]) == ("Water", "1.00", "1.23")
+    [row] = _rows("test_result")
+    assert row["before"] == "1.23"
+
+
+def test_a_failed_before_read_falls_back_to_the_cached_value(env, caplog):
+    client, _, api, _, _ = env
+    api.fetch_tests_for_sample_ids.side_effect = RuntimeError("429")
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    _drain()
+    [row] = _rows("test_result")
+    assert row["before"] == "1.23"
+    assert "before upload" in caplog.text
+
+
+def test_test_results_compare_as_exact_text(env):
+    client, *_ = env
+    client.patch("/api/tests/9", json={"value": "1.230"})
+    _drain()
+    [row] = _rows("test_result")
+    assert "unchanged" not in (row["detail"] or {})
 
 
 def test_an_edit_to_the_same_value_is_recorded_as_unchanged(env):
     client, *_ = env
-    client.patch("/api/tests/9", json={"value": "1.230"})
+    client.patch("/api/tests/9", json={"value": "1.23"})
+    _drain()
     [row] = _rows("test_result")
     assert row["detail"]["unchanged"] is True
 
 
-def test_duplicate_test_names_get_distinct_fields(env):
-    client, ustate, *_ = env
-    rec = ustate.records[("Yesterday", LAB)]
-    rec.tests_data.append({"test_id": 10, "test_name": "Water", "results": "2"})
-    client.patch("/api/tests/10", json={"value": "3"})
+def test_a_value_already_saved_is_recorded_at_once(env):
+    client, *_ = env
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    _drain()
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    rows = _rows("test_result")
+    assert len(rows) == 2 and rows[0]["detail"]["already_saved"] is True
+    assert _own_writes().fields(LAB, "qbench_test") == set()
+
+
+def test_a_failed_upload_is_recorded_as_failed_and_moves_nothing(env):
+    import app as app_module
+    client, _, api, _, _ = env
+    api.update_test_result.side_effect = app_module.QBenchAPIError("503")
+    _store().observe(LAB, "qbench_test", {"test:9": "1.23"}, seen_at=1.0)
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    _drain(fail=True)
     [row] = _rows("test_result")
-    assert row["field"] == "Water (test 10)"
+    assert row["detail"]["failed"] is True and row["after"] == "4.56"
+    assert _store().snapshots(LAB, "qbench_test") == {"test:9": "1.23"}
+    assert _own_writes().fields(LAB, "qbench_test") == set()
+    # QBench still says 1.23: nothing outside COA Reviewer happened.
+    ustate_cache_drop(env)
+    client.get(f"/api/tests/{LAB}")
+    assert _rows("external_change") == []
+
+
+def ustate_cache_drop(env):
+    env[1].records[("Yesterday", LAB)].tests_data = None
+
+
+@pytest.mark.parametrize("qbench_says", ["1.23", "4.56"])
+def test_a_read_while_the_upload_is_pending_judges_nothing(env, qbench_says):
+    client, _, api, _, _ = env
+    _store().observe(LAB, "qbench_test", {"test:9": "1.23"}, seen_at=1.0)
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    api.fetch_tests_for_sample_ids.return_value[0]["results"] = qbench_says
+    ustate_cache_drop(env)
+    client.get(f"/api/tests/{LAB}")
+    assert _rows("external_change") == []
+    api.fetch_tests_for_sample_ids.return_value[0]["results"] = "1.23"
+    _drain()
+    api.fetch_tests_for_sample_ids.return_value[0]["results"] = "4.56"
+    ustate_cache_drop(env)
+    client.get(f"/api/tests/{LAB}")
+    assert _rows("external_change") == []
+
+
+def test_a_test_is_keyed_by_id_without_the_reviewers_cache(env):
+    client, ustate, *_ = env
+    ustate.records[("Yesterday", LAB)].tests_data = None
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    _drain()
+    [row] = _rows("test_result")
+    assert row["field"] == "Water"                     # named by QBench's read
+    assert _store().snapshots(LAB, "qbench_test") == {"test:9": "4.56"}
+
+
+def test_an_edit_not_attributable_to_a_sample_is_logged(env, caplog):
+    client, *_ = env
+    assert client.patch("/api/tests/12345", json={"value": "1"}).status_code == 200
+    assert "12345" in caplog.text and "no sample" in caplog.text
 
 
 # ── attachments ──────────────────────────────────────────────────────────
@@ -123,54 +242,48 @@ def test_deleting_an_attachment_is_recorded(env):
 
 # ── comments ─────────────────────────────────────────────────────────────
 
-def test_a_comment_edit_records_the_last_seen_comments_as_before(env):
+def test_a_comment_edit_is_recorded_with_qbenchs_before(env):
     client, *_ = env
-    _store().update_snapshots(LAB, "qbench_comments", {"comments": "old note"})
     client.patch(f"/api/comments/{LAB}", json={"comments": "new note"})
+    assert _rows("comments") == []
+    assert _own_writes().fields(LAB, "qbench_comments") == {"comments"}
+    _drain()
     [row] = _rows("comments")
     assert (row["before"], row["after"]) == ("old note", "new note")
-    # queued, not yet confirmed: the snapshot has not moved
-    assert _store().snapshots(LAB, "qbench_comments") == {"comments": "old note"}
+    assert _store().snapshots(LAB, "qbench_comments") == {"comments": "new note"}
+    assert _own_writes().fields(LAB, "qbench_comments") == set()
 
 
-def test_a_comment_edit_with_nothing_seen_before_records_unknown(env):
-    client, *_ = env
-    client.patch(f"/api/comments/{LAB}", json={"comments": "new note"})
+def test_a_comment_whose_before_read_fails_uses_the_newest_queued_one(env):
+    client, _, api, _, _ = env
+    _store().update_snapshots(LAB, "qbench_comments", {"comments": "seen"})
+    api.fetch_sample.side_effect = RuntimeError("down")
+    client.patch(f"/api/comments/{LAB}", json={"comments": "a"})
+    client.patch(f"/api/comments/{LAB}", json={"comments": "b"})
+    _drain()
+    rows = sorted(_rows("comments"), key=lambda r: r["id"])
+    assert [(r["before"], r["after"]) for r in rows] == [("seen", "a"), ("a", "b")]
+
+
+def test_a_failed_comment_write_is_recorded_as_failed(env):
+    import app as app_module
+    client, _, api, _, _ = env
+    api.update_sample_comments.side_effect = app_module.QBenchAPIError("boom")
+    client.patch(f"/api/comments/{LAB}", json={"comments": "hi"})
+    _drain(fail=True)
     [row] = _rows("comments")
-    assert row["before"] is None and row["after"] == "new note"
+    assert row["detail"]["failed"] is True
+    # the pre-write read set the baseline; the failed write did not move it
+    assert _store().snapshots(LAB, "qbench_comments") == {"comments": "old note"}
+    assert _own_writes().fields(LAB, "qbench_comments") == set()
 
 
-def test_a_confirmed_comment_write_moves_the_snapshot():
-    import app as app_module
-
-    class Api:
-        def update_sample_comments(self, sid, comments):
-            return {"ok": True}
-    q = app_module.UploadQueue(Api(), start_worker=False)
-    q.on_comment_saved = app_module._comment_saved
-    q._process({"kind": "comment", "sample_id": 5, "comments": "hi", "lab_id": LAB})
-    assert _store().snapshots(LAB, "qbench_comments") == {"comments": "hi"}
-
-
-def test_a_failed_comment_write_leaves_the_snapshot_alone(monkeypatch):
-    import app as app_module
-
-    class Api:
-        def update_sample_comments(self, sid, comments):
-            # app's own class: another test may have reloaded qbench_client
-            raise app_module.QBenchAPIError("boom")
-    q = app_module.UploadQueue(Api(), start_worker=False)
-    q.on_comment_saved = app_module._comment_saved
-    q._process({"kind": "comment", "sample_id": 5, "comments": "hi", "lab_id": LAB,
-                "attempts": q.MAX_ATTEMPTS})
-    assert _store().snapshots(LAB, "qbench_comments") == {}
-
-
-def test_the_upload_queue_is_wired_to_record_confirmed_comments():
+def test_every_upload_queue_is_wired_for_history():
     import inspect
     import app as app_module
     src = inspect.getsource(app_module)
-    assert src.count("on_comment_saved = _comment_saved") >= 2
+    assert src.count("_wire_upload_queue(UploadQueue(") >= 2
+    assert "on_comment_saved" not in src
 
 
 # ── sample info ──────────────────────────────────────────────────────────
@@ -230,6 +343,61 @@ def test_a_sync_whose_before_read_fails_still_syncs(env):
     assert row["before"] is None
 
 
+def test_a_read_during_the_patch_does_not_judge_the_fields_being_written(env):
+    """Another reviewer's GET lands while our PATCH is in flight."""
+    import time
+    import app as app_module
+    client, _, api, _, _ = env
+    _store().observe(LAB, "qbench_info", {"fw": "FW-1"}, seen_at=1.0)
+
+    def patch_and_meanwhile_read(sid, payload):
+        app_module._observe(LAB, "qbench_info", {"fw": "FW-9"}, seen_at=time.time(),
+                            wait=True)
+        return {"data": [{"id": 5}]}
+    api.update_sample.side_effect = patch_and_meanwhile_read
+    client.patch(f"/api/sample-info/{LAB}", json={"fw": "FW-9"})
+    assert _rows("external_change") == []
+    assert _own_writes().fields(LAB, "qbench_info") == set()
+
+
+def test_a_failed_patch_releases_its_fields(env):
+    client, _, api, _, _ = env
+    api.update_sample.side_effect = RuntimeError("nope")
+    client.patch(f"/api/sample-info/{LAB}", json={"fw": "FW-9"})
+    assert _own_writes().fields(LAB, "qbench_info") == set()
+
+
+# ── I3: the snapshot is what QBench stores, so the next read agrees ──────
+
+@pytest.mark.parametrize("field,sent,qbench_returns", [
+    ("tags", ["a", "b"], ["a", "b"]),
+    ("tags", '["a", "b"]', ["a", "b"]),
+    ("Rush", True, True),
+    ("Rush", "true", True),
+    ("tank_capacity", "500", 500.0),
+    ("time_of_collection", "2026-09-25 10:00", "2026-09-25 10:00"),
+])
+def test_an_edit_round_trips_without_a_phantom_change(env, field, sent, qbench_returns):
+    client, _, api, _, _ = env
+    client.patch(f"/api/sample-info/{LAB}", json={field: sent})
+    api.fetch_sample.return_value = {**api.fetch_sample.return_value, field: qbench_returns}
+    client.get(f"/api/sample-info/{LAB}")
+    assert _rows("external_change") == []
+
+
+def test_the_snapshot_prefers_qbenchs_echo(env):
+    client, _, api, _, _ = env
+    api.update_sample.return_value = {"data": [{"id": 5, "time_of_collection":
+                                                "2026-09-25T10:00:00"}]}
+    client.patch(f"/api/sample-info/{LAB}", json={"time_of_collection": "2026-09-25 10:00"})
+    assert _store().snapshots(LAB, "qbench_info")["time_of_collection"] == \
+        "2026-09-25T10:00:00"
+    api.fetch_sample.return_value = {**api.fetch_sample.return_value,
+                                     "time_of_collection": "2026-09-25T10:00:00"}
+    client.get(f"/api/sample-info/{LAB}")
+    assert _rows("external_change") == []
+
+
 # ── Command Center listings ──────────────────────────────────────────────
 
 def test_creating_a_listing_records_it_on_every_sample(env):
@@ -257,6 +425,15 @@ def test_completing_a_listing_records_it_for_the_lab_id_sent(env):
     client.post("/api/cc/tasks/7/complete", json={"notes": "Re-ran", "lab_id": LAB})
     [row] = _rows("listing_completed")
     assert row["after"] == "Re-ran" and row["detail"] == {"task_id": 7}
+
+
+def test_completing_records_every_lab_id_that_looks_like_one(env, caplog):
+    client, *_ = env
+    client.post("/api/cc/tasks/7/complete", json={
+        "notes": "x", "lab_id": LAB, "lab_ids": ["073126-41553", "DROP TABLE", LAB]})
+    assert len(_rows("listing_completed")) == 1
+    assert len(_rows("listing_completed", "073126-41553")) == 1
+    assert "not a lab id" in caplog.text
 
 
 def test_completing_without_a_lab_id_records_nothing_and_succeeds(env):
@@ -287,3 +464,6 @@ def test_every_edit_still_succeeds_with_the_store_down(env, store_down):
         "initial_problem": "x", "sample_ids": [{"lab_id": LAB}]}).status_code == 200
     assert client.post("/api/cc/tasks/7/complete",
                        json={"notes": "x", "lab_id": LAB}).status_code == 200
+    _drain()
+    assert _own_writes().fields(LAB, "qbench_test") == set()
+    assert _own_writes().fields(LAB, "qbench_comments") == set()
