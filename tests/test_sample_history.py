@@ -166,14 +166,74 @@ def test_an_edit_to_the_same_value_is_recorded_as_unchanged(env):
     assert row["detail"]["unchanged"] is True
 
 
-def test_a_value_already_saved_is_recorded_at_once(env):
-    client, *_ = env
+def test_a_re_entered_value_is_uploaded_again_after_an_outside_change(env):
+    """Dana saves 4.56 → a tech sets 7.0 in QBench → Dana re-enters 4.56.
+    The re-entry must reach QBench, and the history must say 7.0 → 4.56
+    because that is what happened (not a skipped 'already saved')."""
+    client, ustate, api, _, _ = env
+    qbench = {"results": "1.23"}
+    api.fetch_tests_for_sample_ids.side_effect = lambda ids: [
+        {"id": 9, "sample_id": 5, "results": qbench["results"], "assay": {"name": "Water"}}]
+    api.update_test_result.side_effect = lambda tid, v: qbench.update(results=v) or {}
     client.patch("/api/tests/9", json={"value": "4.56"})
     _drain()
+    qbench["results"] = "7.0"                           # the tech, directly in QBench
+    ustate_cache_drop(env)
+    client.get(f"/api/tests/{LAB}")
     client.patch("/api/tests/9", json={"value": "4.56"})
-    rows = _rows("test_result")
-    assert len(rows) == 2 and rows[0]["detail"]["already_saved"] is True
-    assert _own_writes().fields(LAB, "qbench_test") == set()
+    _drain()
+    assert qbench["results"] == "4.56"
+    assert api.update_test_result.call_count == 2
+    [ext] = _rows("external_change")
+    assert (ext["before"], ext["after"]) == ("4.56", "7.0")
+    newest = _rows("test_result")[0]
+    assert (newest["before"], newest["after"]) == ("7.0", "4.56")
+    assert "already_saved" not in (newest["detail"] or {})
+
+
+def test_a_confirmed_edit_the_store_cannot_record_keeps_its_guard(env, monkeypatch):
+    """Store down at confirm time: the snapshot could not move, so the field
+    stays guarded (until it ages out) rather than reading as an outside
+    change on the next GET."""
+    client, *_ = env
+    monkeypatch.setattr(_store(), "record_events", lambda *a, **k: False)
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    _drain()
+    assert _own_writes().fields(LAB, "qbench_test") == {"test:9"}
+
+
+def test_a_burst_of_edits_on_one_sample_reads_qbench_once(env):
+    client, ustate, api, _, _ = env
+    ustate.records[("Yesterday", LAB)].test_ids = [9, 10]
+    api.fetch_tests_for_sample_ids.return_value = [
+        {"id": 9, "sample_id": 5, "results": "1.23", "assay": {"name": "Water"}},
+        {"id": 10, "sample_id": 5, "results": "2", "assay": {"name": "Ash"}}]
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    client.patch("/api/tests/10", json={"value": "3"})
+    client.patch("/api/tests/9", json={"value": "4.57"})
+    _drain()
+    assert api.fetch_tests_for_sample_ids.call_count == 1
+    rows = sorted(_rows("test_result"), key=lambda r: r["id"])
+    assert [(r["field"], r["before"], r["after"]) for r in rows] == [
+        ("Water", "1.23", "4.56"), ("Ash", "2", "3"), ("Water", "4.56", "4.57")]
+    assert _rows("external_change") == []
+
+
+def test_a_deep_queue_skips_the_pre_read(env, caplog):
+    import logging
+    import app as app_module
+    caplog.set_level(logging.DEBUG)
+    client, _, api, _, _ = env
+    q = app_module.state.upload_queue
+    for _ in range(app_module.PRE_READ_MAX_QUEUE_DEPTH + 1):
+        q.queue.put({"kind": "noop"})
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    payload = q.queue.queue[-1]
+    q._process(payload)
+    assert api.fetch_tests_for_sample_ids.call_count == 0
+    assert "queue depth" in caplog.text
+    [row] = _rows("test_result")
+    assert row["before"] == "1.23"                   # the cached fallback
 
 
 def test_a_failed_upload_is_recorded_as_failed_and_moves_nothing(env):
@@ -360,11 +420,29 @@ def test_a_read_during_the_patch_does_not_judge_the_fields_being_written(env):
     assert _own_writes().fields(LAB, "qbench_info") == set()
 
 
-def test_a_failed_patch_releases_its_fields(env):
+def test_a_patch_qbench_refused_releases_its_fields(env):
+    import app as app_module
     client, _, api, _, _ = env
-    api.update_sample.side_effect = RuntimeError("nope")
+    api.update_sample.side_effect = app_module.QBenchAPIError("400 bad field")
     client.patch(f"/api/sample-info/{LAB}", json={"fw": "FW-9"})
     assert _own_writes().fields(LAB, "qbench_info") == set()
+
+
+def test_a_patch_that_may_have_landed_keeps_its_fields_guarded(env):
+    """A timeout: QBench may have applied it, so the next read must not
+    call our value an outside change."""
+    import requests
+    client, _, api, _, _ = env
+    api.update_sample.side_effect = requests.exceptions.ReadTimeout("slow")
+    assert client.patch(f"/api/sample-info/{LAB}", json={"fw": "FW-9"}).status_code == 500
+    assert _own_writes().fields(LAB, "qbench_info") == {"fw"}
+
+
+def test_a_patch_the_store_cannot_record_keeps_its_fields_guarded(env, monkeypatch):
+    client, *_ = env
+    monkeypatch.setattr(_store(), "record_events", lambda *a, **k: False)
+    assert client.patch(f"/api/sample-info/{LAB}", json={"fw": "FW-9"}).status_code == 200
+    assert _own_writes().fields(LAB, "qbench_info") == {"fw"}
 
 
 # ── I3: the snapshot is what QBench stores, so the next read agrees ──────
@@ -465,5 +543,30 @@ def test_every_edit_still_succeeds_with_the_store_down(env, store_down):
     assert client.post("/api/cc/tasks/7/complete",
                        json={"notes": "x", "lab_id": LAB}).status_code == 200
     _drain()
-    assert _own_writes().fields(LAB, "qbench_test") == set()
-    assert _own_writes().fields(LAB, "qbench_comments") == set()
+    # Confirmed but unrecorded: the snapshot is behind QBench, so the fields
+    # stay guarded until they age out instead of reading as outside changes.
+    assert _own_writes().fields(LAB, "qbench_test") == {"test:9"}
+    assert _own_writes().fields(LAB, "qbench_comments") == {"comments"}
+
+
+# ── snapshot pruning ─────────────────────────────────────────────────────
+
+def test_old_snapshots_are_pruned_once_a_day():
+    import app as app_module
+    store = _store()
+    now = 400 * 86400.0
+    store.update_snapshots(LAB, "qbench_test", {"test:1": "old"}, seen_at=now - 181 * 86400)
+    store.update_snapshots(LAB, "qbench_test", {"test:2": "new"}, seen_at=now - 10 * 86400)
+    assert app_module._maybe_prune_snapshots(now) == 1
+    assert store.snapshots(LAB, "qbench_test") == {"test:2": "new"}
+    store.update_snapshots(LAB, "qbench_test", {"test:3": "old"}, seen_at=now - 200 * 86400)
+    assert app_module._maybe_prune_snapshots(now + 3600) is None      # already ran today
+    assert app_module._maybe_prune_snapshots(now + 86401) == 1
+
+
+def test_the_cleanup_cycle_prunes_snapshots(monkeypatch):
+    import app as app_module
+    calls = []
+    monkeypatch.setattr(app_module, "_maybe_prune_snapshots", lambda now: calls.append(now))
+    app_module._session_cleanup_cycle(123.0)
+    assert calls == [123.0]

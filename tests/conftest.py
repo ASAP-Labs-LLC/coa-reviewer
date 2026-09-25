@@ -143,5 +143,7 @@ def _isolated_shared_store(request, tmp_path_factory, monkeypatch):
     # In-flight own writes and deferred observations are process-wide too.
     monkeypatch.setattr(app_module, "OWN_WRITES", app_module.OwnWrites())
     monkeypatch.setattr(app_module, "OBSERVE_QUEUE", app_module.ObserveQueue())
+    monkeypatch.setattr(app_module, "PRE_READS", app_module.PreReads())
+    monkeypatch.setattr(app_module, "_last_snapshot_prune", None)
     yield
     store.close()

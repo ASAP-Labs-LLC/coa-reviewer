@@ -82,6 +82,7 @@ SNAPSHOT_REFRESH_SECONDS = 3600.0  # unchanged fields refresh seen_at at most ho
 MAX_OBSERVE_ITEMS = 2000     # (lab_id, source) items one observe_many() call takes
 MAX_OBSERVE_READ_ROWS = 200_000  # snapshot rows one observe_many() read may return
 CHANGED_AT_SLACK_SECONDS = 60.0  # clock skew allowed around [since, detected_at]
+MAX_PRUNE_ROWS = 10_000      # snapshot rows one prune_snapshots() call may delete
 _WHEN_POLICIES = ("always", "if_judged", "if_absent")
 MAX_SPAN_SECONDS = 86400 + 600  # a span can't outlive one calendar day + slack
 
@@ -138,6 +139,7 @@ CREATE TABLE IF NOT EXISTS field_snapshots (
     digest  TEXT,
     PRIMARY KEY (lab_id, source, field)
 );
+CREATE INDEX IF NOT EXISTS ix_snapshots_seen ON field_snapshots(seen_at);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -1095,6 +1097,23 @@ class SharedStore:
             self._in_tx(c, lambda: c.executemany(_UPSERT_SNAPSHOT_SQL, rows))
             return True
         return self._run("update_snapshots", op, False, key=lab_id)
+
+    def prune_snapshots(self, *, before: float, limit: int = MAX_PRUNE_ROWS) -> Optional[int]:
+        """Delete up to ``limit`` snapshots last seen before ``before`` (a
+        sample nobody has looked at for months). A later read of one simply
+        re-baselines it. Returns how many went, or ``None`` on failure."""
+        before = _require_float(before, "before")
+        _require(isinstance(limit, int) and 0 < limit <= MAX_PRUNE_ROWS,
+                 f"limit must be 1..{MAX_PRUNE_ROWS}, got {limit!r}")
+
+        def op(c: sqlite3.Connection) -> int:
+            cur = c.execute("DELETE FROM field_snapshots WHERE rowid IN (SELECT rowid FROM"
+                            " field_snapshots WHERE seen_at < ? LIMIT ?)", (before, limit))
+            return int(cur.rowcount or 0)
+        n = self._run("prune_snapshots", op, None, key=f"<{before:.0f}")
+        if n:
+            logger.info("pruned %d field snapshot(s) last seen before %.0f", n, before)
+        return n
 
     def observe(self, lab_id: str, source: str, values: Dict[str, Any], *,
                 seen_at: Optional[float] = None, actor_hint: Optional[str] = None,

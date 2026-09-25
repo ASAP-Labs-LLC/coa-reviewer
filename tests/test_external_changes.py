@@ -723,3 +723,15 @@ def test_own_writes_expire_and_are_bounded(caplog):
     for i in range(4):
         monkey.begin("A", "qbench_test", f"test:{i}")
     assert monkey.fields("A", "qbench_test") == {"test:1", "test:2", "test:3"}
+
+
+def test_prune_is_bounded(tmp_path):
+    s = SharedStore(tmp_path / "db.sqlite")
+    for i in range(30):
+        s.update_snapshots(f"L{i}", "qbench_test", {"t": "1"}, seen_at=10.0)
+    assert s.prune_snapshots(before=100.0, limit=25) == 25
+    assert s.prune_snapshots(before=100.0, limit=25) == 5
+    assert s.prune_snapshots(before=100.0, limit=25) == 0
+    with pytest.raises(ValueError):
+        s.prune_snapshots(before=100.0, limit=shared_store.MAX_PRUNE_ROWS + 1)
+    s.close()

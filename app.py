@@ -861,13 +861,12 @@ class UploadQueue:
         self.api_client = api_client
         self.queue: queue.Queue = queue.Queue()
         self.running = True
-        self.last_synced_values: Dict[int, str] = {}
         self.results: List[dict] = []
         self._lock = threading.Lock()
         self.sse_broadcast: Optional[Callable[[dict], None]] = None
         # Sample-history hooks, called for payloads that carry "history"
         # (see _wire_upload_queue): just before the first attempt (payload,
-        # api_client), on QBench's success, and after the final failure.
+        # this queue), on QBench's success, and after the final failure.
         self.on_before_write: Optional[Callable[[dict, Any], None]] = None
         self.on_saved: Optional[Callable[[dict], None]] = None
         self.on_failed: Optional[Callable[[dict], None]] = None
@@ -876,11 +875,9 @@ class UploadQueue:
             self.thread.start()
 
     def enqueue(self, test_id: int, value: str, history: Optional[dict] = None) -> bool:
-        """Queue a test result write; False if QBench already holds it
-        from our last write (nothing is queued)."""
-        last = self.last_synced_values.get(test_id)
-        if last == value:
-            return False
+        """Queue a test result write. Always queued, even if we wrote the
+        same value before: QBench may have been changed since (by a tech,
+        directly), and a same-value PATCH is harmless."""
         self.queue.put({"kind": "test", "test_id": test_id, "value": value, "attempts": 0,
                         "history": history})
         return True
@@ -899,7 +896,7 @@ class UploadQueue:
             return
         try:
             if name == "on_before_write":
-                fn(payload, self.api_client)
+                fn(payload, self)
             else:
                 fn(payload)
         except Exception:
@@ -958,7 +955,6 @@ class UploadQueue:
             self._hook("on_before_write", payload)
         try:
             self.api_client.update_test_result(int(test_id), value)
-            self.last_synced_values[int(test_id)] = value
             with self._lock:
                 self.results.append({"test_id": test_id, "value": value, "status": "ok"})
             logger.info("Uploaded test %s = '%s'", test_id, value)
@@ -2471,6 +2467,10 @@ def _session_cleanup_cycle(now: float) -> None:
         _persist_dirty_sessions()
     except Exception:
         logger.exception("writing fanned-out sessions failed")
+    try:
+        _maybe_prune_snapshots(now)
+    except Exception:
+        logger.exception("pruning field snapshots failed")
 
 
 def _session_cleanup_worker(cycles: Optional[int] = None,
@@ -4656,8 +4656,72 @@ class ObserveQueue:
             _broadcast_observed(list(got))
 
 
+class PreReads:
+    """The upload worker's recent QBench reads, per (lab_id, source), so a
+    burst of edits on one sample costs one read. An entry lives
+    ``TTL_SECONDS``; our own confirmed writes are applied to it, and any
+    fresh read of the sample (a GET, a tab pull) drops it. Bounded."""
+
+    TTL_SECONDS = 5.0
+    MAX_ENTRIES = 200
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._entries: "OrderedDict[tuple, dict]" = OrderedDict()
+
+    def get(self, lab_id: str, source: str) -> Optional[dict]:
+        with self._lock:
+            entry = self._entries.get((lab_id, source))
+            if entry is None or self._clock() - entry["at"] > self.TTL_SECONDS:
+                self._entries.pop((lab_id, source), None)
+                return None
+            return entry
+
+    def put(self, lab_id: str, source: str, read_started: float,
+            values: Dict[str, str], names: Dict[str, str]) -> dict:
+        entry = {"at": self._clock(), "read_started": read_started,
+                 "values": dict(values), "names": dict(names)}
+        with self._lock:
+            self._entries.pop((lab_id, source), None)
+            self._entries[(lab_id, source)] = entry
+            while len(self._entries) > self.MAX_ENTRIES:
+                self._entries.popitem(last=False)
+        return entry
+
+    def wrote(self, lab_id: str, source: str, key: str, value: str) -> None:
+        with self._lock:
+            entry = self._entries.get((lab_id, source))
+            if entry is not None:
+                entry["values"][key] = value
+
+    def drop(self, lab_id: str, source: str) -> None:
+        with self._lock:
+            self._entries.pop((lab_id, source), None)
+
+
+#: Above this many queued uploads, skip the pre-write read (429 risk); the
+#: history's before-value falls back to the reviewer's cached one.
+PRE_READ_MAX_QUEUE_DEPTH = 20
+#: Field snapshots unseen this long are pruned (a later read re-baselines).
+SNAPSHOT_MAX_AGE_SECONDS = 180 * 86400
+SNAPSHOT_PRUNE_INTERVAL_SECONDS = 86400
+_last_snapshot_prune: Optional[float] = None
+
 OWN_WRITES = OwnWrites()
 OBSERVE_QUEUE = ObserveQueue()
+PRE_READS = PreReads()
+
+
+def _maybe_prune_snapshots(now: float) -> Optional[int]:
+    """At most once a day (cleanup worker): prune snapshots last seen over
+    ``SNAPSHOT_MAX_AGE_SECONDS`` ago, bounded per run. None = not run."""
+    global _last_snapshot_prune
+    if (_last_snapshot_prune is not None
+            and now - _last_snapshot_prune < SNAPSHOT_PRUNE_INTERVAL_SECONDS):
+        return None
+    _last_snapshot_prune = now
+    return state.shared.prune_snapshots(before=now - SNAPSHOT_MAX_AGE_SECONDS)
 
 
 def _sample_event(lab_id: str, kind: str) -> None:
@@ -4754,6 +4818,8 @@ def _observe(lab_id: Optional[str], source: str, values: Dict[str, Any], *,
     anything changed outside it. ``seen_at`` is when the read started. On a
     request thread (``wait=False``) a busy writer hands the work to
     ``OBSERVE_QUEUE`` instead of blocking. Never raises."""
+    if respect_own_writes and lab_id:
+        PRE_READS.drop(lab_id, source)      # this read is newer than any cached one
     try:
         item = _observe_item(lab_id, source, values, seen_at=seen_at,
                              respect_own_writes=respect_own_writes, **kw)
@@ -4816,34 +4882,56 @@ def _upload_history(ustate: "UserState", *, kind: str, lab_id: str, source: str,
             "token": OWN_WRITES.begin(lab_id, source, key, value)}
 
 
-def _read_current(h: dict, api: Any) -> Tuple[str, Optional[str]]:
-    """QBench's current value for the field an upload is about to write,
-    and (for a test) its name."""
+def _read_sample_values(h: dict, api: Any) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """QBench's current values for the whole sample an upload belongs to
+    (every test, or its comments) and the tests' names — one read serves a
+    burst of edits on that sample."""
     sid = int(h["sample_id"])
     if h["source"] == "qbench_comments":
-        return _comments_text(api.fetch_sample(sid)), None
-    test_id = h["detail"].get("test_id")
+        return {"comments": _comments_text(api.fetch_sample(sid))}, {}
     raw = list(api.fetch_tests_for_sample_ids([sid]) or [])[:MAX_OBSERVE_FIELDS]
-    for t, row in zip(raw, _qbench_test_rows(raw)):
-        if t.get("id") == test_id:
-            return _observed_value(row["results"]), row["test_name"]
-    raise LookupError(f"test {test_id} not on sample {sid}")
+    values: Dict[str, str] = {}
+    names: Dict[str, str] = {}
+    for row in _qbench_test_rows(raw):
+        if row["test_id"] is not None:
+            key = _test_key(row["test_id"])
+            values[key], names[key] = _observed_value(row["results"]), row["test_name"]
+    return values, names
 
 
-def _upload_before_write(payload: dict, api: Any) -> None:
-    """UploadQueue hook, worker thread, first attempt only: read QBench's
-    current value, record any outside change since we last looked, and keep
-    it as this edit's ``before``. Best-effort: one bounded read."""
-    h = payload.get("history") or {}
-    if not h.get("sample_id"):
-        return
+def _pre_read(h: dict, q: "UploadQueue") -> Optional[dict]:
+    """The sample's current QBench values: cached for a burst, else one read
+    — skipped when the queue is deep (every read risks a 429)."""
+    entry = PRE_READS.get(h["lab_id"], h["source"])
+    if entry is not None:
+        return entry
+    depth = q.queue.qsize()
+    if depth > PRE_READ_MAX_QUEUE_DEPTH:
+        history_log.debug("upload queue depth %d > %d: pre-write read skipped for %s",
+                          depth, PRE_READ_MAX_QUEUE_DEPTH, h["lab_id"])
+        return None
     read_started = time.time()
     try:
-        current, name = _read_current(h, api)
+        values, names = _read_sample_values(h, q.api_client)
     except Exception as exc:
         logger.warning("history: could not read %s/%s before upload: %s",
                        h.get("lab_id"), h.get("label"), exc)
+        return None
+    return PRE_READS.put(h["lab_id"], h["source"], read_started, values, names)
+
+
+def _upload_before_write(payload: dict, q: "UploadQueue") -> None:
+    """UploadQueue hook, worker thread, first attempt only: QBench's current
+    value (see ``_pre_read``) becomes this edit's ``before``, and any outside
+    change since we last looked is recorded first."""
+    h = payload.get("history") or {}
+    if not h.get("sample_id"):
         return
+    entry = _pre_read(h, q)
+    if entry is None or h["key"] not in entry["values"]:
+        return
+    current, name = entry["values"][h["key"]], entry["names"].get(h["key"])
+    read_started = entry["read_started"]
     h["before"], h["before_read"] = current, True
     if name and h.get("label_is_fallback"):
         h["label"] = name
@@ -4859,16 +4947,21 @@ def _upload_value(payload: dict) -> str:
 
 def _upload_saved(payload: dict) -> None:
     """UploadQueue hook: QBench confirmed. Record the edit and move the
-    snapshot in one transaction, then release the field."""
+    snapshot in one transaction, then release the field — unless that write
+    failed: then the snapshot is behind QBench, so the field stays guarded
+    until ``OwnWrites`` ages it out rather than reading as an outside change."""
     h = payload.get("history") or {}
-    try:
-        value = _upload_value(payload)
-        before = h.get("before") if h.get("before_read") else h.get("before_hint")
-        _record_history(h.get("lab_id"), [_history_event(
-            h["kind"], h["user"], field=h["label"], before=before, after=value,
-            detail=h["detail"], snapshot=(h["source"], h["key"], value))])
-    finally:
+    value = _upload_value(payload)
+    PRE_READS.wrote(h.get("lab_id"), h.get("source"), h.get("key"), value)
+    before = h.get("before") if h.get("before_read") else h.get("before_hint")
+    recorded = _record_history(h.get("lab_id"), [_history_event(
+        h["kind"], h["user"], field=h["label"], before=before, after=value,
+        detail=h["detail"], snapshot=(h["source"], h["key"], value))])
+    if recorded:
         OWN_WRITES.end(h.get("token"))
+    else:
+        history_log.warning("history: %s/%s confirmed but not recorded; guarded until"
+                            " it ages out", h.get("lab_id"), h.get("key"))
 
 
 def _upload_failed(payload: dict) -> None:
@@ -4948,6 +5041,7 @@ def _observe_qbench_tests(lab_id: str, tests: List[dict], raw_tests: Optional[Li
     except Exception as exc:   # a malformed payload costs the observation only
         logger.warning("observe %s tests: could not read the payload: %s", lab_id, exc)
         return
+    PRE_READS.drop(lab_id, "qbench_test")    # this read is newer than any cached one
     if item is not None:
         _observe(lab_id, "qbench_test", item["values"], seen_at=seen_at,
                  field_meta=item["field_meta"], respect_own_writes=False)
@@ -4977,6 +5071,7 @@ def _observe_tab_tests(sample_test_map: Dict[int, Dict[str, Any]], tests: List[d
             continue
         if item is not None:
             items.append(item)
+            PRE_READS.drop(item["lab_id"], "qbench_test")
     try:
         got = state.shared.observe_many(items, wait=True) if items else {}
     except Exception as exc:
@@ -5082,7 +5177,7 @@ def _begin_info_writes(lab_id: str, fields: Dict[str, Any]) -> List[int]:
 
 def _record_sample_fields(lab_id: str, kind: str, user: str, fields: Dict[str, Any],
                           before: Dict[str, Optional[str]], response: Any,
-                          detail: Optional[dict] = None) -> None:
+                          detail: Optional[dict] = None) -> bool:
     stored = _stored_values(fields, response)
     events = []
     for f in list(fields)[:MAX_EVENTS_PER_BATCH]:
@@ -5091,7 +5186,7 @@ def _record_sample_fields(lab_id: str, kind: str, user: str, fields: Dict[str, A
             kind, user, field=f, before=before.get(f), after=stored[f], detail=detail,
             snapshot=(target[0], target[1], stored[f]) if target else None,
             numeric=True))
-    _record_history(lab_id, events)
+    return _record_history(lab_id, events)
 
 
 def _update_sample_with_history(lab_id: str, sid: int, fields: Dict[str, Any],
@@ -5104,12 +5199,19 @@ def _update_sample_with_history(lab_id: str, sid: int, fields: Dict[str, Any],
     raises (nothing is recorded then)."""
     before = _sample_before(lab_id, sid, fields)
     tokens = _begin_info_writes(lab_id, fields)
+    release = False
     try:
         response = state.api_client.update_sample(sid, payload)
-        _record_sample_fields(lab_id, kind, user, fields, before, response, detail)
+        release = _record_sample_fields(lab_id, kind, user, fields, before, response, detail)
         return response
+    except QBenchAPIError:
+        release = True      # QBench answered with a refusal: nothing landed
+        raise
     finally:
-        for token in tokens:
+        # A timeout may have landed, and an unrecorded write leaves the
+        # snapshot behind QBench: either way keep the fields guarded until
+        # OwnWrites ages them out.
+        for token in tokens if release else []:
             OWN_WRITES.end(token)
 
 
@@ -5207,13 +5309,7 @@ def update_test(test_id: int):
             key=_test_key(test_id), label=assay or f"Test {test_id}", value=value,
             sample_id=rec.sample_id, before_hint=old_value, detail={"test_id": test_id})
         history["label_is_fallback"] = not assay
-    if not state.upload_queue.enqueue(test_id, value, history=history) and history:
-        # QBench already holds this value from our last write: nothing is
-        # uploaded, so the attempt is recorded now and the field released.
-        OWN_WRITES.end(history["token"])
-        _record_history(rec.lab_id, [_history_event(
-            "test_result", history["user"], field=history["label"], before=old_value,
-            after=value, detail={"test_id": test_id, "already_saved": True})])
+    state.upload_queue.enqueue(test_id, value, history=history)
 
     state.change_log.qbench_edit(
         "test_result",
