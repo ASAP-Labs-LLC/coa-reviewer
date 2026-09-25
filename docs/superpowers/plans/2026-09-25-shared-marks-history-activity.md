@@ -1919,3 +1919,23 @@ actor). Comments: snapshot on UploadQueue success only (find `_process_comment`)
   "claimed, outcome unknown": wait up to `accepted_wait`, then the N2 exit.
 - **N4 — match the outcome to this request.** Ignore any outcome whose `at`
   differs from the `at` this process wrote (a leftover from an earlier run).
+
+### Task 6 — pending writes (store critic, round 2, N6)
+
+Tombstones fix "a mark that never reached the store", but not "a failed write
+over an existing shared verdict" (shared says good; Dana unchecks; apply_mark
+fails; the next get_tab re-applies good and her uncheck silently reverts).
+
+- Add a process-wide `PendingVerdicts` (small class in app.py or a tiny module):
+  bounded dict `(lab_id, mode) → {outcome, by, reason, cc_task_id, sample_id, tab, at}`,
+  `MAX_PENDING = 2000` (WARNING when full; oldest dropped with an ERROR naming it).
+- `_share_verdict`: if `apply_mark` returns None → store in PendingVerdicts, log
+  WARNING, the mark still succeeds for the reviewer (their local record and ledger
+  hold it), fan-out uses the pending verdict.
+- `get_tab` and fan-out: a pending entry for (lab_id, mode) wins over the store's
+  verdict.
+- `_session_cleanup_worker` retries pending entries each cycle (bounded: at most
+  200 per cycle) via `apply_mark`; on success remove and broadcast `tags` +
+  `sample_event`.
+- Tests: failed apply_mark then get_tab does not revert; retry succeeds later and
+  the history row appears; bounded size.
