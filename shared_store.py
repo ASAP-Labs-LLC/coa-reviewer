@@ -709,6 +709,11 @@ class SharedStore:
         ``{"op": "open", "user":..., "started":..., "last_seen":...}``,
         ``{"op": "touch", "span_id":..., "last_seen":...}`` or
         ``{"op": "close", "span_id":..., "ended_at":..., "reason":...}``.
+        A ``"close"`` (or ``"touch"``) may use ``"span_id": "$prev"`` to mean
+        "the id the immediately preceding op in this same batch produced" —
+        how a span that opened and closed before ever reaching the store
+        (nobody flushed in between) gets both halves written atomically in
+        one flush instead of being silently dropped.
 
         Returns a list of results parallel to ``ops`` (the new span id for
         ``"open"``, a bool for ``"touch"``/``"close"``), or ``None`` if the
@@ -731,20 +736,22 @@ class SharedStore:
                              float(item["started"]), float(item["last_seen"])))
                         results.append(int(cur.lastrowid))
                     elif kind == "touch":
+                        span_id = self._resolve_span_id(item["span_id"], results)
                         cur = c.execute(
                             "UPDATE presence SET last_seen=? WHERE id=? AND ended_at IS NULL",
-                            (float(item["last_seen"]), int(item["span_id"])))
+                            (float(item["last_seen"]), span_id))
                         results.append(cur.rowcount == 1)
                     elif kind == "close":
                         reason = item["reason"]
                         _require(reason in SPAN_END_REASONS,
                                 f"unknown end reason {reason!r}")
+                        span_id = self._resolve_span_id(item["span_id"], results)
                         cur = c.execute(
                             "UPDATE presence SET last_seen=MAX(last_seen, ?),"
                             " ended_at=MAX(last_seen, ?), end_reason=?"
                             " WHERE id=? AND ended_at IS NULL",
                             (float(item["ended_at"]), float(item["ended_at"]), reason,
-                             int(item["span_id"])))
+                             span_id))
                         results.append(cur.rowcount == 1)
                     else:
                         raise ValueError(f"unknown presence op {kind!r}")
@@ -757,6 +764,14 @@ class SharedStore:
                 raise
             return results
         return self._run("apply_presence", op, None, key=f"{len(batch)} ops")
+
+    @staticmethod
+    def _resolve_span_id(raw: Any, results: List[Any]) -> int:
+        if raw == "$prev":
+            _require(bool(results) and isinstance(results[-1], int),
+                     "'$prev' span_id with no preceding open in this batch")
+            return int(results[-1])
+        return int(raw)
 
     def spans_between(self, start: float, end: float,
                       limit: int = MAX_RANGE_ROWS) -> List[dict]:
