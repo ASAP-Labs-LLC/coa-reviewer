@@ -35,6 +35,7 @@ queryable view of it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import queue
@@ -59,7 +60,12 @@ EVENT_KINDS = (
 )
 # Where an observed value came from (field_snapshots.source).
 SOURCES = ("qbench_test", "qbench_info", "qbench_comments", "labvision_test")
+# Sources compared numerically (12 == 12.00). Test results are measurements
+# whose written precision matters, so they compare as exact normalised text.
+NUMERIC_SOURCES = ("qbench_info",)
 EXTERNAL_ACTOR = "Outside COA Reviewer"
+# What observe()/observe_many() return when asked not to wait for a busy writer.
+WRITER_BUSY = "writer-busy"
 SPAN_END_REASONS = ("logout", "timeout", "gap", "restart", "midnight")
 
 MAX_HISTORY = 500          # rows one History tab can show
@@ -73,6 +79,9 @@ MAX_OBSERVE_FIELDS = 500     # fields compared by one observe() call
 MAX_FIELD_NAME = 200         # characters kept of a snapshot's field name
 MAX_NUMERIC_TEXT = 64        # longer strings are never compared as numbers
 SNAPSHOT_REFRESH_SECONDS = 3600.0  # unchanged fields refresh seen_at at most hourly
+MAX_OBSERVE_ITEMS = 2000     # (lab_id, source) items one observe_many() call takes
+MAX_OBSERVE_READ_ROWS = 200_000  # snapshot rows one observe_many() read may return
+CHANGED_AT_SLACK_SECONDS = 60.0  # clock skew allowed around [since, detected_at]
 _WHEN_POLICIES = ("always", "if_judged", "if_absent")
 MAX_SPAN_SECONDS = 86400 + 600  # a span can't outlive one calendar day + slack
 
@@ -126,6 +135,7 @@ CREATE TABLE IF NOT EXISTS field_snapshots (
     field   TEXT NOT NULL,
     value   TEXT,
     seen_at REAL NOT NULL,
+    digest  TEXT,
     PRIMARY KEY (lab_id, source, field)
 );
 CREATE TABLE IF NOT EXISTS meta (
@@ -148,9 +158,9 @@ _UPSERT_VERDICT_SQL = (
 _UPSERT_VERDICT_IF_NEWER_SQL = _UPSERT_VERDICT_SQL + " WHERE verdicts.at <= excluded.at"
 
 _UPSERT_SNAPSHOT_SQL = (
-    "INSERT INTO field_snapshots (lab_id, source, field, value, seen_at)"
-    " VALUES (?,?,?,?,?) ON CONFLICT(lab_id, source, field) DO UPDATE SET"
-    " value=excluded.value, seen_at=excluded.seen_at"
+    "INSERT INTO field_snapshots (lab_id, source, field, value, digest, seen_at)"
+    " VALUES (?,?,?,?,?,?) ON CONFLICT(lab_id, source, field) DO UPDATE SET"
+    " value=excluded.value, digest=excluded.digest, seen_at=excluded.seen_at"
 )
 _INSERT_EVENT_SQL = (
     "INSERT INTO sample_events (lab_id, at, user, kind, field,"
@@ -285,37 +295,58 @@ def _decode_detail(raw: Optional[str]) -> Any:
 _DECIMAL_RE = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)")
 
 
-def _comparable(value: Any) -> Tuple[str, Any]:
+def _full_text(value: Any) -> str:
+    """The whole value as text (not bounded — see ``_digest``)."""
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else json.dumps(value, default=str)
+
+
+def _comparable(value: Any, numeric: bool = True) -> Tuple[str, str]:
     """The comparison key for an observed value (never what is stored).
 
-    Text is bounded to ``MAX_TEXT`` exactly as it is stored, stripped, and
-    internal whitespace collapsed; ``None`` and blank are the same. A plain
-    decimal (≤ ``MAX_NUMERIC_TEXT`` chars) compares as an exact ``Decimal``,
-    so ``12`` == ``12.00`` but ``0.1`` != ``0.10000000000000000001``."""
-    text = " ".join((_as_text(value) or "").split())
-    if len(text) <= MAX_NUMERIC_TEXT and _DECIMAL_RE.fullmatch(text):
+    Stripped, internal whitespace collapsed; ``None`` and blank are the same.
+    With ``numeric``, a plain decimal (≤ ``MAX_NUMERIC_TEXT`` chars) compares
+    as an exact ``Decimal``, so ``12`` == ``12.00`` but ``0.1`` !=
+    ``0.10000000000000000001``. Without it the text must match exactly."""
+    text = " ".join(_full_text(value).split())
+    if numeric and len(text) <= MAX_NUMERIC_TEXT and _DECIMAL_RE.fullmatch(text):
         try:
-            return ("n", Decimal(text))
+            number = Decimal(text)
         except InvalidOperation:   # pragma: no cover - the regex rules it out
-            pass
+            return ("s", text)
+        return ("n", "0" if number == 0 else str(number.normalize()))
     return ("s", text)
 
 
-def same_value(a: Any, b: Any) -> bool:
+def same_value(a: Any, b: Any, numeric: bool = True) -> bool:
     """Whether two observed values are the same after normalisation."""
-    return _comparable(a) == _comparable(b)
+    return _comparable(a, numeric) == _comparable(b, numeric)
 
 
-def _check_snapshot(snap: Any) -> Tuple[str, str, Optional[str]]:
-    """Validate a ``(source, field, value)`` snapshot and bound its text."""
+def _digest(value: Any, source: str) -> str:
+    """sha256 of the whole normalised value. The ``value`` column keeps only
+    ``MAX_TEXT`` characters for display; comparing digests means a change
+    past that point is still seen."""
+    kind, canon = _comparable(value, source in NUMERIC_SOURCES)
+    return hashlib.sha256(f"{kind}:{canon}".encode("utf-8")).hexdigest()
+
+
+def _snapshot_row(lab_id: str, source: str, field: str, value: Any,
+                  seen_at: float) -> tuple:
+    return (lab_id, source, field, _as_text(value), _digest(value, source), seen_at)
+
+
+def _check_snapshot(snap: Any) -> Tuple[str, str, Any]:
+    """Validate a ``(source, field, value)`` snapshot."""
     _require(isinstance(snap, (tuple, list)) and len(snap) == 3,
              f"snapshot must be (source, field, value), got {snap!r}")
     source, field, value = snap
     _require(source in SOURCES, f"unknown snapshot source {source!r}")
-    return source, _require_text(field, "snapshot field")[:MAX_FIELD_NAME], _as_text(value)
+    return source, _require_text(field, "snapshot field")[:MAX_FIELD_NAME], value
 
 
-def _snapshot_list(snapshot: Any) -> List[Tuple[str, str, Optional[str]]]:
+def _snapshot_list(snapshot: Any) -> List[Tuple[str, str, Any]]:
     """``None``, one ``(source, field, value)`` or a list of them."""
     if snapshot is None:
         return []
@@ -324,6 +355,33 @@ def _snapshot_list(snapshot: Any) -> List[Tuple[str, str, Optional[str]]]:
     _require(isinstance(snapshot, list) and len(snapshot) <= MAX_OBSERVE_FIELDS,
              "snapshot must be a tuple or a bounded list of tuples")
     return [_check_snapshot(s) for s in snapshot]
+
+
+def _parse_when(value: Any) -> Optional[float]:
+    """An epoch number or an ISO-ish timestamp (naive = local time) as
+    epoch seconds; ``None`` if it cannot be read."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value or "").strip()
+    if not text or len(text) > 64:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _ensure_snapshot_digest(conn: sqlite3.Connection) -> None:
+    """A database created before ``digest`` existed gets the column (NULL
+    digests are computed from ``value`` when compared)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(field_snapshots)").fetchall()}
+    if "digest" in cols:
+        return
+    try:
+        conn.execute("ALTER TABLE field_snapshots ADD COLUMN digest TEXT")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():   # another connection won
+            raise
 
 
 def _op_label(op: str, key: Optional[str]) -> str:
@@ -401,6 +459,7 @@ class _ReaderPool:
             conn.row_factory = sqlite3.Row
             conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             conn.executescript(_SCHEMA)   # idempotent: guarantees tables exist
+            _ensure_snapshot_digest(conn)
             conn.execute("PRAGMA query_only=1")
         except sqlite3.Error:
             try:
@@ -524,6 +583,7 @@ class SharedStore:
                                self._path, mode)
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(_SCHEMA)
+            _ensure_snapshot_digest(conn)
         except sqlite3.Error:
             try:
                 conn.close()
@@ -645,53 +705,70 @@ class SharedStore:
     # ── run a write under the writer lock ───────────────────────────────────
 
     def _run(self, op: str, fn: Callable[[sqlite3.Connection], T], default: T,
-             key: Optional[str] = None) -> T:
-        """Run ``fn`` under the lock; any sqlite error → WARNING/ERROR +
-        default. BUSY/LOCKED/a bad-query error (CONSTRAINT/MISUSE/RANGE/a
-        plain SQLITE_ERROR) keeps the connection and does not back off;
-        an I/O error drops it; a corrupt file is quarantined (writer
-        dropped first, so our own handle can't block the rename)."""
+             key: Optional[str] = None, *, wait: bool = True, busy: Any = None) -> T:
+        """Run ``fn`` under the writer lock; any sqlite error → WARNING/ERROR +
+        default. With ``wait=False`` a writer already in use by another
+        thread returns ``busy`` at once instead of queueing behind it (a
+        request thread must never block on history).
+
+        BUSY/LOCKED/a bad-query error (CONSTRAINT/MISUSE/RANGE/a plain
+        SQLITE_ERROR) keeps the connection and does not back off; an I/O
+        error drops it; a corrupt file is quarantined (writer dropped first,
+        so our own handle can't block the rename)."""
         started = time.perf_counter()
         label = _op_label(op, key)
-        with self._lock:
-            conn = self._connection()
-            if conn is None:
-                self._last_write_error = "unavailable"
-                return default
-            try:
-                result = fn(conn)
-            except sqlite3.Error as exc:
-                kind = _classify(exc)
-                self._last_write_error = kind if kind in ("busy", "keep", "corrupt") else "io"
-                if kind in ("busy", "keep"):
-                    logger.warning("shared store %s failed (%s): %s", label, kind, exc)
-                    # The connection is kept, so it must not be left inside
-                    # a transaction ``fn`` opened: every later write would
-                    # silently vanish into it.
-                    try:
-                        if conn.in_transaction:
-                            conn.execute("ROLLBACK")
-                    except sqlite3.Error as rb_exc:
-                        logger.warning("shared store %s rollback failed: %s", label, rb_exc)
-                    return default
-                if kind == "corrupt":
-                    self._drop_connection(backoff=False)   # our handle first
-                    if self._quarantine_files():
-                        self._backoff = BACKOFF_START_SECONDS
-                        self._backoff_until = None
-                    else:
-                        self._fail_open(exc)
-                    return default
-                logger.warning("shared store %s failed: %s", label, exc)
-                self._drop_connection(backoff=True)
-                return default
-            self._last_write_error = None
+        if not self._lock.acquire(blocking=wait):
+            logger.debug("shared store %s: writer busy, not waiting", label)
+            return busy
+        try:
+            ok, result = self._run_locked(label, fn, default)
+        finally:
+            self._lock.release()
+        if not ok:
+            return result
         elapsed_ms = (time.perf_counter() - started) * 1000
         if elapsed_ms > SLOW_QUERY_MS:
             logger.info("shared store %s slow: %.1f ms", label, elapsed_ms)
         else:
             logger.debug("shared store %s %.1f ms", label, elapsed_ms)
         return result
+
+    def _run_locked(self, label: str, fn: Callable[[sqlite3.Connection], T],
+                    default: T) -> Tuple[bool, T]:
+        """The body of ``_run``; caller holds ``_lock``. ``(ok, result)``."""
+        conn = self._connection()
+        if conn is None:
+            self._last_write_error = "unavailable"
+            return False, default
+        try:
+            result = fn(conn)
+        except sqlite3.Error as exc:
+            kind = _classify(exc)
+            self._last_write_error = kind if kind in ("busy", "keep", "corrupt") else "io"
+            if kind in ("busy", "keep"):
+                logger.warning("shared store %s failed (%s): %s", label, kind, exc)
+                # The connection is kept, so it must not be left inside
+                # a transaction ``fn`` opened: every later write would
+                # silently vanish into it.
+                try:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                except sqlite3.Error as rb_exc:
+                    logger.warning("shared store %s rollback failed: %s", label, rb_exc)
+                return False, default
+            if kind == "corrupt":
+                self._drop_connection(backoff=False)   # our handle first
+                if self._quarantine_files():
+                    self._backoff = BACKOFF_START_SECONDS
+                    self._backoff_until = None
+                else:
+                    self._fail_open(exc)
+                return False, default
+            logger.warning("shared store %s failed: %s", label, exc)
+            self._drop_connection(backoff=True)
+            return False, default
+        self._last_write_error = None
+        return True, result
 
     # ── run a read against the reader pool ──────────────────────────────────
 
@@ -962,7 +1039,7 @@ class SharedStore:
             rows.append((lab_id, now, _require_text(ev.get("user"), "user"), kind,
                          _as_text(ev.get("field")), _as_text(ev.get("before")),
                          _as_text(ev.get("after")), _encode_detail(ev.get("detail"))))
-            snaps.extend((lab_id, src, fld, val, now)
+            snaps.extend(_snapshot_row(lab_id, src, fld, val, now)
                          for src, fld, val in _snapshot_list(ev.get("snapshot")))
         if not rows:
             return True
@@ -1005,14 +1082,13 @@ class SharedStore:
             return {r["field"]: r["value"] for r in rows}
         return self._run_read("snapshots", op, None, key=lab_id)
 
-    def update_snapshots(self, lab_id: str, source: str, values: Dict[str, Any]) -> bool:
-        """Record values COA Reviewer itself wrote, with no history row —
-        for a queued write whose history row was written when it was queued
-        (comments: the snapshot moves only once QBench confirms)."""
+    def update_snapshots(self, lab_id: str, source: str, values: Dict[str, Any], *,
+                         seen_at: Optional[float] = None) -> bool:
+        """Record values COA Reviewer itself wrote, with no history row."""
         lab_id = _require_text(lab_id, "lab_id")
         _require(isinstance(values, dict), "values must be a dict")
-        now = self._now()
-        rows = [(lab_id, *_check_snapshot((source, f, v)), now)
+        when = self._now() if seen_at is None else _require_float(seen_at, "seen_at")
+        rows = [_snapshot_row(lab_id, *_check_snapshot((source, f, v)), when)
                 for f, v in list(values.items())[:MAX_OBSERVE_FIELDS]]
 
         def op(c: sqlite3.Connection) -> bool:
@@ -1022,118 +1098,212 @@ class SharedStore:
 
     def observe(self, lab_id: str, source: str, values: Dict[str, Any], *,
                 seen_at: Optional[float] = None, actor_hint: Optional[str] = None,
-                changed_at: Any = None,
-                field_meta: Optional[Dict[str, dict]] = None) -> Optional[int]:
-        """Compare what a read just saw with the snapshot and record every
-        field that changed without COA Reviewer as an ``external_change``.
+                changed_at: Any = None, field_meta: Optional[Dict[str, dict]] = None,
+                wait: bool = True) -> Any:
+        """Compare what a read saw with the snapshot; record every field that
+        changed without COA Reviewer as an ``external_change``.
 
-        A field never seen before is stored silently as the baseline. The
-        comparison runs on a reader first; the writer is opened only when
-        something differs, is new, or has a ``seen_at`` older than
-        ``SNAPSHOT_REFRESH_SECONDS`` — so the common case (nothing changed)
-        is one indexed read and no write. The writer re-compares inside its
-        transaction, so an own edit that lands in between is not reported.
+        ``seen_at`` is when the read *started* (default now): a snapshot
+        confirmed after that is newer knowledge than the read, so the field
+        is skipped — neither recorded nor overwritten. A field never seen is
+        stored silently as the baseline. ``field_meta`` is ``{field:
+        {"label", "actor", "changed_at"}}``: ``label`` is the text the
+        history shows for a key like ``test:9``; ``actor``/``changed_at``
+        override the call-wide ``actor_hint``/``changed_at``. A
+        ``changed_at`` outside [previous sighting, now] is dropped.
 
-        ``actor_hint``/``changed_at`` apply to every field; ``field_meta``
-        (``{field: {"actor":…, "changed_at":…}}``) overrides them per field.
-        Returns how many changes were recorded, or ``None`` on failure."""
+        Returns the number of changes recorded, ``None`` on failure, or
+        ``WRITER_BUSY`` when ``wait`` is False and the writer was in use."""
+        out = self.observe_many([{
+            "lab_id": lab_id, "source": source, "values": values, "seen_at": seen_at,
+            "actor_hint": actor_hint, "changed_at": changed_at,
+            "field_meta": field_meta}], wait=wait)
+        if out is None or out == WRITER_BUSY:
+            return out
+        return out.get(str(lab_id).strip(), 0)
+
+    def observe_many(self, items: List[dict], *, wait: bool = True) -> Any:
+        """``observe`` for many (lab_id, source) items at once: ONE reader
+        acquisition (one SELECT per source per ≤ ``MAX_BATCH`` lab ids) and,
+        only if something is new, different or stale, one writer transaction
+        per ≤ ``MAX_BATCH`` items. The writer re-checks inside its
+        transaction, so a concurrent own edit or observer is never counted.
+
+        Returns ``{lab_id: changes}`` for lab ids with changes (``{}`` when
+        nothing changed), ``None`` on failure, or ``WRITER_BUSY``."""
         started = time.perf_counter()
-        lab_id = _require_text(lab_id, "lab_id")
-        _require(source in SOURCES, f"unknown source {source!r}")
-        fields = self._observed_fields(lab_id, source, values)
-        if not fields:
-            return 0
-        now = self._now() if seen_at is None else _require_float(seen_at, "seen_at")
-        names = list(fields)
-        known = self._run_read("observe", lambda c: self._snapshot_rows(
-            c, lab_id, source, names), None, key=lab_id)
+        _require(isinstance(items, list), "items must be a list")
+        _require(len(items) <= MAX_OBSERVE_ITEMS,
+                 f"at most {MAX_OBSERVE_ITEMS} items per call, got {len(items)}")
+        prepared = [p for p in (self._prepare_observe(it) for it in items) if p["fields"]]
+        if not prepared:
+            return {}
+        known = self._run_read("observe", lambda c: self._read_snapshots(c, prepared), None,
+                               key=f"{len(prepared)} item(s)")
         if known is None:
             return None
-        todo = self._observe_todo(fields, known, now)
+        todo = [(p, names) for p in prepared
+                for names in [self._observe_todo(p, known.get((p["lab_id"], p["source"]), {}))]
+                if names]
         if not todo:
-            logger.debug("observe %s/%s: %d field(s) unchanged, %.1f ms", lab_id, source,
-                         len(fields), (time.perf_counter() - started) * 1000)
-            return 0
-        ctx = {"lab_id": lab_id, "source": source, "now": now, "actor": actor_hint,
-               "changed_at": changed_at, "meta": field_meta or {}}
-        n = self._run("observe", lambda c: self._in_tx(
-            c, lambda: self._observe_tx(c, ctx, {f: fields[f] for f in todo})),
-            None, key=lab_id)
-        if n:
-            logger.info("external changes detected: %s %s n=%d", lab_id, source, n)
-        logger.debug("observe %s/%s: %d field(s), %d written, %s change(s), %.1f ms",
-                     lab_id, source, len(fields), len(todo), n,
+            logger.debug("observe: %d item(s) unchanged, %.1f ms", len(prepared),
+                         (time.perf_counter() - started) * 1000)
+            return {}
+        counts = self._observe_write(todo, wait)
+        if counts is None or counts == WRITER_BUSY:
+            return counts
+        for lab_id, n in counts.items():
+            logger.info("external changes detected: %s n=%d", lab_id, n)
+        logger.debug("observe: %d item(s), %d written, %d changed lab id(s), %.1f ms",
+                     len(prepared), len(todo), len(counts),
                      (time.perf_counter() - started) * 1000)
-        return n
+        return counts
+
+    def _prepare_observe(self, it: dict) -> dict:
+        _require(isinstance(it, dict), "an observe item must be a dict")
+        lab_id = _require_text(it.get("lab_id"), "lab_id")
+        source = it.get("source")
+        _require(source in SOURCES, f"unknown source {source!r}")
+        seen_at = it.get("seen_at")
+        meta = it.get("field_meta") or {}
+        _require(isinstance(meta, dict), "field_meta must be a dict")
+        return {"lab_id": lab_id, "source": source,
+                "fields": self._observed_fields(lab_id, source, it.get("values")),
+                "seen_at": self._now() if seen_at is None else _require_float(seen_at, "seen_at"),
+                "actor": it.get("actor_hint"), "changed_at": it.get("changed_at"),
+                "meta": meta}
 
     @staticmethod
-    def _observed_fields(lab_id: str, source: str,
-                         values: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    def _observed_fields(lab_id: str, source: str, values: Any) -> Dict[str, Any]:
         _require(isinstance(values, dict), "values must be a dict")
         items = list(values.items())
         if len(items) > MAX_OBSERVE_FIELDS:
             logger.warning("observe %s/%s: fields capped from %d to %d", lab_id, source,
                            len(items), MAX_OBSERVE_FIELDS)
             items = items[:MAX_OBSERVE_FIELDS]
-        out: Dict[str, Optional[str]] = {}
+        out: Dict[str, Any] = {}
         for field, value in items:
             name = str(field or "").strip()[:MAX_FIELD_NAME]
             if name:
-                out[name] = _as_text(value)
+                out[name] = value
         return out
+
+    @staticmethod
+    def _read_snapshots(c: sqlite3.Connection,
+                        prepared: List[dict]) -> Dict[Tuple[str, str], Dict[str, sqlite3.Row]]:
+        by_source: Dict[str, List[str]] = {}
+        for p in prepared:
+            by_source.setdefault(p["source"], []).append(p["lab_id"])
+        out: Dict[Tuple[str, str], Dict[str, sqlite3.Row]] = {}
+        for source, lab_ids in by_source.items():
+            ids = sorted(set(lab_ids))
+            for start in range(0, len(ids), MAX_BATCH):
+                chunk = ids[start:start + MAX_BATCH]
+                rows = c.execute(
+                    f"SELECT lab_id, field, value, digest, seen_at FROM field_snapshots"
+                    f" WHERE source=? AND lab_id IN ({','.join('?' * len(chunk))}) LIMIT ?",
+                    [source, *chunk, MAX_OBSERVE_READ_ROWS]).fetchall()
+                if len(rows) == MAX_OBSERVE_READ_ROWS:
+                    logger.warning("observe: snapshot read capped at %d rows; the writer"
+                                   " re-checks the rest", MAX_OBSERVE_READ_ROWS)
+                for r in rows:
+                    out.setdefault((r["lab_id"], source), {})[r["field"]] = r
+        return out
+
+    @staticmethod
+    def _stored_digest(row: sqlite3.Row, source: str) -> str:
+        return row["digest"] or _digest(row["value"], source)
+
+    def _observe_todo(self, p: dict, known: Dict[str, sqlite3.Row]) -> List[str]:
+        """Fields that need the writer: new, different, or stale — never one
+        whose snapshot is newer than the read."""
+        todo = []
+        for name, value in p["fields"].items():
+            row = known.get(name)
+            if row is None:
+                todo.append(name)
+            elif float(row["seen_at"]) > p["seen_at"]:
+                logger.debug("observe %s/%s/%s: read is older than its snapshot, skipped",
+                             p["lab_id"], p["source"], name)
+            elif (self._stored_digest(row, p["source"]) != _digest(value, p["source"])
+                    or p["seen_at"] - float(row["seen_at"]) >= SNAPSHOT_REFRESH_SECONDS):
+                todo.append(name)
+        return todo
+
+    def _observe_write(self, todo: List[Tuple[dict, List[str]]], wait: bool) -> Any:
+        counts: Dict[str, int] = {}
+        for start in range(0, len(todo), MAX_BATCH):
+            chunk = todo[start:start + MAX_BATCH]
+            got = self._run("observe", lambda c, chunk=chunk: self._in_tx(
+                c, lambda: self._observe_tx(c, chunk)), None,
+                key=f"{len(chunk)} item(s)", wait=wait, busy=WRITER_BUSY)
+            if got is None or got == WRITER_BUSY:
+                return got
+            for lab_id, n in got.items():
+                counts[lab_id] = counts.get(lab_id, 0) + n
+        return counts
+
+    def _observe_tx(self, c: sqlite3.Connection,
+                    chunk: List[Tuple[dict, List[str]]]) -> Dict[str, int]:
+        detected_at = self._now()
+        counts: Dict[str, int] = {}
+        for p, names in chunk:
+            known = self._snapshot_rows(c, p["lab_id"], p["source"], names)
+            for name in names:
+                if self._observe_field_tx(c, p, name, known.get(name), detected_at):
+                    counts[p["lab_id"]] = counts.get(p["lab_id"], 0) + 1
+        return counts
+
+    def _observe_field_tx(self, c: sqlite3.Connection, p: dict, name: str,
+                          row: Optional[sqlite3.Row], detected_at: float) -> bool:
+        """One field inside the writer's transaction; True if it changed."""
+        lab_id, source, seen_at = p["lab_id"], p["source"], p["seen_at"]
+        value = p["fields"][name]
+        if row is not None and float(row["seen_at"]) > seen_at:
+            logger.debug("observe %s/%s/%s: read is older than its snapshot, skipped",
+                         lab_id, source, name)
+            return False
+        digest = _digest(value, source)
+        if row is not None and self._stored_digest(row, source) == digest:
+            if seen_at - float(row["seen_at"]) >= SNAPSHOT_REFRESH_SECONDS or not row["digest"]:
+                c.execute("UPDATE field_snapshots SET seen_at=?, digest=? WHERE lab_id=?"
+                          " AND source=? AND field=?", (seen_at, digest, lab_id, source, name))
+            return False
+        if row is not None:
+            c.execute(_INSERT_EVENT_SQL, self._external_row(p, name, row, value, detected_at))
+        c.execute(_UPSERT_SNAPSHOT_SQL, _snapshot_row(lab_id, source, name, value, seen_at))
+        return row is not None
 
     @staticmethod
     def _snapshot_rows(c: sqlite3.Connection, lab_id: str, source: str,
                        names: List[str]) -> Dict[str, sqlite3.Row]:
         """Snapshot rows for ``names`` (≤ MAX_OBSERVE_FIELDS < MAX_BATCH)."""
         marks = ",".join("?" * len(names))
-        rows = c.execute(f"SELECT field, value, seen_at FROM field_snapshots WHERE"
+        rows = c.execute(f"SELECT field, value, digest, seen_at FROM field_snapshots WHERE"
                          f" lab_id=? AND source=? AND field IN ({marks})",
                          [lab_id, source, *names]).fetchall()
         return {r["field"]: r for r in rows}
 
     @staticmethod
-    def _observe_todo(fields: Dict[str, Optional[str]], known: Dict[str, sqlite3.Row],
-                      now: float) -> List[str]:
-        """Fields that need the writer: new, different, or stale."""
-        todo = []
-        for name, value in fields.items():
-            row = known.get(name)
-            if (row is None or not same_value(row["value"], value)
-                    or now - float(row["seen_at"]) >= SNAPSHOT_REFRESH_SECONDS):
-                todo.append(name)
-        return todo
-
-    def _observe_tx(self, c: sqlite3.Connection, ctx: dict,
-                    todo: Dict[str, Optional[str]]) -> int:
-        lab_id, source, now = ctx["lab_id"], ctx["source"], ctx["now"]
-        known = self._snapshot_rows(c, lab_id, source, list(todo))
-        changes = 0
-        for name, value in todo.items():
-            row = known.get(name)
-            if row is not None and same_value(row["value"], value):
-                if now - float(row["seen_at"]) >= SNAPSHOT_REFRESH_SECONDS:
-                    c.execute("UPDATE field_snapshots SET seen_at=? WHERE lab_id=?"
-                              " AND source=? AND field=?", (now, lab_id, source, name))
-                continue
-            if row is not None:
-                c.execute(_INSERT_EVENT_SQL, self._external_row(ctx, name, row, value))
-                changes += 1
-            c.execute(_UPSERT_SNAPSHOT_SQL, (lab_id, source, name, value, now))
-        return changes
-
-    @staticmethod
-    def _external_row(ctx: dict, name: str, row: sqlite3.Row,
-                      value: Optional[str]) -> tuple:
-        meta = ctx["meta"].get(name) or {}
-        actor = str(meta.get("actor") or ctx["actor"] or "").strip() or EXTERNAL_ACTOR
-        detail: Dict[str, Any] = {"source": ctx["source"], "since": row["seen_at"],
-                                  "detected_at": ctx["now"]}
-        changed_at = meta.get("changed_at") or ctx["changed_at"]
+    def _external_row(p: dict, name: str, row: sqlite3.Row, value: Any,
+                      detected_at: float) -> tuple:
+        meta = p["meta"].get(name) or {}
+        actor = str(meta.get("actor") or p["actor"] or "").strip() or EXTERNAL_ACTOR
+        since = float(row["seen_at"])
+        detail: Dict[str, Any] = {"source": p["source"], "key": name, "since": since,
+                                  "detected_at": detected_at}
+        changed_at = meta.get("changed_at") or p["changed_at"]
         if changed_at:
-            detail["changed_at"] = changed_at
-        return (ctx["lab_id"], ctx["now"], actor, "external_change", name,
-                row["value"], value, _encode_detail(detail))
+            when = _parse_when(changed_at)
+            if (when is not None and since - CHANGED_AT_SLACK_SECONDS <= when
+                    <= detected_at + CHANGED_AT_SLACK_SECONDS):
+                detail["changed_at"] = changed_at
+            else:
+                logger.debug("observe %s/%s: changed_at %r outside [%s, %s], dropped",
+                             p["lab_id"], name, changed_at, since, detected_at)
+        label = str(meta.get("label") or name)[:MAX_FIELD_NAME]
+        return (p["lab_id"], detected_at, actor, "external_change", label,
+                row["value"], _as_text(value), _encode_detail(detail))
 
     def history(self, lab_id: str, limit: int = 200) -> List[dict]:
         lab_id = _require_text(lab_id, "lab_id")
