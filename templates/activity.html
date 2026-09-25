@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Time online · COA Reviewer</title>
+    <!-- app.css carries the colour tokens, the dark palette (body.dark) and
+         the theme pips; activity.css only lays this page out on top of them. -->
+    <link rel="stylesheet" href="/static/css/app.css">
+    <link rel="stylesheet" href="/static/css/activity.css">
+</head>
+<body class="activity-page">
+    <header class="act-top">
+        <div class="act-top-inner">
+            <a class="act-back" href="/">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+                <span>Back to review</span>
+            </a>
+            <div class="act-top-right">
+                <span id="act-updated" class="act-updated" aria-live="polite"></span>
+                <!-- Same pip strip and localStorage "theme" key as the review
+                     screen, so switching theme on either page agrees. -->
+                <div class="theme-pips" role="group" aria-label="Color theme">
+                    <button class="theme-pip" data-theme="system" title="Match system" aria-label="Auto">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <circle cx="12" cy="12" r="9"/>
+                            <path d="M12 3 v18"/>
+                            <path d="M12 3 a9 9 0 0 0 0 18" fill="currentColor" stroke="none"/>
+                        </svg>
+                    </button>
+                    <button class="theme-pip" data-theme="light" title="Light" aria-label="Light">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <circle cx="12" cy="12" r="4"/>
+                            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+                        </svg>
+                    </button>
+                    <button class="theme-pip" data-theme="dark" title="Dark" aria-label="Dark">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" fill="currentColor" stroke="none"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="act-main">
+        <section class="act-head" aria-label="Day">
+            <div class="act-titles">
+                <h1 class="act-title">Time online</h1>
+                <p id="act-date-label" class="act-date">&nbsp;</p>
+            </div>
+            <nav class="act-stepper" aria-label="Choose a day">
+                <button id="act-prev" class="act-step" type="button" aria-label="Previous day" title="Previous day (←)">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+                </button>
+                <label class="act-pick" title="Pick a day">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>
+                    <span id="act-pick-text">Pick a day</span>
+                    <input id="act-date-input" type="date" aria-label="Pick a day">
+                </label>
+                <button id="act-next" class="act-step" type="button" aria-label="Next day" title="Next day (→)">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>
+                </button>
+                <button id="act-today" class="act-today" type="button" hidden>Today</button>
+            </nav>
+        </section>
+
+        <div id="activity-root" class="act-root" aria-busy="true">
+            <p class="act-loading">Loading…</p>
+        </div>
+    </main>
+
+    <div id="act-card" class="act-card" role="tooltip" hidden></div>
+
+    <!-- Which build is running, bottom-right, same as the review screen. -->
+    <div id="app-version" aria-hidden="true">v{{ app_version|default("dev", true)|replace("v", "", 1) }}</div>
+
+    <script src="/static/js/activity.js"></script>
+</body>
+</html>
