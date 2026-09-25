@@ -20,7 +20,6 @@ body.activity-page {
     --act-col-min: 104px;
     --act-col-max: 176px;
     --act-bar: 40px;
-    --act-block: 12px;
     --act-ink: color-mix(in srgb, var(--text) 78%, transparent);
     --act-soft: var(--bg-active);
     --act-pad: 32px;
@@ -272,7 +271,7 @@ body.dark .act-panel { border-color: var(--border); background: #141414; }
 .act-legend span { display: inline-flex; align-items: center; gap: 7px; }
 .lg { display: inline-block; flex: none; }
 .lg-span  { width: 14px; height: 10px; border-radius: 3px; background: var(--act-soft); box-shadow: inset 0 0 0 1px var(--border); }
-.lg-block { width: 5px; height: 12px; border-radius: 2px; background: var(--act-ink); }
+.lg-block { width: 14px; height: 10px; border-radius: 3px; background: var(--act-ink); }
 .lg-live  { width: 7px; height: 7px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px var(--good-soft); }
 
 /* Only the chart scrolls sideways — never the page. */
@@ -476,22 +475,28 @@ body.dark .act-span { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09); }
 }
 .act-span:focus-visible { box-shadow: inset 0 0 0 1px var(--border-strong), var(--ring); }
 
-/* Making changes: a narrow solid ink bar over the capsule */
+/* Making changes: a solid ink bar filling the capsule (3px inset), at
+   least 10px tall so even a single change is plainly visible. */
 .act-block {
     position: absolute;
     left: 50%;
-    width: var(--act-block);
-    min-height: 3px;
+    width: calc(var(--act-bar) - 8px);
+    min-height: 10px;
     transform: translateX(-50%);
-    border-radius: 3px;
+    border-radius: 6px;
     background: var(--act-ink);
     z-index: 2;
     cursor: default;
     outline: none;
-    transition: width var(--t-fast) var(--ease-out), background-color var(--t-fast) var(--ease-std);
+    transition: background-color var(--t-fast) var(--ease-std);
+}
+/* Changes with no sign-in around them still get a full-width pill. */
+.act-block.is-standalone {
+    width: var(--act-bar);
+    border-radius: 9px;
 }
 .act-block:hover,
-.act-block:focus-visible { width: calc(var(--act-block) + 6px); background: var(--text); }
+.act-block:focus-visible { background: var(--text); }
 .act-block:focus-visible { box-shadow: var(--ring); }
 
 /* Still signed in: the live (bottom, "now") end gets the green dot. */
@@ -607,7 +612,6 @@ body.dark .act-gate-mark { background: rgba(255, 255, 255, 0.06); }
         --act-hour: 38px;
         --act-col-min: 84px;
         --act-bar: 32px;
-        --act-block: 10px;
     }
     .act-main { padding-top: 24px; }
     .act-title { font-size: 24px; }

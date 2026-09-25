@@ -147,6 +147,11 @@ function hourOf(ts) {
     return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
 }
 
+function hourPx() {
+    const v = parseFloat(getComputedStyle(document.body).getPropertyValue("--act-hour"));
+    return v > 0 ? v : 46;
+}
+
 function hourLabel(h) {
     if (h === 0 || h === 24) return "12 AM";
     if (h === 12) return "Noon";
@@ -443,6 +448,30 @@ function stats(data) {
     </section>`;
 }
 
+// Editing blocks as drawn: the server already joins changes within two
+// 5-minute bins; the chart is more generous and joins blocks less than
+// 15 minutes apart, so a working stretch reads as one solid run. A block
+// that overlaps no signed-in span is flagged so it's drawn standalone.
+const MERGE_GAP_SECONDS = 900;
+function displayBlocks(u) {
+    if (u._display) return u._display;
+    const merged = [];
+    for (const b of (u.blocks || []).slice().sort((x, y) => x.start - y.start)) {
+        const last = merged[merged.length - 1];
+        if (last && b.start - last.end < MERGE_GAP_SECONDS) {
+            last.end = Math.max(last.end, b.end);
+            last.count += b.count;
+        } else {
+            merged.push({ start: b.start, end: b.end, count: b.count });
+        }
+    }
+    for (const b of merged) {
+        b.standalone = !(u.spans || []).some(s => b.start < s.end && b.end > s.start);
+    }
+    u._display = merged;
+    return merged;
+}
+
 function chart(data) {
     const b = data.bounds || { start_hour: 6, end_hour: 22 };
     const start = Math.max(0, Math.min(23, b.start_hour | 0));
@@ -475,7 +504,7 @@ function chart(data) {
             now = `<div class="act-future" style="top:${top}%"></div><div class="act-now" style="top:${top}%"></div>`;
             nowTag = `<span class="act-now-tag" style="top:${top}%">${escapeHtml(clock(nowTs))}</span>`;
             labels = labels.replace(/<span class="act-hlabel" style="top:([\d.]+)%">/g, (m, t) =>
-                Math.abs(+t - top) < (45 / span) ? `<span class="act-hlabel is-hidden" style="top:${t}%">` : m);
+                Math.abs(+t - top) * span / 100 * hourPx() < 11 ? `<span class="act-hlabel is-hidden" style="top:${t}%">` : m);
         }
     }
 
@@ -486,7 +515,7 @@ function chart(data) {
         return `<div class="act-colhead${live ? " is-live" : ""}" data-u="${ui}">
             <span class="act-avatar" aria-hidden="true">${escapeHtml(initials(u.user))}${live ? `<i class="act-avatar-dot"></i>` : ""}</span>
             <span class="act-name" title="${nameHtml}">${nameHtml}</span>
-            <span class="act-total">${escapeHtml(duration(t.online_seconds || 0))}</span>
+            <span class="act-total">${t.online_seconds ? escapeHtml(duration(t.online_seconds)) : "no sign-in recorded"}</span>
             <span class="act-total act-total-sub">${t.changes ? escapeHtml(plural(t.changes, "change", "changes")) : "no changes"}</span>
         </div>`;
     }).join("");
@@ -502,10 +531,10 @@ function chart(data) {
                 data-u="${ui}" data-s="${si}" aria-label="${escapeHtml(label)}"
                 style="top:${top}%;height:${Math.max(0, bottom - top)}%">${openLive ? `<i class="act-open-dot" aria-hidden="true"></i>` : ""}</div>`;
         }).join("");
-        const blocks = (u.blocks || []).map((bk, bi) => {
+        const blocks = displayBlocks(u).map((bk, bi) => {
             const top = pct(bk.start), bottom = pct(bk.end);
             const label = u.user + `, making changes ${clockRange(bk.start, bk.end)}, ${plural(bk.count, "change", "changes")}`;
-            return `<div class="act-block" tabindex="0" role="img"
+            return `<div class="act-block${bk.standalone ? " is-standalone" : ""}" tabindex="0" role="img"
                 data-u="${ui}" data-b="${bi}" aria-label="${escapeHtml(label)}"
                 style="top:${top}%;height:${Math.max(0, bottom - top)}%"></div>`;
         }).join("");
@@ -547,11 +576,11 @@ function cardHtml(el) {
     const head = `<p class="c-name">${nameHtml}${live ? `<span class="c-live"><i></i>Online now</span>` : ""}</p>`;
 
     if (el.dataset.b != null) {
-        const bk = (u.blocks || [])[+el.dataset.b];
+        const bk = displayBlocks(u)[+el.dataset.b];
         if (!bk) return "";
         return `${head}
             <p class="c-main">${escapeHtml(clockRange(bk.start, bk.end))} · ${escapeHtml(plural(bk.count, "change", "changes"))}</p>
-            <p class="c-sub">Making changes</p>`;
+            <p class="c-sub">${bk.standalone ? "Making changes (no sign-in recorded around these)" : "Making changes"}</p>`;
     }
 
     const s = (u.spans || [])[+el.dataset.s];
