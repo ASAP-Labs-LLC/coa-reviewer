@@ -1939,3 +1939,22 @@ fails; the next get_tab re-applies good and her uncheck silently reverts).
   `sample_event`.
 - Tests: failed apply_mark then get_tab does not revert; retry succeeds later and
   the history row appears; bounded size.
+
+### Task 6 — pending writes are timestamped (store critic, final pass)
+
+A retry must never overwrite newer work. So:
+- `SharedStore.apply_mark(..., at: Optional[float] = None)` — the original mark
+  time (default now). The verdict upsert is conditional:
+  `ON CONFLICT(lab_id, mode) DO UPDATE SET … WHERE verdicts.at <= excluded.at`.
+  If a newer verdict exists, the verdict is left alone but the history row is
+  still inserted at the original `at` (with `before` = the verdict that was in
+  force at that time if cheaply knowable, else the current one, and
+  `detail.superseded = true`). Return value adds `"applied": bool`.
+- In `_run`'s busy/keep branch: `if conn.in_transaction: conn.execute("ROLLBACK")`.
+- `PendingVerdicts` entries carry `at`. In `get_tab` and fan-out a pending entry
+  wins only when `pending.at > store_verdict.at` (or no store verdict).
+- Any successful `apply_mark` on a (lab_id, mode) removes an older pending entry
+  for it.
+- Test: Dana's write fails at 10:00 → Sam marks Bad at 10:05 (succeeds) → retry
+  of Dana's 10:00 uncheck → Sam's Bad survives, history shows Dana's uncheck at
+  10:00 flagged superseded, and get_tab shows Bad.
