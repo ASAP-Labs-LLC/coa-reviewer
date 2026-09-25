@@ -57,6 +57,7 @@ import hashlib
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import shutil
@@ -400,7 +401,13 @@ def _read_switch_marker(path: Path) -> Tuple[Optional[dict], str]:
         return None, "malformed switch request"
     tag, at = doc.get("tag"), doc.get("at")
     valid_tag = isinstance(tag, str) and 0 < len(tag) <= MAX_TAG_LEN
-    valid_at = isinstance(at, (int, float)) and not isinstance(at, bool)
+    # NaN/Infinity are valid JSON numbers to Python's parser (it accepts the
+    # non-standard tokens) and would otherwise sail through the age check
+    # below: `now - nan` and `now - inf` are never inside any bound, but
+    # `age < x or age > y` is False for both when age is NaN, so the naive
+    # comparison would treat a NaN age as "fresh". isfinite() closes that.
+    valid_at = (isinstance(at, (int, float)) and not isinstance(at, bool)
+               and math.isfinite(at))
     if not valid_tag or not valid_at:
         return doc, "malformed switch request"
     return doc, ""
@@ -473,12 +480,14 @@ def _refuse_switch_request(app: "App", *, tag: Optional[str], at: Optional[float
         return reason
     now = time.time()
     age = now - float(at)
-    if age < -5.0 or age > MAX_REQUEST_AGE_SECONDS:
+    if not (-5.0 <= age <= MAX_REQUEST_AGE_SECONDS):
         return f"stale request (age {age:.0f}s)"
     ok, why = may_switch(staged=staged, requested_tag=tag or "")
     if not ok:
         return why
     canonical = (staged or {}).get("tag")
+    if not canonical or not (app.releases_dir / canonical).is_dir():
+        return "staged release folder is missing"
     if not differs_from(app.current_version(), canonical):
         return "already on this release"
     cached = _LATEST_CACHE.get(app.name)
@@ -493,17 +502,23 @@ def _refuse_switch_request(app: "App", *, tag: Optional[str], at: Optional[float
 
 def _claim_marker(path: Path, dest: Path, payload: dict) -> bool:
     """Turn the marker into its outcome file, atomically, then fill in its
-    content.
+    content, also atomically.
 
-    The rename comes first and never writes into ``path`` beforehand — a
-    failed attempt must leave the marker byte-for-byte and mtime-for-mtime
-    unchanged, because the caller uses its mtime to recognise "already tried
-    and failed to claim this exact file" and skip it on the next tick rather
-    than retrying forever. On a rename failure (e.g. a Windows sharing
-    violation from a process still holding the file) fall back to deleting
-    the marker, so the request is still consumed at the cost of the audit
-    file. If even deletion fails, return False — the caller remembers this
-    exact file and leaves it alone."""
+    Two separate atomic steps, deliberately: the rename comes first and never
+    writes into ``path`` beforehand — a failed attempt must leave the marker
+    byte-for-byte and mtime-for-mtime unchanged, because the caller uses its
+    mtime to recognise "already tried and failed to claim this exact file"
+    and skip it on the next tick rather than retrying forever. On a rename
+    failure (e.g. a Windows sharing violation from a process still holding
+    the file) fall back to deleting the marker, so the request is still
+    consumed at the cost of the audit file. If even deletion fails, return
+    False — the caller remembers this exact file and leaves it alone.
+
+    Once renamed, the content is filled in via a temp file plus
+    ``os.replace`` rather than an in-place ``write_text`` — otherwise a
+    reader polling ``read_switch_outcome`` at exactly the wrong moment could
+    see the file mid-truncation: the stale marker content, or briefly empty.
+    """
     try:
         os.replace(path, dest)
     except OSError as exc:
@@ -516,11 +531,17 @@ def _claim_marker(path: Path, dest: Path, payload: dict) -> bool:
             log.warning("[claim] could not remove %s either (%s); leaving it — "
                        "it will not be retried", path, exc2)
             return False
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        dest.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, dest)
     except OSError as exc:
         log.warning("[claim] claimed %s but could not write its outcome content: %s",
                    dest.name, exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
     return True
 
 
@@ -1217,6 +1238,19 @@ def rollback(app: App) -> bool:
     return False
 
 
+def cli_switch(app: App, tag: str, *, force: bool = False) -> bool:
+    """What the CLI ``switch`` command does for one app.
+
+    The hold on ``tag`` (if any, from an earlier rollback) is cleared only
+    *after* ``switch`` reports success — clearing it up front would un-hold a
+    known-bad release even if this attempt also fails, leaving the next
+    automatic restart-time request free to walk right back into it."""
+    ok = switch(app, tag, force=force)
+    if ok:
+        release_tag(app.data_dir, tag)
+    return ok
+
+
 def _stop_app(app: App) -> None:
     sup = _load_supervisor()
     subprocess.run(["taskkill", "/F", "/FI", f"WINDOWTITLE eq {app.name}"],
@@ -1391,6 +1425,10 @@ def try_auto_switch(app: App, *, latest: Optional[str]) -> bool:
     staged = read_staged(app.data_dir)
     if not staged or is_paused(app.data_dir):
         return False
+    if _is_held(app.data_dir, staged.get("tag")):
+        log.info("[%s] not auto-switching to %s: held (rolled back from before)",
+                 app.name, staged.get("tag"))
+        return False
     health = _http_get_json(f"http://127.0.0.1:{app.port}/healthz")
     ok, why = should_auto_switch(
         enabled=app.auto_switch, staged=staged, current=app.current_version(),
@@ -1510,11 +1548,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log.warning("--force: skipping the staged/healthy guard. The "
                         "post-switch health check and automatic rollback still "
                         "apply — those are not bypassable.")
-        # A person is explicitly choosing this tag; any earlier automatic
-        # hold on it (from a rollback) must not block their own decision.
-        for a in chosen:
-            release_tag(a.data_dir, args.tag)
-        return 0 if all(switch(a, args.tag, force=args.force) for a in chosen) else 1
+        return 0 if all(cli_switch(a, args.tag, force=args.force) for a in chosen) else 1
 
     if args.command == "rollback":
         return 0 if all(rollback(a) for a in chosen) else 1

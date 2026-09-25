@@ -141,9 +141,21 @@ def withdraw_switch_request(data_dir: Path | str) -> bool:
 
 def read_switch_outcome(data_dir: Path | str) -> Optional[dict]:
     """What the updater did with the last switch request, or ``None`` if it
-    has not claimed one (yet, or ever). ``{"state": "accepted"|"refused",
-    ...}``. If both files somehow exist, ``refused`` wins — that is the safer
-    thing for a caller to believe if the picture is ambiguous."""
+    has not claimed one (yet, or ever).
+
+    ``{"state": "accepted"|"refused", "tag", "by", "at", ...}`` — ``at`` is
+    the original request's timestamp (not when it was claimed), so a caller
+    polling this can match the outcome back to the request it made. If both
+    files somehow exist, ``refused`` wins — that is the safer thing for a
+    caller to believe if the picture is ambiguous.
+
+    The updater claims a marker in two atomic steps (rename, then a
+    temp-file-plus-replace to fill in the content), so a poller can land
+    between them and see the file unreadable, empty or briefly holding the
+    pre-claim marker's content. That is an ordinary, expected race — not
+    something to warn about — so it logs at DEBUG and the caller is expected
+    to poll again a moment later.
+    """
     data_dir = Path(data_dir)
     for name, state in ((REFUSED_FILE, "refused"), (ACCEPTED_FILE, "accepted")):
         try:
@@ -151,12 +163,15 @@ def read_switch_outcome(data_dir: Path | str) -> Optional[dict]:
         except FileNotFoundError:
             continue
         except (OSError, UnicodeDecodeError) as exc:
-            logger.warning("could not read %s: %s", name, exc)
+            logger.debug("could not read %s (will retry): %s", name, exc)
+            continue
+        if not raw.strip():
+            logger.debug("%s is empty (will retry)", name)
             continue
         try:
             doc = json.loads(raw)
         except ValueError as exc:
-            logger.warning("corrupt %s: %s", name, exc)
+            logger.debug("%s not yet valid JSON (will retry): %s", name, exc)
             continue
         if not isinstance(doc, dict):
             continue

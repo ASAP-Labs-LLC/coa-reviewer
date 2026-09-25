@@ -132,6 +132,9 @@ def test_read_switch_outcome_accepted(tmp_path):
         json.dumps({"tag": "v4.0.0", "by": "x", "at": 1.0, "accepted_at": 2.0}))
     got = read_switch_outcome(tmp_path)
     assert got["state"] == "accepted" and got["tag"] == "v4.0.0"
+    # `at` is the original request's timestamp, not accepted_at — the app
+    # uses it to match this outcome back to the request it made.
+    assert got["at"] == 1.0
 
 
 def test_read_switch_outcome_refused(tmp_path):
@@ -147,9 +150,29 @@ def test_read_switch_outcome_refused_wins_if_both_exist(tmp_path):
     assert read_switch_outcome(tmp_path)["state"] == "refused"
 
 
-def test_read_switch_outcome_corrupt_is_ignored(tmp_path):
+def test_read_switch_outcome_corrupt_is_ignored(tmp_path, caplog):
+    caplog.set_level("DEBUG", logger="coa.restart")
     (tmp_path / ACCEPTED_FILE).write_text("{nope")
     assert read_switch_outcome(tmp_path) is None
+    assert "DEBUG" in caplog.text or caplog.records[-1].levelname == "DEBUG"
+
+
+def test_read_switch_outcome_empty_file_is_ignored(tmp_path, caplog):
+    """The claim is two atomic steps (rename, then fill in content); a
+    poller can land between them and see an empty file. That is an ordinary
+    race, not a WARNING-worthy corruption."""
+    caplog.set_level("DEBUG", logger="coa.restart")
+    (tmp_path / ACCEPTED_FILE).write_text("")
+    assert read_switch_outcome(tmp_path) is None
+    assert all(r.levelname != "WARNING" for r in caplog.records)
+
+
+def test_read_switch_outcome_never_logs_above_debug_for_a_bad_file(tmp_path, caplog):
+    caplog.set_level("DEBUG", logger="coa.restart")
+    (tmp_path / REFUSED_FILE).write_text("{nope")
+    (tmp_path / ACCEPTED_FILE).write_text("")
+    assert read_switch_outcome(tmp_path) is None
+    assert all(r.levelname == "DEBUG" for r in caplog.records)
 
 
 def test_clear_switch_files(tmp_path):

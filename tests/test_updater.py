@@ -584,9 +584,11 @@ def _seed_latest(monkeypatch, app, tag, *, age=0.0):
 
 
 def _ready(app, monkeypatch, *, staged_tag="v4.0.0", current="v3.5.0"):
-    """Stage a healthy release, make it look like the latest GitHub poll,
-    and set current_version — the state under which a switch is allowed."""
+    """Stage a healthy release, make it look like the latest GitHub poll, give
+    it an unpacked release folder (a real staged release always has one), and
+    set current_version — the state under which a switch is allowed."""
     updater.write_staged(app.data_dir, tag=staged_tag, healthy=True, notes="ok")
+    (app.releases_dir / staged_tag).mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(app, "current_version", lambda: current)
     _seed_latest(monkeypatch, app, staged_tag)
 
@@ -667,6 +669,22 @@ def test_honour_switch_request_paused_refused(tmp_path, monkeypatch):
     assert doc["why"] == "app is paused"
 
 
+def test_honour_switch_request_refused_when_release_folder_is_missing(tmp_path, monkeypatch):
+    """staged.json can claim a tag is healthy while the unpacked release is
+    gone (pruned, or the disk lost it) — the gate must catch that before
+    claiming the marker as accepted and handing it to switch()."""
+    app = _coa_app(tmp_path)
+    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
+    _seed_latest(monkeypatch, app, "v4.0.0")
+    # Deliberately no (app.releases_dir / "v4.0.0").mkdir() — folder missing.
+    _write_marker(app, tag="v4.0.0")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+    doc = json.loads((app.data_dir / "switch-refused").read_text())
+    assert doc["why"] == "staged release folder is missing"
+
+
 def test_honour_switch_request_noop_when_already_on_tag(tmp_path, monkeypatch):
     app = _coa_app(tmp_path)
     _ready(app, monkeypatch, staged_tag="v4.0.0", current="v4.0.0")
@@ -683,6 +701,9 @@ def test_honour_switch_request_noop_when_already_on_tag(tmp_path, monkeypatch):
     json.dumps({"tag": "v4.0.0", "at": "now"}),    # at not a number
     json.dumps({"tag": "v4.0.0", "at": True}),     # bool is not a number here
     json.dumps({"tag": "x" * 65, "at": 1.0}),      # tag too long
+    '{"tag": "v4.0.0", "at": NaN}',                # Python's json accepts this token
+    '{"tag": "v4.0.0", "at": Infinity}',
+    '{"tag": "v4.0.0", "at": -Infinity}',
 ])
 def test_malformed_switch_request_never_switches_and_leaves_refused(
         tmp_path, monkeypatch, bad_marker):
@@ -719,6 +740,7 @@ def test_switch_request_from_slightly_in_the_future_is_tolerated(tmp_path, monke
 def test_switch_request_refused_without_a_recent_poll(tmp_path, monkeypatch):
     app = _coa_app(tmp_path)
     updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    (app.releases_dir / "v4.0.0").mkdir(parents=True)
     monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
     monkeypatch.setattr(updater, "_LATEST_CACHE", {})   # never polled
     _write_marker(app, tag="v4.0.0")
@@ -731,6 +753,7 @@ def test_switch_request_refused_without_a_recent_poll(tmp_path, monkeypatch):
 def test_switch_request_refused_when_a_newer_poll_beat_it(tmp_path, monkeypatch):
     app = _coa_app(tmp_path)
     updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    (app.releases_dir / "v4.0.0").mkdir(parents=True)
     monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
     _seed_latest(monkeypatch, app, "v4.0.1")   # GitHub has moved on
     _write_marker(app, tag="v4.0.0")
@@ -761,8 +784,8 @@ def test_held_tag_refuses_a_restart_time_switch(tmp_path, monkeypatch):
 
 
 def test_release_tag_clears_a_hold(tmp_path):
-    """What the CLI `switch` command does before calling switch(): a human
-    explicitly choosing a tag overrides an earlier automatic hold on it."""
+    """release_tag is the primitive cli_switch uses: a human explicitly
+    choosing a tag overrides an earlier automatic hold on it."""
     app = _coa_app(tmp_path)
     updater.hold_tag(app.data_dir, "v4.0.0")
     assert updater._is_held(app.data_dir, "v4.0.0")
@@ -774,6 +797,34 @@ def test_held_tags_file_is_bounded(tmp_path):
     for i in range(updater.MAX_HELD_TAGS + 10):
         updater.hold_tag(tmp_path, f"v0.0.{i}")
     assert len(updater._read_held_tags(tmp_path)) == updater.MAX_HELD_TAGS
+
+
+def test_cli_switch_clears_the_hold_only_after_success(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    updater.hold_tag(app.data_dir, "v4.0.0")
+    monkeypatch.setattr(updater, "switch", lambda a, tag, **kw: True)
+    assert updater.cli_switch(app, "v4.0.0") is True
+    assert not updater._is_held(app.data_dir, "v4.0.0")
+
+
+def test_cli_switch_leaves_the_hold_in_place_on_failure(tmp_path, monkeypatch):
+    """A failed manual switch must not silently un-hold a release that is
+    still bad — the next automatic restart-time request would walk right
+    back into it."""
+    app = _coa_app(tmp_path)
+    updater.hold_tag(app.data_dir, "v4.0.0")
+    monkeypatch.setattr(updater, "switch", lambda a, tag, **kw: False)
+    assert updater.cli_switch(app, "v4.0.0") is False
+    assert updater._is_held(app.data_dir, "v4.0.0")
+
+
+def test_cli_switch_passes_force_through(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    calls = []
+    monkeypatch.setattr(updater, "switch",
+                        lambda a, tag, **kw: calls.append(kw) or True)
+    updater.cli_switch(app, "v4.0.0", force=True)
+    assert calls == [{"force": True}]
 
 
 def test_rollback_holds_the_abandoned_release(tmp_path, monkeypatch):
@@ -816,6 +867,21 @@ def test_switch_rollback_after_unhealthy_holds_the_bad_tag_and_uses_switch_guard
     # the rollback (also guarded) — both must see the marker.
     assert marker_seen_during_rollback == [True, True]
     assert not (app.data_dir / "switching").exists()   # cleared afterwards
+
+
+def test_try_auto_switch_refuses_a_held_tag(tmp_path, monkeypatch, caplog):
+    """A held tag must not deploy itself either — auto-switch is exactly the
+    kind of unattended path a hold exists to protect."""
+    caplog.set_level("INFO", logger="updater")
+    app = _coa_app(tmp_path)
+    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    updater.hold_tag(app.data_dir, "v4.0.0")
+    monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
+    monkeypatch.setattr(updater, "_http_get_json",
+                        lambda *a, **k: pytest.fail("must not probe health"))
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.try_auto_switch(app, latest="v4.0.0") is False
+    assert "held" in caplog.text
 
 
 def test_claim_failure_is_not_retried_on_the_next_tick(tmp_path, monkeypatch):
