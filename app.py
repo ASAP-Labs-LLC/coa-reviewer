@@ -45,6 +45,9 @@ from flask import Flask, Response, jsonify, render_template, request, send_file,
 from qbench_client import QBenchAPIClient, QBenchAPIError
 from labcore_client import LabCoreClient, LabCoreUnavailable
 from change_log import ChangeLog
+from presence import PresenceTracker
+from shared_store import SharedStore
+import restart_update
 import tray
 
 # ── Playwright ──────────────────────────────────────────────────────────────
@@ -1035,6 +1038,19 @@ class SampleRecord:
 # Shared Application State (QBench connection + config)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _tidy_after_last_run(shared: SharedStore) -> None:
+    """A new process means the last one is gone: whatever it left open or
+    half-asked is over, one way or another."""
+    closed = shared.close_open_spans("restart")
+    if closed:
+        logger.info("Closed %d presence span(s) left open by the last run", closed)
+    removed = restart_update.clear_switch_files(DATA_DIR)
+    if removed:
+        logging.getLogger("coa.restart").warning(
+            "Removed %d leftover switch file(s) — a new process means the "
+            "restart already happened", removed)
+
+
 class AppState:
     """Shared server resources – QBench connection, config, Command Center.
     Per-user state (records, results, pdf cache) lives in UserState."""
@@ -1065,6 +1081,14 @@ class AppState:
         self.change_log = ChangeLog(
             self.config.get("change_log_dir") or (DATA_DIR / "changelog")
         )
+
+        # Shared, durable review state (verdicts, per-sample history,
+        # presence). DATA_DIR, never APP_DIR: it must survive release swaps.
+        # The store opens lazily and never raises on I/O, so a bad disk costs
+        # history, not startup.
+        self.shared = SharedStore(DATA_DIR / "coa_shared.db")
+        self.presence = PresenceTracker(self.shared)
+        _tidy_after_last_run(self.shared)
 
     def broadcast_sse(self, data: dict) -> None:
         """Send an SSE event to ALL currently connected users."""
@@ -1597,19 +1621,61 @@ def _reap_idle_sessions(now: float) -> List[UserState]:
         reaped = [user_sessions.pop(uid) for uid in expired]
     for us in reaped:
         us.persist()
+        _presence_end(us.name, "timeout")
         log_login_event("TIMEOUT", us.name, "server")
         logger.info("Session timed out: %s", us.name)
     return reaped
 
 
+def _presence_touch(name: str) -> None:
+    """Count ``name`` as here. Memory-only (no database call per request),
+    and never allowed to fail the request it rides on."""
+    try:
+        state.presence.touch(name)
+    except Exception:
+        logger.exception("presence touch failed")
+
+
+def _presence_end(name: str, reason: str) -> None:
+    """End ``name``'s presence span; a failure here costs a log line, never
+    the logout or reap it rides on."""
+    try:
+        state.presence.end(name, reason)
+    except Exception:
+        logger.exception("presence end (%s) failed", reason)
+
+
+# How often the cleanup worker runs. It is also what flushes presence to the
+# store, so it must not exceed presence.FLUSH_SECONDS (what a crash can lose).
+SESSION_CLEANUP_INTERVAL_SECONDS = 30.0
+
+
+def _session_cleanup_cycle(now: float) -> None:
+    """One pass of the cleanup worker: reap idle sessions, close presence
+    spans that went quiet, then write presence to the store. Each step is
+    isolated so one failing never skips the others — in particular the flush,
+    which is the only thing that gets presence onto disk."""
+    try:
+        _reap_idle_sessions(now)
+    except Exception:
+        logger.exception("session cleanup failed")
+    try:
+        state.presence.sweep()
+    except Exception:
+        logger.exception("presence sweep failed")
+    try:
+        state.presence.flush()
+    except Exception:
+        logger.exception("presence flush failed")
+
+
 def _session_cleanup_worker() -> None:
-    """Background thread: remove sessions idle longer than SESSION_CLEANUP_SECONDS."""
+    """Background thread: remove sessions idle longer than
+    SESSION_CLEANUP_SECONDS and keep presence flushed. Runs for the life of
+    the process by design (a daemon); each cycle is bounded."""
     while True:
-        time.sleep(30)
-        try:
-            _reap_idle_sessions(time.time())
-        except Exception:
-            logger.exception("session cleanup failed")
+        time.sleep(SESSION_CLEANUP_INTERVAL_SECONDS)
+        _session_cleanup_cycle(time.time())
 
 
 threading.Thread(target=_session_cleanup_worker, daemon=True).start()
@@ -1681,51 +1747,252 @@ def _auto_restart_worker() -> None:
 threading.Thread(target=_auto_restart_worker, daemon=True).start()
 
 
-def request_restart(source: str) -> None:
-    """Restart because someone clicked: the Restart button in the UI or the
-    tray icon's menu. Delayed a moment so the caller gets its answer first.
-    `_graceful_shutdown` respawns the app itself; the updater's supervision
-    on ASAPSV1 is the backstop if that fails."""
-    logger.info("Manual restart requested via %s", source)
+# ── Restart (UI button / tray): plain, or by installing a staged release ────
+#
+# With a newer, healthy release staged by the updater, Restart asks it to
+# switch (restart_update) instead of respawning the same version, then watches
+# for its answer. Invariants, whatever the updater does:
+#   * whoever clicked Restart gets a restart;
+#   * once the updater has (or may have) taken the request, this process never
+#     spawns its own replacement — a self-respawned child can outlive the
+#     updater's port-based kill and double-bind the port (the 2026-07-31
+#     incident). The updater's supervise() restarts the app within ~20 s;
+#   * an outcome file from an earlier request is never read as this one's.
+# Every wait is a fixed number of polls, and sleeps go through
+# _restart_sleep so tests can drive the updater's side from inside it.
 
-    def _go() -> None:
-        time.sleep(1)
-        _graceful_shutdown("manual restart")
+restart_log = logging.getLogger("coa.restart")
 
-    threading.Thread(target=_go, daemon=True).start()
+RESTART_POLL_SECONDS = 1.0
+# How long to wait to be killed once the updater has accepted. Its switch()
+# stops the app, flips the junction and starts the new release; well within
+# this unless something went wrong, in which case supervise() takes over.
+ACCEPTED_WAIT_SECONDS = 45.0
+# Marker gone with no outcome file for this many polls in a row: the updater
+# took it but its claim fell back to deleting the marker.
+UNKNOWN_CLAIM_POLLS = 3
+
+_restart_lock = threading.Lock()
+_restart_requested = False           # single flight: one restart per process
+_restart_tag: Optional[str] = None   # what the pending restart is installing
 
 
-def _graceful_shutdown(reason: str = "unknown") -> None:
-    """Shut down cleanly: flush logs, close sockets, then exit."""
-    logger.info("Graceful shutdown initiated (reason: %s)", reason)
-    # Flush all log handlers
+def _restart_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _spawn(target: Callable[..., None], args: tuple, name: str) -> None:
+    threading.Thread(target=target, args=args, daemon=True, name=name).start()
+
+
+def _save_state_for_exit() -> None:
+    """Flush logs and put presence on disk. Called before exiting and before
+    asking for a switch (which kills us with taskkill /F, skipping
+    _graceful_shutdown). Never raises."""
+    try:
+        state.presence.close_all("restart")   # queues every close, then flushes
+    except Exception:
+        logger.exception("could not save presence before exit")
     for h in logging.root.handlers:
         try:
             h.flush()
         except Exception:
             pass
 
-    # If not being watched by Run.pyw, self-respawn so the server comes back up.
-    # Run.pyw sets COA_WATCHER_ACTIVE=1 in the environment; if it's absent we're
-    # running standalone and must restart ourselves.
-    if reason in ("auto-restart", "manual restart") and not os.environ.get("COA_WATCHER_ACTIVE"):
-        logger.info("No Run.pyw watcher — self-respawning...")
-        try:
-            subprocess.Popen(
-                [sys.executable, "-u", str(Path(__file__).resolve())],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                cwd=str(APP_DIR),
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-        except Exception as _spawn_err:
-            logger.error("Self-respawn failed: %s", _spawn_err)
 
+def request_restart(source: str, *, by: Optional[str] = None) -> Optional[str]:
+    """Restart because someone clicked: the Restart button in the UI (``by``
+    is the reviewer) or the tray icon (``by="tray"``).
+
+    Returns the tag being installed when a newer release is staged, else
+    ``None`` for a plain restart. Either way the work happens on a thread, so
+    the caller gets its answer first. Single-flight: a second click while one
+    is pending changes nothing and reports the same answer."""
+    global _restart_requested, _restart_tag
+    with _restart_lock:
+        if _restart_requested:
+            restart_log.info("Restart via %s ignored: one is already under way (%s)",
+                             source, _restart_tag or "plain restart")
+            return _restart_tag
+        _restart_requested = True
+        restart_log.info("Manual restart requested via %s", source)
+        try:
+            _restart_tag = _begin_restart(by or source)
+        except Exception:
+            # Whatever broke, the person still gets the restart they asked for.
+            restart_log.exception("Could not prepare the restart — restarting normally")
+            _restart_tag = None
+            restart_update.clear_switch_files(DATA_DIR)
+            _spawn(_delayed_shutdown, ("manual restart",), "restart")
+        return _restart_tag
+
+
+def _begin_restart(by: str) -> Optional[str]:
+    """Ask for a switch if one is due, else schedule a plain restart."""
+    tag = restart_update.staged_update(DATA_DIR, APP_VERSION)
+    if tag:
+        _save_state_for_exit()
+        at = time.time()
+        if restart_update.write_switch_request(DATA_DIR, tag, by=by, now=at):
+            restart_log.info("Asked the updater to install %s; waiting for its answer", tag)
+            _spawn(_await_switch, (tag, at), "await-switch")
+            return tag
+        restart_log.warning("Could not ask the updater to install %s — restarting "
+                            "normally", tag)
+        restart_update.clear_switch_files(DATA_DIR)
+    else:
+        restart_log.info("No newer release staged — plain restart")
+    _spawn(_delayed_shutdown, ("manual restart",), "restart")
+    return None
+
+
+def _delayed_shutdown(reason: str) -> None:
+    _restart_sleep(1.0)   # let the HTTP answer reach the browser first
+    _graceful_shutdown(reason)
+
+
+def _matching_outcome(at: float) -> Optional[dict]:
+    """The updater's answer to *this* request, or None. An outcome whose
+    ``at`` is not ours is a leftover from an earlier request (N4)."""
+    outcome = restart_update.read_switch_outcome(DATA_DIR)
+    if outcome is None:
+        return None
+    try:
+        theirs = float(outcome.get("at"))
+    except (TypeError, ValueError):
+        theirs = None
+    if theirs is None or abs(theirs - at) > 1e-3:
+        restart_log.debug("Ignoring a switch outcome for another request (at=%r)",
+                          outcome.get("at"))
+        return None
+    return outcome
+
+
+def _poll_switch(at: float, polls: int, poll: float) -> Tuple[str, Optional[dict]]:
+    """Poll up to ``polls`` times for the updater's answer. Returns
+    ``("refused"|"accepted", outcome)``, ``("unknown", None)`` when the marker
+    vanished without an outcome, or ``("unclaimed", None)`` when time ran out."""
+    missing = 0
+    for _ in range(max(1, polls)):
+        _restart_sleep(poll)
+        outcome = _matching_outcome(at)
+        if outcome is not None:
+            return str(outcome.get("state")), outcome
+        missing = missing + 1 if not restart_update.marker_present(DATA_DIR) else 0
+        if missing >= UNKNOWN_CLAIM_POLLS:
+            return "unknown", None
+    return "unclaimed", None
+
+
+def _polls(seconds: float, poll: float) -> int:
+    return max(1, int(round(seconds / max(poll, 1e-3))))
+
+
+def _await_switch(tag: str, at: float, *, pickup: float = restart_update.PICKUP_SECONDS,
+                  accepted_wait: float = ACCEPTED_WAIT_SECONDS,
+                  poll: float = RESTART_POLL_SECONDS) -> None:
+    """Watch for the updater's answer to the switch request written at
+    ``at`` and make sure the person who asked gets a restart."""
+    try:
+        verdict, outcome = _poll_switch(at, _polls(pickup, poll), poll)
+        if verdict == "unclaimed":
+            if restart_update.withdraw_switch_request(DATA_DIR):
+                restart_log.warning(
+                    "Updater did not take the switch to %s within %.0fs — restarting "
+                    "normally (is updater.py up to date on this host?)", tag, pickup)
+                _fallback_restart()
+                return
+            # Claimed in the same instant we withdrew: its answer is coming.
+            verdict, outcome = _poll_switch(at, _polls(accepted_wait, poll), poll)
+        _act_on_outcome(tag, verdict, outcome, accepted_wait, poll)
+    except Exception:
+        restart_log.exception("Restart watcher for %s failed", tag)
+        _restart_after_watcher_error()
+
+
+def _restart_after_watcher_error() -> None:
+    """The watcher broke. If the request is still ours to withdraw, nobody
+    has it: restart normally. Otherwise the updater may have it, so exit
+    without a respawn and let its supervise() bring the app back."""
+    try:
+        withdrawn = restart_update.withdraw_switch_request(DATA_DIR)
+    except Exception:
+        withdrawn = False
+    if withdrawn:
+        _fallback_restart()
+        return
+    _graceful_shutdown("manual restart", respawn=False)
+
+
+def _act_on_outcome(tag: str, verdict: str, outcome: Optional[dict],
+                    accepted_wait: float, poll: float) -> None:
+    if verdict == "refused":
+        restart_log.warning("Updater refused the switch to %s (%s) — restarting normally",
+                            tag, (outcome or {}).get("why", "no reason given"))
+        _fallback_restart()
+        return
+    if verdict == "accepted":
+        restart_log.info("Updater accepted the switch to %s; waiting to be stopped", tag)
+    else:
+        restart_log.warning("The switch request for %s was taken but left no outcome; "
+                            "waiting to be stopped", tag)
+    for _ in range(_polls(accepted_wait, poll)):
+        _restart_sleep(poll)
+    restart_log.warning("Still running %.0fs after the updater took the switch to %s — "
+                        "exiting without a respawn; the updater restarts the app",
+                        accepted_wait, tag)
+    restart_update.clear_switch_files(DATA_DIR)
+    _graceful_shutdown("manual restart", respawn=False)
+
+
+def _fallback_restart() -> None:
+    restart_update.clear_switch_files(DATA_DIR)
+    _graceful_shutdown("manual restart")
+
+
+def _self_respawn() -> None:
+    """Start a fresh app.py beside this one (standalone installs only)."""
+    try:
+        subprocess.Popen(
+            [sys.executable, "-u", str(Path(__file__).resolve())],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            cwd=str(APP_DIR),
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    except Exception as _spawn_err:
+        logger.error("Self-respawn failed: %s", _spawn_err)
+
+
+def _may_respawn(reason: str, respawn: bool) -> bool:
+    if not respawn or reason not in ("auto-restart", "manual restart"):
+        return False
+    if (DATA_DIR / "switching").exists():
+        # The updater has the app deliberately stopped and will start the
+        # new release itself; a child of ours would fight it for the port.
+        restart_log.warning("Not respawning: the updater is mid-switch (%s exists)",
+                            DATA_DIR / "switching")
+        return False
+    # Run.pyw sets COA_WATCHER_ACTIVE=1; without it we must restart ourselves.
+    return not os.environ.get("COA_WATCHER_ACTIVE")
+
+
+def _graceful_shutdown(reason: str = "unknown", *, respawn: bool = True) -> None:
+    """Shut down cleanly: save presence, flush logs, then exit — respawning
+    first unless told not to (see the restart notes above)."""
+    logger.info("Graceful shutdown initiated (reason: %s, respawn: %s)", reason, respawn)
+    _save_state_for_exit()
+    if _may_respawn(reason, respawn):
+        logger.info("No Run.pyw watcher — self-respawning...")
+        _self_respawn()
     # Take the tray icon down with the process, or Windows leaves a ghost of
     # it until the mouse passes over.
-    tray.stop_tray()
-    time.sleep(0.5)
+    try:
+        tray.stop_tray()
+    except Exception:
+        logger.exception("could not stop the tray icon")
+    _restart_sleep(0.5)
     # Use os._exit to avoid hanging on daemon threads
     os._exit(0)
 
@@ -2377,8 +2644,14 @@ def track_activity():
     progress always does.
     """
     global _last_request_time
-    if request.path not in _NON_ACTIVITY_PATHS and session.get("uid"):
+    uid = session.get("uid") if request.path not in _NON_ACTIVITY_PATHS else None
+    if uid:
         _last_request_time = time.time()
+        # Presence follows the same two rules. dict.get is atomic under the
+        # GIL, so no lock for a read; an unknown uid (reaped) is not "here".
+        ustate = user_sessions.get(uid)
+        if ustate is not None:
+            _presence_touch(ustate.name)
     # Log non-static, non-polling requests for debugging
     if not request.path.startswith("/static/") and request.path != "/api/events":
         logger.debug("REQUEST %s %s from %s", request.method, request.path, request.remote_addr)
@@ -2420,7 +2693,8 @@ def index():
 @app.route("/api/health")
 def health():
     """Lightweight health check — no auth required. Used by frontend restart polling."""
-    return jsonify({"ok": True, "pid": os.getpid(), "t": time.time()})
+    return jsonify({"ok": True, "pid": os.getpid(), "t": time.time(),
+                    "version": APP_VERSION})
 
 
 @app.route("/healthz")
@@ -2583,6 +2857,7 @@ def portal_logout():
             log_login_event("LOGOUT", ustate.name, request.remote_addr)
             state.change_log.session("logout", user=ustate.name,
                                      ip=request.remote_addr)
+            _presence_end(ustate.name, "logout")
             logger.info("Portal logout: %s", ustate.name)
     session.clear()
     return jsonify({"ok": True})
@@ -2642,6 +2917,9 @@ def portal_reauth():
 @app.route("/api/heartbeat", methods=["POST"])
 @require_portal
 def heartbeat():
+    ustate = get_user_state()
+    if ustate is not None:
+        _presence_touch(ustate.name)
     return jsonify({"ok": True})
 
 
@@ -2650,8 +2928,11 @@ def heartbeat():
 def restart_server():
     """Restart the server process; it respawns itself (see request_restart)."""
     ustate = get_user_state()
-    request_restart(f"the Restart button ({ustate.name if ustate else 'unknown'})")
-    return jsonify({"ok": True, "message": "Server is restarting...", "old_pid": os.getpid()})
+    name = ustate.name if ustate else "unknown"
+    tag = request_restart(f"the Restart button ({name})", by=name)
+    # `update` is the release being installed, or null for a plain restart.
+    return jsonify({"ok": True, "message": "Server is restarting...",
+                    "old_pid": os.getpid(), "update": tag})
 
 
 @app.route("/api/server-info", methods=["GET"])
@@ -4618,7 +4899,7 @@ if __name__ == "__main__":
     # the updater launches app.py directly; Run.pyw used to own it. After the
     # port check, so a duplicate that is about to exit never shows one.
     tray.start_tray(version=APP_VERSION, port=port, pid=os.getpid(), log_path=_LOG_FILE,
-                    restart=lambda: request_restart("the tray icon"))
+                    restart=lambda: request_restart("the tray icon", by="tray"))
 
     if not PLAYWRIGHT_AVAILABLE:
         logger.warning("Playwright unavailable: %s", _playwright_error)
