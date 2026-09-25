@@ -1701,6 +1701,7 @@ const HISTORY_SOURCES = {
     labvision_test: "LabVision result",
 };
 const OUTSIDE_USER = "Outside COA Reviewer";
+const HISTORY_ERROR_CHARS = 140;    // longer errors are cut; full text on hover
 const MODE_WORD = { info: "Info", tests: "Tests" };
 const OUTCOME_WORD = { good: "Good", bad: "Bad" };
 
@@ -1766,6 +1767,13 @@ function historySentence(ev) {
     const mode = escapeHtml(MODE_WORD[ev.field] || ev.field || "");
     const field = `<em>${escapeHtml(historyFieldName(ev.field))}</em>`;
     const change = `from ${hVal(ev.before)} to ${hVal(ev.after)}`;
+    // An edit QBench finally refused: the row records the attempt, so say
+    // plainly that it did not stick (the error is a note underneath).
+    if (detail.failed) {
+        const name = ev.kind === "comments" ? "<em>Comments</em>" : field;
+        return `${hWho(ev.user)}’s change to ${name} ${change} `
+            + `<span class="h-failed">didn’t save</span>`;
+    }
     switch (ev.kind) {
         case "mark": {
             const out = OUTCOME_WORD[ev.after] || escapeHtml(ev.after ?? "");
@@ -1808,7 +1816,13 @@ function historyNotes(ev) {
     if (detail.superseded) notes.push("(overridden by a newer mark)");
     if (detail.migrated) notes.push("(carried over from before v4)");
     if (detail.unchanged) notes.push("(same value)");
+    if (detail.already_saved) notes.push("(already saved)");
     let html = notes.length ? `<p class="h-note">${escapeHtml(notes.join(" "))}</p>` : "";
+    if (detail.failed) {
+        const err = String(detail.error || "QBench did not accept the change");
+        const short = err.length > HISTORY_ERROR_CHARS ? `${err.slice(0, HISTORY_ERROR_CHARS)}…` : err;
+        html += `<p class="h-note h-error" title="${escapeHtml(err)}">${escapeHtml(short)}</p>`;
+    }
     if (ev.kind === "mark" && detail.reason) {
         html += `<p class="h-quote" title="${escapeHtml(detail.reason)}">${escapeHtml(detail.reason)}</p>`;
     }
@@ -1841,7 +1855,8 @@ function historyItemHtml(ev, d) {
     const avatar = external
         ? `<span class="h-avatar h-avatar--external" title="Outside COA Reviewer" aria-hidden="true">↗</span>`
         : `<span class="h-avatar" title="${escapeHtml(ev.user || "")}" aria-hidden="true">${escapeHtml(historyInitials(ev.user))}</span>`;
-    return `<li class="h-item${external ? " h-item--external" : ""}">${avatar}`
+    const failed = ev.detail && ev.detail.failed ? " h-item--failed" : "";
+    return `<li class="h-item${external ? " h-item--external" : ""}${failed}">${avatar}`
         + `<div class="h-body"><p class="h-text">${historySentence(ev)}</p>`
         + historyNotes(ev)
         + `<time class="h-time" datetime="${escapeHtml(d.toISOString())}" title="${escapeHtml(historyExact(d))}">`

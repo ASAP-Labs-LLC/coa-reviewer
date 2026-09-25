@@ -303,3 +303,37 @@ def test_the_history_list_clears_the_version_badge() -> None:
     block = APP_CSS[APP_CSS.index(".history-list {"):][:500]
     m = re.search(r"padding:\s*\S+\s+\S+\s+(\d+)px", block)
     assert m and int(m.group(1)) >= 40, "the last history item sits under #app-version"
+
+
+# ── failed saves (upload finally refused) ─────────────────────────────────
+
+def test_a_failed_save_says_it_did_not_save() -> None:
+    sentence = _body("historySentence")
+    assert "detail.failed" in sentence
+    assert re.search(r"didn(?:'|\u2019|\\u2019)t save", sentence)
+    assert 'class="h-failed"' in sentence
+
+
+def test_the_failure_error_is_escaped_truncated_and_whole_on_hover() -> None:
+    notes = _body("historyNotes")
+    assert "detail.error" in notes
+    assert "HISTORY_ERROR_CHARS" in notes and ".slice(0, HISTORY_ERROR_CHARS)" in notes
+    assert 'title="${escapeHtml(err)}"' in notes
+    assert "${escapeHtml(short)}" in notes
+
+
+def test_an_already_saved_edit_is_noted() -> None:
+    assert "detail.already_saved" in _body("historyNotes")
+    assert "(already saved)" in APP_JS
+
+
+def test_the_failure_accent_uses_the_warn_token_only() -> None:
+    block = APP_CSS[APP_CSS.index(".h-failed {"):][:900]
+    assert "var(--warn)" in block
+    assert "h-item--failed" in _body("historyItemHtml")
+
+
+def test_the_bulk_sample_events_handler_ignores_extra_keys() -> None:
+    """The backend sends {type, kind, lab_ids}; the handler reads lab_ids only."""
+    case = _sse_case("sample_events")
+    assert "data.kind" not in case
