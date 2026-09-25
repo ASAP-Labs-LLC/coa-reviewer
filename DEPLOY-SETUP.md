@@ -28,6 +28,35 @@ Hard Rules before doing anything.
 
 ---
 
+## v4.0.0 one-time step
+
+COA Reviewer v4.0.0 added a restart-time switch handshake: the Restart button
+(and the tray's Restart Application) can now ask the updater to install an
+already-staged, healthy release instead of just respawning the running
+version (`restart_update.py` in the app, `honour_switch_request` in the
+updater — see `CLAUDE.md`). The updater's half of that handshake is **not**
+deployed by a coa-reviewer release tag — `updater.py` lives outside the
+`coa\releases\` tree entirely and only ever gets onto the box by hand.
+
+**Do once, on ASAPSV1:** copy this repo's `deploy/updater/updater.py` to
+`C:\ASAPApps\updater\updater.py` and restart the updater's scheduled task so
+it picks up the new file.
+
+**Until that is done**, Restart still works — it just falls back to a normal
+restart (same version, no switch) after `restart_update.PICKUP_SECONDS`
+(~60 s), because the old `updater.py` never claims the `switch-requested`
+marker the app leaves for it. Nothing breaks; reviewers just don't get the
+"restart installs the update" shortcut until the updater is current.
+
+Also note: `coa_shared.db` (+ its `-wal`/`-shm` sidecars) — the shared
+verdicts / sample history / presence store added in v4.0.0 — lives in
+`C:\ASAPApps\coa\data`, alongside `re_review_state.json`, `review_state\`,
+etc. It is real, unrecoverable review data same as the rest of that folder:
+include it (and the sidecars — WAL means the main file alone is not a
+consistent snapshot) in any backup of `C:\ASAPApps\coa\data`.
+
+---
+
 ## 1. What exists today
 
 Two Flask apps, both currently running **directly off the shared drive** over a

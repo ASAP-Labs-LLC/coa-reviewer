@@ -38,6 +38,16 @@ STATE_PATHS = [
     "changelog",
     "review_state/",
     "login.log",
+    # v4.0.0: the shared store and the restart-time switch handshake. With
+    # COA_DATA_DIR unset, DATA_DIR falls back to APP_DIR — the project root —
+    # so a dev box running the app locally can leave these sitting right
+    # here, exactly like re_review_state.json always could.
+    "coa_shared.db",
+    "pending_verdicts.json",
+    "switch-requested",
+    "switch-accepted",
+    "switch-refused",
+    "held-tags.json",
 ]
 
 
