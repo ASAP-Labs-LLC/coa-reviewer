@@ -1888,3 +1888,17 @@ must use these, not the earlier snippets.
 ### Task 8 — `/api/activity` uses `event_marks_between` and passes
 `online=state.presence.online()`, `is_today=...`, `truncated=` (True when either
 spans or events hit `MAX_RANGE_ROWS`) into `activity.build_day` (see its new kwargs).
+
+### Task 7b: Changes made outside COA Reviewer (added 2026-09-25 at the user's request)
+
+Spec §3b. Files: `shared_store.py` (table `field_snapshots`, `observe()`,
+`EVENT_KINDS += ("external_change",)`, optional `snapshot=(source, field, value)`
+kwarg on `record_event` and `apply_mark` untouched), `app.py` (observation
+points + own-edit snapshots), `static/js/app.js` (render `external_change`).
+Tests: `tests/test_external_changes.py` (store-level: baseline silent, diff
+records event with before/after/since, normalisation 12 vs 12.00 and whitespace,
+own edit via record_event(snapshot=…) not reported later, bounded fields, store
+down → no raise) and route-level (GET tests/sample-info/comments with a
+monkeypatched api_client whose values changed between two reads → one
+external_change row; own PATCH then GET → none; LabVision operator becomes the
+actor). Comments: snapshot on UploadQueue success only (find `_process_comment`).

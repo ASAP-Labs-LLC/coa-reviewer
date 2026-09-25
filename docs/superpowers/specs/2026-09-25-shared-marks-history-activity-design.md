@@ -39,7 +39,7 @@ Tables:
 - `sample_events(id, lab_id, at, user, kind, field, before, after, detail)` —
   index `(lab_id, at)`, `(at)`. `kind` is a closed set: `mark`, `unmark`,
   `test_result`, `sample_info`, `sample_sync`, `comments`,
-  `attachment_deleted`, `listing_created`, `listing_completed`.
+  `attachment_deleted`, `listing_created`, `listing_completed`, `external_change`.
 - `presence(id, user, started_at, last_seen, ended_at, end_reason)` — index
   `(started_at)`, `(user, last_seen)`.
 
@@ -93,6 +93,40 @@ Rules (NASA Power-of-10 applied to Python):
   hover, day separators. Loaded when the tab is shown or the selected sample
   changes while shown; refreshed on a `sample_event` SSE for the selected
   lab_id. The choice persists in localStorage. Empty state explains itself.
+
+
+### 3b. Changes made outside COA Reviewer
+
+COA Reviewer is not the only writer: QBench is edited directly and LabVision
+records test results. History must say so rather than imply nothing changed.
+
+- New table `field_snapshots(lab_id, source, field, value, seen_at)`, PK
+  `(lab_id, source, field)`; `source ∈ {qbench_test, qbench_info,
+  qbench_comments, labvision_test}`. It holds the last value COA Reviewer saw
+  or wrote for each field.
+- `SharedStore.observe(lab_id, source, values: {field: value}, *, seen_at,
+  actor_hint=None, changed_at=None)` — one transaction: for each field,
+  compare the normalised value with the snapshot; a difference inserts an
+  `external_change` event (`user` = the source's own actor when known, e.g.
+  the LabVision operator, else `"Outside COA Reviewer"`; `before`/`after`;
+  `detail = {source, since: previous seen_at, detected_at, changed_at?}`) and
+  updates the snapshot; a field never seen before is stored silently as the
+  baseline. Bounded (≤ 500 fields per call).
+- Normalisation for comparison only: strip, collapse internal whitespace,
+  `None`/"" equal, and numeric strings compared as floats (so `12` == `12.00`).
+- COA Reviewer's own edits update the snapshot in the same transaction as their
+  history row (`record_event(..., snapshot=(source, field, value))`), so they
+  never resurface as external. Queued comment writes update it only when the
+  UploadQueue confirms success.
+- Observation points: `GET /api/tests/<lab_id>` (test results),
+  `GET /api/sample-info/<lab_id>` (editable fields), `GET /api/comments/<lab_id>`,
+  `/api/sync-preview` (LabVision tests with operator; QBench fields it already
+  reads), and tab pulls when the bulk payload carries results. Observation is
+  best-effort and never delays or fails the read (errors → WARNING).
+- History UI: "**Changed outside COA Reviewer** — *moisture* from `11.2` to
+  `12.5` · sometime between 9:12 AM and 2:14 PM" (exact time when the source
+  provides one), with a small neutral "external" marker so it reads differently
+  from in-app edits.
 
 ## 4. Time online — `/activity`
 
