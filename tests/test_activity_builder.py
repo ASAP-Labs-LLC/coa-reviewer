@@ -5,7 +5,8 @@ from datetime import date, datetime
 
 import pytest
 
-from activity import BIN_SECONDS, MAX_SPANS_PER_USER, MAX_USERS, build_day, day_window
+from activity import (BIN_SECONDS, DEFAULT_START_HOUR, MAX_SPANS_PER_USER, MAX_USERS,
+                      build_day, day_window)
 
 
 def ts(h, m=0):
@@ -56,6 +57,18 @@ def test_bounds_default_and_extend():
     assert build_day(D, [], [], now=ts(20))["bounds"] == {"start_hour": 6, "end_hour": 22}
     spans = [{"user": "u", "start": ts(5, 30), "end": ts(22, 10), "open": False}]
     assert build_day(D, spans, [], now=ts(23))["bounds"] == {"start_hour": 5, "end_hour": 23}
+
+
+def test_bound_point_at_day_end_counts_as_hour_24_not_wall_clock_zero():
+    """A span clipped to the day's end lands exactly on ``hi`` — local
+    midnight of the *next* day, wall-clock hour 0. Read literally that
+    would (wrongly) drag start_hour down to 0; it must instead count as
+    hour 24, the end of *this* day."""
+    lo, hi = day_window(D)
+    spans = [{"user": "u", "start": ts(20), "end": hi + 100, "open": False}]
+    out = build_day(D, spans, [], now=hi + 200)
+    assert out["bounds"]["end_hour"] == 24
+    assert out["bounds"]["start_hour"] == DEFAULT_START_HOUR
 
 
 def test_events_without_span_still_show():

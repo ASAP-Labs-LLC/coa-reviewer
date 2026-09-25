@@ -65,12 +65,21 @@ def _blocks(times: List[float]) -> List[dict]:
     return blocks
 
 
-def _bounds(points: Iterable[float]) -> Dict[str, int]:
+def _bounds(points: Iterable[float], hi: float) -> Dict[str, int]:
     """Hour bounds from each point's actual local wall-clock time, so a DST
     transition day (23 or 25 real hours) never produces an ``end_hour``
-    outside 0..24."""
+    outside 0..24.
+
+    A point clipped to the day's end lands exactly on ``hi`` — local
+    midnight of the *next* day, wall-clock hour 0 — which would otherwise
+    read as the *start* of a day rather than the end of this one; it's
+    special-cased to hour 24 instead of being converted normally.
+    """
     start_h, end_h = DEFAULT_START_HOUR, DEFAULT_END_HOUR
     for p in points:
+        if p >= hi:
+            end_h = 24
+            continue
         dt = datetime.fromtimestamp(p)
         hour = dt.hour + dt.minute / 60
         floor_h = int(hour)                                  # floor: always <= hour
@@ -137,7 +146,7 @@ def build_day(day: date, spans: List[dict], events: List[dict], *, now: float,
     return {
         "date": day.isoformat(),
         "users": users,
-        "bounds": _bounds(points),
+        "bounds": _bounds(points, hi),
         "truncated": was_truncated,
         "summary": {
             "people": len(users),
