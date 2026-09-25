@@ -61,6 +61,8 @@ MAX_RANGE_ROWS = 5000      # rows one /activity day can use; len==limit means tr
 MAX_BATCH = 900            # bound parameters per IN (SQLite limit is 999)
 MAX_TEXT = 4000            # characters kept per before/after/detail value
 MAX_VERDICTS_INPUT = 10_000  # lab_ids accepted by one verdicts_for() call
+MAX_MARKS_PER_BATCH = 500    # marks written by one apply_marks() transaction
+_WHEN_POLICIES = ("always", "if_judged", "if_absent")
 MAX_SPAN_SECONDS = 86400 + 600  # a span can't outlive one calendar day + slack
 
 SLOW_QUERY_MS = 50.0
@@ -413,6 +415,15 @@ class SharedStore:
         self._last_skip_log = 0.0
         self._quarantine_disabled = False
         self._readers = _ReaderPool(self._path, backoff_active=self._writer_backing_off)
+        # Why the most recent write failed: None (it succeeded), "unavailable"
+        # (no connection / backing off), "busy", "keep" (a bad query — the
+        # store itself is fine), "corrupt" or "io". Process-wide and racy
+        # across threads by nature; a hint for retry policy, not a contract.
+        self._last_write_error: Optional[str] = None
+
+    @property
+    def last_write_error(self) -> Optional[str]:
+        return self._last_write_error
 
     def _writer_backing_off(self) -> bool:
         return (self._backoff_until is not None
@@ -569,11 +580,13 @@ class SharedStore:
         with self._lock:
             conn = self._connection()
             if conn is None:
+                self._last_write_error = "unavailable"
                 return default
             try:
                 result = fn(conn)
             except sqlite3.Error as exc:
                 kind = _classify(exc)
+                self._last_write_error = kind if kind in ("busy", "keep", "corrupt") else "io"
                 if kind in ("busy", "keep"):
                     logger.warning("shared store %s failed (%s): %s", label, kind, exc)
                     # The connection is kept, so it must not be left inside
@@ -596,6 +609,7 @@ class SharedStore:
                 logger.warning("shared store %s failed: %s", label, exc)
                 self._drop_connection(backoff=True)
                 return default
+            self._last_write_error = None
         elapsed_ms = (time.perf_counter() - started) * 1000
         if elapsed_ms > SLOW_QUERY_MS:
             logger.info("shared store %s slow: %.1f ms", label, elapsed_ms)
@@ -709,60 +723,118 @@ class SharedStore:
     def apply_mark(self, lab_id: str, mode: str, outcome: str, *, by: str,
                    reason: str = "", cc_task_id: Any = None,
                    sample_id: Any = None, tab: Optional[str] = None,
-                   at: Optional[float] = None) -> Optional[dict]:
+                   at: Optional[float] = None,
+                   extra_detail: Optional[Dict[str, Any]] = None) -> Optional[dict]:
         """Set (or tombstone) a verdict and record the history event for it
         as one atomic transaction: either both happen or neither does.
 
         ``at`` is when the mark was made (default now). A retried write
         passes its original time: if a newer verdict already exists it is
         left alone, but the history row is still written at ``at`` with
-        ``detail.superseded = true``.
+        ``detail.superseded = true``. ``extra_detail`` (e.g. ``{"cause":
+        "regenerate"}``) is merged into the history row's detail.
 
         Returns ``{"before": <previous outcome or None>, "applied": bool,
-        "verdicts": {mode: verdict, ...}}`` for this lab_id, or ``None`` if
-        the write failed — callers must not assume the mark took effect
-        without checking.
+        "skipped": False, "verdicts": {mode: verdict, ...}}`` for this
+        lab_id, or ``None`` if the write failed — callers must not assume
+        the mark took effect without checking.
         """
-        lab_id = _require_text(lab_id, "lab_id")
+        item = self._prepare_mark({
+            "lab_id": lab_id, "mode": mode, "outcome": outcome, "by": by,
+            "reason": reason, "cc_task_id": cc_task_id, "sample_id": sample_id,
+            "tab": tab, "at": at, "extra_detail": extra_detail})
+        out = self._run("apply_mark", lambda c: self._marks_tx(c, [item]), None,
+                        key=item["row"][0])
+        return out[0] if out is not None else None
+
+    def apply_marks(self, items: List[dict]) -> Optional[List[dict]]:
+        """Several marks in ONE transaction (at most ``MAX_MARKS_PER_BATCH``),
+        each with apply_mark's semantics plus an optional ``when``:
+
+        - ``"always"`` (default) — as apply_mark;
+        - ``"if_judged"`` — only if the current row is good/bad (a clear
+          that has nothing to clear writes nothing, not even history);
+        - ``"if_absent"`` — only if there is no row at all (a tombstone
+          counts as a row): insert-only, for the ledger migration.
+
+        Every item is validated before anything is written. Returns one
+        result per item (``skipped`` True for a ``when`` that did not hold),
+        or ``None`` if the write failed (then nothing was written)."""
+        _require(isinstance(items, list), "items must be a list")
+        _require(len(items) <= MAX_MARKS_PER_BATCH,
+                 f"at most {MAX_MARKS_PER_BATCH} marks per batch, got {len(items)}")
+        prepared = [self._prepare_mark(it) for it in items]
+        if not prepared:
+            return []
+        return self._run("apply_marks", lambda c: self._marks_tx(c, prepared), None,
+                         key=f"{len(prepared)} marks")
+
+    def _prepare_mark(self, it: dict) -> dict:
+        """Validate one mark and build its verdict row and history detail."""
+        _require(isinstance(it, dict), "a mark must be a dict")
+        lab_id = _require_text(it.get("lab_id"), "lab_id")
+        mode, outcome = it.get("mode"), it.get("outcome")
         _require(mode in MODES, f"unknown mode {mode!r}")
         _require(outcome in MARK_OUTCOMES, f"unknown outcome {outcome!r}")
-        by = _require_text(by, "by")
+        by = _require_text(it.get("by"), "by")
+        when_policy = it.get("when") or "always"
+        _require(when_policy in _WHEN_POLICIES, f"unknown when {when_policy!r}")
+        at = it.get("at")
         when = self._now() if at is None else _require_float(at, "at")
-        row = (lab_id, mode, outcome, "" if outcome == "cleared" else (reason or "")[:MAX_TEXT],
-               _as_int(cc_task_id), _as_int(sample_id), by, when)
+        reason = (it.get("reason") or "")[:MAX_TEXT]
+        extra = it.get("extra_detail")
+        _require(extra is None or isinstance(extra, dict), "extra_detail must be a dict")
+        row = (lab_id, mode, outcome, "" if outcome == "cleared" else reason,
+               _as_int(it.get("cc_task_id")), _as_int(it.get("sample_id")), by, when)
         detail: Dict[str, Any] = {}
-        if tab is not None:
-            detail["tab"] = tab
+        if it.get("tab") is not None:
+            detail["tab"] = it.get("tab")
         if reason:
-            detail["reason"] = (reason or "")[:MAX_TEXT]
+            detail["reason"] = reason
+        detail.update(extra or {})
+        return {"row": row, "detail": detail, "when": when_policy}
 
-        def op(c: sqlite3.Connection) -> dict:
-            c.execute("BEGIN IMMEDIATE")
+    def _marks_tx(self, c: sqlite3.Connection, prepared: List[dict]) -> List[dict]:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            results = [self._apply_mark_tx(c, p["row"], dict(p["detail"]), p["when"])
+                       for p in prepared]
+            c.execute("COMMIT")
+        except BaseException:
+            # Not just sqlite3.Error: a ValueError from a bug in this block
+            # must not leave the writer sitting mid-transaction — every
+            # later write would silently vanish into it.
             try:
-                result = self._apply_mark_tx(c, row, dict(detail))
-                c.execute("COMMIT")
-            except BaseException:
-                # Not just sqlite3.Error: a ValueError from a bug in this
-                # block must not leave the writer sitting mid-transaction —
-                # every later write would silently vanish into it.
-                try:
-                    c.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
-                raise
-            return result
-        return self._run("apply_mark", op, None, key=lab_id)
+                c.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        return results
 
     @staticmethod
-    def _apply_mark_tx(c: sqlite3.Connection, row: tuple, detail: Dict[str, Any]) -> dict:
-        """The body of apply_mark's transaction (caller owns BEGIN/COMMIT)."""
+    def _verdict_rows(c: sqlite3.Connection, lab_id: str) -> Dict[str, dict]:
+        rows = c.execute("SELECT * FROM verdicts WHERE lab_id=?", (lab_id,)).fetchall()
+        return {r["mode"]: {
+            "outcome": r["outcome"], "reason": r["reason"],
+            "cc_task_id": r["cc_task_id"], "sample_id": r["sample_id"],
+            "by": r["by_user"], "at": r["at"],
+        } for r in rows}
+
+    @classmethod
+    def _apply_mark_tx(cls, c: sqlite3.Connection, row: tuple, detail: Dict[str, Any],
+                       when_policy: str = "always") -> dict:
+        """One mark inside a transaction the caller owns."""
         lab_id, mode, outcome, by, when = row[0], row[1], row[2], row[6], row[7]
         prev_row = c.execute("SELECT outcome, at FROM verdicts WHERE lab_id=? AND mode=?",
                              (lab_id, mode)).fetchone()
+        judged = prev_row is not None and prev_row["outcome"] in OUTCOMES
+        if (when_policy == "if_judged" and not judged) or \
+                (when_policy == "if_absent" and prev_row is not None):
+            return {"before": prev_row["outcome"] if judged else None, "applied": False,
+                    "skipped": True, "verdicts": cls._verdict_rows(c, lab_id)}
         applied = prev_row is None or prev_row["at"] <= when
         if applied:
-            prev_outcome = (prev_row["outcome"]
-                            if prev_row and prev_row["outcome"] != "cleared" else None)
+            prev_outcome = prev_row["outcome"] if judged else None
             c.execute(_UPSERT_VERDICT_IF_NEWER_SQL, row)
         else:
             # Superseded: "before" is what was in force at ``when`` — the
@@ -779,13 +851,8 @@ class SharedStore:
             (lab_id, when, by, "unmark" if outcome == "cleared" else "mark", mode,
              prev_outcome, None if outcome == "cleared" else outcome,
              _encode_detail(detail) if detail else None))
-        rows = c.execute("SELECT * FROM verdicts WHERE lab_id=?", (lab_id,)).fetchall()
-        verdicts = {r["mode"]: {
-            "outcome": r["outcome"], "reason": r["reason"],
-            "cc_task_id": r["cc_task_id"], "sample_id": r["sample_id"],
-            "by": r["by_user"], "at": r["at"],
-        } for r in rows}
-        return {"before": prev_outcome, "applied": applied, "verdicts": verdicts}
+        return {"before": prev_outcome, "applied": applied, "skipped": False,
+                "verdicts": cls._verdict_rows(c, lab_id)}
 
     # ── sample history ───────────────────────────────────────────────────
 

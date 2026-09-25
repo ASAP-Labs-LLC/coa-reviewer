@@ -366,6 +366,89 @@ def test_run_rolls_back_an_open_transaction_on_a_keep_error(store):
     assert store.set_verdict("B", "tests", "good", by="x") is True
 
 
+# ── extra_detail, apply_marks, last_write_error ────────────────────────────
+
+def test_apply_mark_extra_detail_is_recorded(store):
+    store.apply_mark("A", "tests", "cleared", by="x", tab="Due Out",
+                     extra_detail={"cause": "regenerate"})
+    assert store.history("A")[0]["detail"] == {"tab": "Due Out", "cause": "regenerate"}
+
+
+def test_apply_marks_is_one_batch_with_per_item_results(store, clock):
+    store.apply_mark("A", "tests", "good", by="x", at=clock.t - 10)
+    store.apply_mark("B", "info", "cleared", by="x", at=clock.t - 10)
+    out = store.apply_marks([
+        {"lab_id": "A", "mode": "tests", "outcome": "cleared", "by": "y",
+         "when": "if_judged", "extra_detail": {"cause": "regenerate"}},
+        {"lab_id": "A", "mode": "info", "outcome": "cleared", "by": "y", "when": "if_judged"},
+        {"lab_id": "B", "mode": "info", "outcome": "good", "by": "y", "when": "if_absent"},
+        {"lab_id": "C", "mode": "info", "outcome": "good", "by": "y", "when": "if_absent",
+         "at": clock.t - 5, "extra_detail": {"migrated": True}},
+    ])
+    assert [r["skipped"] for r in out] == [False, True, True, False]
+    got = store.verdicts_for(["A", "B", "C"])
+    assert got["A"]["tests"]["outcome"] == "cleared" and "info" not in got["A"]
+    assert got["B"]["info"]["outcome"] == "cleared"      # a tombstone counts as a row
+    assert got["C"]["info"]["at"] == clock.t - 5
+    assert store.history("A")[0]["detail"]["cause"] == "regenerate"
+    assert store.history("C")[0]["detail"]["migrated"] is True
+    assert len(store.history("B")) == 1                  # the skipped item wrote nothing
+
+
+def test_apply_marks_is_bounded(store):
+    from shared_store import MAX_MARKS_PER_BATCH
+    items = [{"lab_id": f"L{i}", "mode": "tests", "outcome": "good", "by": "x"}
+             for i in range(MAX_MARKS_PER_BATCH + 1)]
+    with pytest.raises(ValueError):
+        store.apply_marks(items)
+
+
+def test_apply_marks_validates_every_item_before_writing(store):
+    with pytest.raises(ValueError):
+        store.apply_marks([{"lab_id": "A", "mode": "tests", "outcome": "good", "by": "x"},
+                           {"lab_id": "B", "mode": "tests", "outcome": "meh", "by": "x"}])
+    assert store.verdicts_for(["A"]) == {}
+
+
+def test_apply_marks_is_atomic(store):
+    conn = store._connection()
+    conn.execute(
+        "CREATE TRIGGER fail_ev BEFORE INSERT ON sample_events WHEN NEW.lab_id = 'B' "
+        "BEGIN SELECT RAISE(ABORT, 'simulated'); END")
+    out = store.apply_marks([
+        {"lab_id": "A", "mode": "tests", "outcome": "good", "by": "x"},
+        {"lab_id": "B", "mode": "tests", "outcome": "good", "by": "x"}])
+    store._connection().execute("DROP TRIGGER IF EXISTS fail_ev")
+    assert out is None
+    assert store.verdicts_for(["A", "B"]) == {}
+
+
+def test_last_write_error_names_the_failure_kind(tmp_path):
+    path = tmp_path / "db.sqlite"
+    s = SharedStore(path)
+    assert s.set_verdict("seed", "tests", "good", by="x") is True
+    assert s.last_write_error is None
+    blocker = sqlite3.connect(str(path), timeout=1.0)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        assert s.apply_mark("A", "tests", "good", by="x") is None
+        assert s.last_write_error == "busy"
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert s.apply_mark("A", "tests", "good", by="x") is not None
+    assert s.last_write_error is None
+    s.close()
+
+
+def test_last_write_error_keep_for_a_bad_query(store):
+    def op(c):
+        c.execute("INSERT INTO meta (key, value) VALUES (NULL, NULL)")
+        return True
+    assert store._run("t", op, False) is False
+    assert store.last_write_error == "keep"
+
+
 # ── lock / corruption handling ──────────────────────────────────────────────
 
 def test_busy_write_returns_default_fast_and_next_write_succeeds(tmp_path):
