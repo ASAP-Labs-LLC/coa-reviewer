@@ -1320,6 +1320,11 @@ class UserState:
         # One session = one mode: two windows in different modes on the same
         # session are unsupported (each request switches the whole session).
         self.mode: str = "tests"
+        # A pre-v4 snapshot was hydrated and some of its marks (ledger entries,
+        # export rows, judged records on a tab whose mode is ambiguous) carry
+        # no mode yet. They take the mode the session first speaks in
+        # (settle_legacy), then behave like any v4 mark.
+        self.legacy_unsettled: bool = False
         # Held for every change to records' verdicts and session_results,
         # which request threads, render threads and other reviewers'
         # fan-out all make. Re-entrant; never held across I/O or SSE.
@@ -1409,9 +1414,29 @@ class UserState:
         entry = self.verdicts.get((tab, lab_id))
         if entry is None:
             return
-        if mode is not None and (entry.get("mode") or _legacy_mode(tab)) != mode:
+        if mode is not None and (entry.get("mode") or _legacy_mode(tab, mode)) != mode:
             return
         self.verdicts.pop((tab, lab_id), None)
+
+    def settle_legacy(self, mode: str) -> bool:
+        """Stamp every mode-less pre-v4 mark (ledger entry, export row,
+        judged record) with ``mode`` — the mode the session first speaks in
+        after restoring a pre-v4 snapshot. True if this call did it (only
+        the first caller does)."""
+        with self.records_lock:
+            if not self.legacy_unsettled:
+                return False
+            self.legacy_unsettled = False
+            for row in self.session_results:
+                if row.get("mode") not in REVIEW_MODES:
+                    row["mode"] = _legacy_mode(row.get("tab"), mode)
+            for entry in self.verdicts.values():
+                if entry.get("mode") not in REVIEW_MODES:
+                    entry["mode"] = _legacy_mode(entry.get("tab"), mode)
+            for rec in self.records.values():
+                if rec.status in (STATUS_GOOD, STATUS_BAD) and rec.verdict_mode is None:
+                    rec.verdict_mode = _legacy_mode(rec.tab, mode)
+            return True
 
     def _reapply_verdict(self, rec: SampleRecord) -> None:
         """A sample just (re)entered the list: if this account judged it
@@ -1426,10 +1451,11 @@ class UserState:
             return
         if rec.status in (STATUS_GOOD, STATUS_BAD):
             return
-        mode = entry.get("mode") or _legacy_mode(rec.tab)
+        mode = entry.get("mode") or _legacy_mode(rec.tab, self.mode)
         if mode != self.mode:
             return      # made in the other review mode; it stays in the ledger
         with self.records_lock:
+            entry["mode"] = mode    # a pre-v4 entry now belongs to this mode
             rec.status = entry["status"]
             rec.reason = entry.get("reason") or ""
             rec.cc_task_id = entry.get("cc_task_id")
@@ -1474,7 +1500,7 @@ class UserState:
         key = (rec.tab, rec.lab_id, mode)
         with self.records_lock:
             for i, existing in enumerate(self.session_results):
-                if _result_key(existing) == key:
+                if _result_key(existing, mode) == key:
                     self.session_results[i] = row
                     return
             self.session_results.append(row)
@@ -1489,21 +1515,22 @@ class UserState:
             self.session_results[:] = [
                 r for r in self.session_results
                 if not ((r.get("tab"), r.get("lab_id")) == (tab, lab_id)
-                        and (all_modes or _result_key(r)[2] == mode))
+                        and (all_modes or _result_key(r, mode)[2] == mode))
             ]
             return len(self.session_results) != before
 
     def result_for(self, tab: str, lab_id: str, mode: str) -> Optional[dict]:
         with self.records_lock:
             for r in self.session_results:
-                if _result_key(r) == (tab, lab_id, mode):
+                if _result_key(r, mode) == (tab, lab_id, mode):
                     return r
         return None
 
     def results_for_mode(self) -> List[dict]:
         """What Export and Good Samples show: this session's mode only."""
         with self.records_lock:
-            return [r for r in self.session_results if _result_key(r)[2] == self.mode]
+            return [r for r in self.session_results
+                    if _result_key(r, self.mode)[2] == self.mode]
 
     def get_tab_records(self, tab: str) -> List[SampleRecord]:
         recs = [r for (t, _), r in self.records.items() if t == tab]
@@ -1568,16 +1595,34 @@ class UserState:
         now = time.time()
         if doc.get("mode") in REVIEW_MODES:
             self.mode = doc["mode"]
+        else:
+            # Pre-v4: the snapshot does not say which mode its reviewer was
+            # in, so neither do its marks until the browser tells us.
+            self.legacy_unsettled = True
         for v in doc.get("verdicts") or []:
             if not isinstance(v, dict) or not v.get("lab_id") or not v.get("tab"):
                 continue
             if v.get("status") not in (STATUS_GOOD, STATUS_BAD) or not _verdict_is_fresh(v, now):
                 continue
-            self.verdicts[(str(v["tab"]), str(v["lab_id"]))] = dict(v)
+            entry = dict(v)
+            if entry.get("mode") not in REVIEW_MODES:
+                entry.pop("mode", None)
+                tab_mode = _tab_mode(entry.get("tab"))
+                if tab_mode:
+                    entry["mode"] = tab_mode
+                else:
+                    self.legacy_unsettled = True
+            self.verdicts[(str(v["tab"]), str(v["lab_id"]))] = entry
         self.session_results = [dict(x) for x in (doc.get("session_results") or [])
                                 if isinstance(x, dict)]
         for row in self.session_results:
-            row.setdefault("mode", _legacy_mode(row.get("tab")))
+            if row.get("mode") not in REVIEW_MODES:
+                row.pop("mode", None)
+                tab_mode = _tab_mode(row.get("tab"))
+                if tab_mode:
+                    row["mode"] = tab_mode
+                else:
+                    self.legacy_unsettled = True
         saved_at = doc.get("saved_at")
         added = 0
         for r in doc.get("records") or []:
@@ -1598,7 +1643,9 @@ class UserState:
             rec.cc_task_id = r.get("cc_task_id")
             if rec.status in (STATUS_GOOD, STATUS_BAD):
                 vm = r.get("verdict_mode")
-                rec.verdict_mode = vm if vm in REVIEW_MODES else _legacy_mode(rec.tab)
+                rec.verdict_mode = vm if vm in REVIEW_MODES else _tab_mode(rec.tab)
+                if rec.verdict_mode is None:
+                    self.legacy_unsettled = True
             try:
                 rec.shared_at = float(r.get("shared_at") or 0.0)
             except (TypeError, ValueError):
@@ -1617,20 +1664,35 @@ class UserState:
         return added
 
 
-def _legacy_mode(tab: Any) -> str:
-    """The review mode of a pre-v4 mark, which did not record one: Intaked
-    is Info mode's tab; everything else was Tests."""
-    return "info" if tab == "Intaked" else "tests"
+# The two tabs that only ever belonged to one review mode. A pre-v4 mark on
+# any other tab (Yesterday, Due Out, Search, Custom Day) could have been made
+# in either, so it has no mode of its own until a session applies it.
+_TAB_MODES = {"Intaked": "info", "Re-review": "tests"}
 
 
-def _result_key(row: dict) -> Tuple[Any, Any, str]:
-    return (row.get("tab"), row.get("lab_id"), row.get("mode") or _legacy_mode(row.get("tab")))
+def _tab_mode(tab: Any) -> Optional[str]:
+    """The mode a tab unambiguously belongs to, else None."""
+    return _TAB_MODES.get(tab) if isinstance(tab, str) else None
+
+
+def _legacy_mode(tab: Any, current: str) -> str:
+    """The review mode of a pre-v4 mark, which did not record one: the tab's
+    own mode where it has one (Intaked → info, Re-review → tests), otherwise
+    whichever mode the session is in — the mark matches either, and is
+    stamped with the mode it is first applied in."""
+    return _tab_mode(tab) or current
+
+
+def _result_key(row: dict, current: str) -> Tuple[Any, Any, str]:
+    """(tab, lab_id, mode); a mode-less pre-v4 row matches ``current``."""
+    return (row.get("tab"), row.get("lab_id"),
+            row.get("mode") or _legacy_mode(row.get("tab"), current))
 
 
 def _verdict_entry(rec: SampleRecord, judged_at: float, date_str: str,
                    mode: Optional[str] = None) -> dict:
     return {
-        "mode": mode or _legacy_mode(rec.tab),
+        "mode": mode or _tab_mode(rec.tab),
         "tab": rec.tab,
         "lab_id": rec.lab_id,
         "status": rec.status,
@@ -1705,8 +1767,10 @@ user_sessions: Dict[str, UserState] = {}
 _sessions_lock = threading.Lock()
 
 
-def get_user_state() -> Optional[UserState]:
-    """Return the UserState for the current request, or None if not authenticated."""
+def get_user_state(touch: bool = True) -> Optional[UserState]:
+    """Return the UserState for the current request, or None if not
+    authenticated. ``touch=False`` looks it up without counting the request
+    as the reviewer being active (the Time Online tab's polls)."""
     uid = session.get("uid")
     if not uid:
         return None
@@ -1714,7 +1778,8 @@ def get_user_state() -> Optional[UserState]:
         ustate = user_sessions.get(uid)
     if ustate is None:
         return None
-    ustate.last_active = time.time()
+    if touch:
+        ustate.last_active = time.time()
     return ustate
 
 
@@ -1749,7 +1814,7 @@ MAX_MIGRATION_CANDIDATES = 50_000
 PENDING_VERDICTS_FILE = DATA_DIR / "pending_verdicts.json"
 # Only these tabs say which mode a pre-v4 mark was made in; a Yesterday or
 # Due Out mark could have been either, so it stays in its own ledger.
-_MIGRATION_TAB_MODES = {"Intaked": "info", "Re-review": "tests"}
+_MIGRATION_TAB_MODES = _TAB_MODES
 _PENDING_OUTCOMES = ("good", "bad", "cleared")
 
 # When a mark is made. A seam so tests can place marks in time; the time
@@ -2025,19 +2090,28 @@ def _apply_shared_to_records(ustate: "UserState", records: List[SampleRecord],
 def _note_mode(ustate: "UserState", raw: Any) -> str:
     """The mode a request speaks for; remembered on the session. Anything
     but a known mode falls back to the session's current mode. A change
-    re-derives every record for the new mode (_switch_mode)."""
-    if raw in REVIEW_MODES and raw != ustate.mode:
+    re-derives every record for the new mode (_switch_mode).
+
+    The first request after a pre-v4 snapshot was restored settles its
+    mode-less marks into the mode this request speaks for, and re-derives
+    even without a change: the snapshot never said which mode the session
+    was in, so a restored Intaked (info) mark can be on show in Tests."""
+    target = raw if raw in REVIEW_MODES else ustate.mode
+    if ustate.legacy_unsettled and ustate.settle_legacy(target):
+        _switch_mode(ustate, target, force=True)
+    elif raw in REVIEW_MODES and raw != ustate.mode:
         _switch_mode(ustate, raw)
     return ustate.mode
 
 
-def _switch_mode(ustate: "UserState", mode: str) -> None:
+def _switch_mode(ustate: "UserState", mode: str, force: bool = False) -> None:
     """Verdicts are per mode, so a switch sets aside every verdict made in
     the other mode (its export rows and ledger entries are kept, and come
     back on the way back), then applies this mode's: ledger first, then one
-    batched shared read (newer wins)."""
+    batched shared read (newer wins). ``force`` re-derives even when the
+    session is already in ``mode``."""
     with ustate.records_lock:
-        if ustate.mode == mode:
+        if ustate.mode == mode and not force:
             return      # a concurrent request (restoreAllTabs) got here first
         old, ustate.mode = ustate.mode, mode
         recs = list(ustate.records.values())
@@ -2373,6 +2447,18 @@ def require_portal(f):
     return wrapper
 
 
+def require_portal_no_touch(f):
+    """Like ``require_portal``, but checking the session does not refresh
+    its ``last_active`` — for polls that are not a person using the app
+    (see ``_NON_ACTIVITY_PATHS``)."""
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if get_user_state(touch=False) is None:
+            return jsonify({"error": "Session expired", "portal_auth": False}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
 def _reap_idle_sessions(now: float) -> List[UserState]:
     """Drop sessions idle longer than SESSION_CLEANUP_SECONDS, writing each
     one's review down first so a re-auth or re-login can bring it back.
@@ -2631,14 +2717,23 @@ def _flush_log_handlers() -> None:
 
 
 def _save_presence_before_switch() -> None:
-    """Put presence on disk before asking for a switch, which kills us with
+    """Put presence, pending shared-verdict writes and fan-out-changed
+    sessions on disk before asking for a switch, which kills us with
     taskkill /F and skips _graceful_shutdown. Saved, not closed: people keep
     working while the updater answers, and the next process closes any open
-    span at its last touch. Never raises."""
+    span at its last touch. Each save is independent. Never raises."""
     try:
         state.presence.flush(blocking=True, timeout=PRESENCE_SAVE_TIMEOUT_SECONDS)
     except Exception:
         restart_log.exception("could not save presence before the switch")
+    try:
+        pending_verdicts.save()
+    except Exception:
+        restart_log.exception("could not save pending verdicts before the switch")
+    try:
+        _persist_dirty_sessions()
+    except Exception:
+        restart_log.exception("could not save changed sessions before the switch")
     _flush_log_handlers()
 
 
@@ -3605,7 +3700,14 @@ def _handle_qbench_error(exc):
 # deploy, and the frontend polls /api/health while waiting for a restart.
 # Either would also suppress the 3 AM auto-restart, which is gated on the same
 # timestamp — so a monitoring call would silently disable a token refresh.
-_NON_ACTIVITY_PATHS = frozenset({"/healthz", "/api/health"})
+#
+# The Time Online tab's data calls are the same kind of thing: an open
+# /activity tab polls them every 120 s while visible, and counting that would
+# keep its viewer "online" (presence) and the app "busy" for as long as the
+# tab stays open. They still need a session (@require_portal_no_touch), but
+# checking it does not refresh last_active either.
+_NON_ACTIVITY_PATHS = frozenset({"/healthz", "/api/health",
+                                 "/api/activity", "/api/activity/range"})
 
 
 @app.before_request
@@ -3685,7 +3787,7 @@ def sample_history(lab_id: str):
 
 
 @app.route("/api/activity")
-@require_portal
+@require_portal_no_touch
 def activity_day():
     """The Time Online day payload for ``/activity``. ``online``/``is_today``
     are only meaningful for *today* — activity.build_day() itself zeroes
@@ -3719,7 +3821,7 @@ def activity_day():
 
 
 @app.route("/api/activity/range")
-@require_portal
+@require_portal_no_touch
 def activity_range():
     """First/last recorded day, for the date picker's min/max — ``None``
     (JSON ``null``) before anything has ever been recorded."""
@@ -4087,7 +4189,9 @@ def start_pulling():
     if mode not in ("info", "tests"):
         mode = "tests"
     # The list was just cleared, so there is nothing to re-derive: set it.
+    # Pre-v4 marks still in the ledger take this mode (settle_legacy).
     ustate.mode = mode
+    ustate.settle_legacy(mode)
 
     yesterday = business_days_ago(2)
     due_out   = business_days_ago(3)

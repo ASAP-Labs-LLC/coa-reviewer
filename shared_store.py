@@ -1356,7 +1356,10 @@ class SharedStore:
                             limit: int = MAX_RANGE_ROWS) -> List[dict]:
         """Like ``events_between`` but only ``user``/``at``/``kind`` — the
         slim shape the Time Online day builder needs, without paying to
-        decode every ``detail`` JSON blob for a day with a lot of activity."""
+        decode every ``detail`` JSON blob for a day with a lot of activity.
+        ``external_change`` rows are left out: their ``user`` is a LabVision
+        operator or "Outside COA Reviewer", not someone using the app, and
+        they must not take a column or use up the row limit."""
         start = _require_float(start, "start")
         end = _require_float(end, "end")
         limit = max(1, min(int(limit), MAX_RANGE_ROWS))
@@ -1364,6 +1367,7 @@ class SharedStore:
         def op(c: sqlite3.Connection) -> List[dict]:
             rows = c.execute(
                 "SELECT user, at, kind FROM sample_events WHERE at >= ? AND at < ?"
+                " AND kind != 'external_change'"
                 " ORDER BY at, id LIMIT ?", (start, end, limit)).fetchall()
             return [{"user": r["user"], "at": r["at"], "kind": r["kind"]} for r in rows]
         rows = self._run_read("event_marks_between", op, [])
