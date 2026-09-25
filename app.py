@@ -46,7 +46,7 @@ from qbench_client import QBenchAPIClient, QBenchAPIError
 from labcore_client import LabCoreClient, LabCoreUnavailable
 from change_log import ChangeLog
 from presence import PresenceTracker
-from shared_store import SharedStore
+from shared_store import MAX_MARKS_PER_BATCH, SharedStore
 import restart_update
 import tray
 
@@ -1016,6 +1016,12 @@ class SampleRecord:
         # rather than going to `error`, so this is what stops the window
         # queueing the same failing render on every focus; Regenerate clears it.
         self.render_failed: bool = False
+        # Shared verdicts: when the verdict this record shows was made (a
+        # local mark, a ledger entry or a shared verdict), so an older one
+        # arriving late — a stale tab-load read — can never overwrite it;
+        # and which review mode it belongs to.
+        self.shared_at: float = 0.0
+        self.verdict_mode: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -1278,7 +1284,15 @@ class UserState:
         # The review mode ("info" / "tests") this session speaks for: which
         # shared verdicts apply to its records. Set by /api/start and by the
         # mode the browser sends with /api/mark and /api/tabs (_note_mode).
+        # One session = one mode: two windows in different modes on the same
+        # session are unsupported (each request switches the whole session).
         self.mode: str = "tests"
+        # Held for every change to records' verdicts and session_results,
+        # which request threads, render threads and other reviewers'
+        # fan-out all make. Re-entrant; never held across I/O or SSE.
+        self.records_lock = threading.RLock()
+        # A fan-out changed this session; the cleanup worker writes it down.
+        self.dirty: bool = False
         self.pdf_cache = PdfCache()
         self.pdf_loading: set = set()
         # Renders waiting in PREVIEW_POOL, keyed like `records`, so a window
@@ -1349,12 +1363,21 @@ class UserState:
 
     # ── remembered verdicts ──────────────────────────────────────────────
 
-    def remember_verdict(self, rec: SampleRecord) -> None:
+    def remember_verdict(self, rec: SampleRecord, judged_at: Optional[float] = None) -> None:
         """This account judged `rec` just now; keep that for 12 hours."""
         self.verdicts[(rec.tab, rec.lab_id)] = _verdict_entry(
-            rec, judged_at=time.time(), date_str=date.today().isoformat())
+            rec, judged_at=judged_at if judged_at is not None else time.time(),
+            date_str=date.today().isoformat(), mode=rec.verdict_mode or self.mode)
 
-    def forget_verdict(self, tab: str, lab_id: str) -> None:
+    def forget_verdict(self, tab: str, lab_id: str, mode: Optional[str] = None) -> None:
+        """Drop the remembered mark for (tab, lab_id) — only if it was made in
+        ``mode`` when one is given. The ledger holds one mark per (tab,
+        lab_id), so an Info mark there must survive a Tests un-mark."""
+        entry = self.verdicts.get((tab, lab_id))
+        if entry is None:
+            return
+        if mode is not None and (entry.get("mode") or _legacy_mode(tab)) != mode:
+            return
         self.verdicts.pop((tab, lab_id), None)
 
     def _reapply_verdict(self, rec: SampleRecord) -> None:
@@ -1370,11 +1393,17 @@ class UserState:
             return
         if rec.status in (STATUS_GOOD, STATUS_BAD):
             return
-        rec.status = entry["status"]
-        rec.reason = entry.get("reason") or ""
-        rec.cc_task_id = entry.get("cc_task_id")
-        self.record_result(rec, "Good" if rec.status == STATUS_GOOD else "Bad",
-                           rec.reason, date_str=entry.get("date"))
+        mode = entry.get("mode") or _legacy_mode(rec.tab)
+        if mode != self.mode:
+            return      # made in the other review mode; it stays in the ledger
+        with self.records_lock:
+            rec.status = entry["status"]
+            rec.reason = entry.get("reason") or ""
+            rec.cc_task_id = entry.get("cc_task_id")
+            rec.verdict_mode = mode
+            rec.shared_at = max(rec.shared_at, float(entry.get("judged_at") or 0.0))
+            self.record_result(rec, "Good" if rec.status == STATUS_GOOD else "Bad",
+                               rec.reason, date_str=entry.get("date"), mode=mode)
 
     def _result_date(self, key: Tuple[str, str]) -> Optional[str]:
         for r in self.session_results:
@@ -1384,7 +1413,8 @@ class UserState:
 
     def record_result(self, rec: SampleRecord, outcome: str, reason: str = "",
                       date_str: Optional[str] = None,
-                      reviewer: Optional[str] = None) -> None:
+                      reviewer: Optional[str] = None,
+                      mode: Optional[str] = None) -> None:
         """Record this sample's review outcome, replacing any earlier one.
 
         session_results feeds Export CSV and Good Samples. It used to be
@@ -1394,7 +1424,10 @@ class UserState:
         `date_str` is for a verdict brought back after a re-pull, which keeps
         the day it was actually judged. `reviewer` names who made a shared
         verdict that reached this session from someone else (default: us).
+        Rows are per review mode too — an Info verdict never overwrites a
+        Tests row — and exports show only the session's mode.
         """
+        mode = mode or self.mode
         row = {
             "lab_id": rec.lab_id,
             "sample_id": rec.sample_id or "",
@@ -1403,22 +1436,41 @@ class UserState:
             "reason": reason,
             "reviewer": reviewer or self.name,
             "date": date_str or date.today().isoformat(),
+            "mode": mode,
         }
-        key = (rec.tab, rec.lab_id)
-        for i, existing in enumerate(self.session_results):
-            if (existing.get("tab"), existing.get("lab_id")) == key:
-                self.session_results[i] = row
-                return
-        self.session_results.append(row)
+        key = (rec.tab, rec.lab_id, mode)
+        with self.records_lock:
+            for i, existing in enumerate(self.session_results):
+                if _result_key(existing) == key:
+                    self.session_results[i] = row
+                    return
+            self.session_results.append(row)
 
-    def clear_result(self, tab: str, lab_id: str) -> bool:
-        """Drop a sample's outcome so it leaves the exports. True if removed."""
-        before = len(self.session_results)
-        self.session_results = [
-            r for r in self.session_results
-            if (r.get("tab"), r.get("lab_id")) != (tab, lab_id)
-        ]
-        return len(self.session_results) != before
+    def clear_result(self, tab: str, lab_id: str, mode: Optional[str] = None,
+                     all_modes: bool = False) -> bool:
+        """Drop a sample's outcome (this mode's, or every mode's) so it leaves
+        the exports. True if removed. Mutates in place under the lock."""
+        mode = mode or self.mode
+        with self.records_lock:
+            before = len(self.session_results)
+            self.session_results[:] = [
+                r for r in self.session_results
+                if not ((r.get("tab"), r.get("lab_id")) == (tab, lab_id)
+                        and (all_modes or _result_key(r)[2] == mode))
+            ]
+            return len(self.session_results) != before
+
+    def result_for(self, tab: str, lab_id: str, mode: str) -> Optional[dict]:
+        with self.records_lock:
+            for r in self.session_results:
+                if _result_key(r) == (tab, lab_id, mode):
+                    return r
+        return None
+
+    def results_for_mode(self) -> List[dict]:
+        """What Export and Good Samples show: this session's mode only."""
+        with self.records_lock:
+            return [r for r in self.session_results if _result_key(r)[2] == self.mode]
 
     def get_tab_records(self, tab: str) -> List[SampleRecord]:
         recs = [r for (t, _), r in self.records.items() if t == tab]
@@ -1447,11 +1499,14 @@ class UserState:
                 "cc_task_id": rec.cc_task_id,
                 "cc_task": rec.cc_task,
                 "info": rec.info,
+                "verdict_mode": rec.verdict_mode,
+                "shared_at": rec.shared_at,
             })
         now = time.time()
         return {
             "version": 2,
             "name": self.name,
+            "mode": self.mode,
             "saved_at": now,
             "records": records,
             "session_results": [dict(r) for r in list(self.session_results)],
@@ -1478,6 +1533,8 @@ class UserState:
         """Rebuild records, results and remembered verdicts from a snapshot.
         Returns records added."""
         now = time.time()
+        if doc.get("mode") in REVIEW_MODES:
+            self.mode = doc["mode"]
         for v in doc.get("verdicts") or []:
             if not isinstance(v, dict) or not v.get("lab_id") or not v.get("tab"):
                 continue
@@ -1486,6 +1543,8 @@ class UserState:
             self.verdicts[(str(v["tab"]), str(v["lab_id"]))] = dict(v)
         self.session_results = [dict(x) for x in (doc.get("session_results") or [])
                                 if isinstance(x, dict)]
+        for row in self.session_results:
+            row.setdefault("mode", _legacy_mode(row.get("tab")))
         saved_at = doc.get("saved_at")
         added = 0
         for r in doc.get("records") or []:
@@ -1504,6 +1563,13 @@ class UserState:
             rec.status = status if status in (STATUS_GOOD, STATUS_BAD) else STATUS_PENDING
             rec.reason = r.get("reason") or ""
             rec.cc_task_id = r.get("cc_task_id")
+            if rec.status in (STATUS_GOOD, STATUS_BAD):
+                vm = r.get("verdict_mode")
+                rec.verdict_mode = vm if vm in REVIEW_MODES else _legacy_mode(rec.tab)
+            try:
+                rec.shared_at = float(r.get("shared_at") or 0.0)
+            except (TypeError, ValueError):
+                rec.shared_at = 0.0
             self.add_record(rec)
             added += 1
             key = (rec.tab, rec.lab_id)
@@ -1513,12 +1579,25 @@ class UserState:
                 self.verdicts[key] = _verdict_entry(
                     rec,
                     judged_at=saved_at if isinstance(saved_at, (int, float)) else now,
-                    date_str=self._result_date(key) or date.today().isoformat())
+                    date_str=self._result_date(key) or date.today().isoformat(),
+                    mode=rec.verdict_mode)
         return added
 
 
-def _verdict_entry(rec: SampleRecord, judged_at: float, date_str: str) -> dict:
+def _legacy_mode(tab: Any) -> str:
+    """The review mode of a pre-v4 mark, which did not record one: Intaked
+    is Info mode's tab; everything else was Tests."""
+    return "info" if tab == "Intaked" else "tests"
+
+
+def _result_key(row: dict) -> Tuple[Any, Any, str]:
+    return (row.get("tab"), row.get("lab_id"), row.get("mode") or _legacy_mode(row.get("tab")))
+
+
+def _verdict_entry(rec: SampleRecord, judged_at: float, date_str: str,
+                   mode: Optional[str] = None) -> dict:
     return {
+        "mode": mode or _legacy_mode(rec.tab),
         "tab": rec.tab,
         "lab_id": rec.lab_id,
         "status": rec.status,
@@ -1629,12 +1708,31 @@ _OUTCOME_LABEL = {"good": "Good", "bad": "Bad"}
 MAX_FANOUT_SESSIONS = 200          # sessions one mark fans out to
 MAX_PENDING_VERDICTS = 2000        # failed writes held for retry
 MAX_PENDING_RETRY_PER_CYCLE = 200  # retries per cleanup cycle
+MAX_PENDING_ATTEMPTS = 10          # a write the store keeps rejecting is dropped
+MAX_DIRTY_PERSISTS_PER_CYCLE = 200 # fanned-out sessions written per cycle
 MAX_MIGRATION_FILES = 500
 MAX_MIGRATION_VERDICTS_PER_FILE = 5000
+MAX_MIGRATION_CANDIDATES = 50_000
+PENDING_VERDICTS_FILE = DATA_DIR / "pending_verdicts.json"
+# Only these tabs say which mode a pre-v4 mark was made in; a Yesterday or
+# Due Out mark could have been either, so it stays in its own ledger.
+_MIGRATION_TAB_MODES = {"Intaked": "info", "Re-review": "tests"}
+_PENDING_OUTCOMES = ("good", "bad", "cleared")
 
 # When a mark is made. A seam so tests can place marks in time; the time
 # travels with a pending write so its retry is ordered correctly.
 _mark_clock: Callable[[], float] = time.time
+
+
+def _valid_pending(row: Any) -> Optional[dict]:
+    """A pending entry read back from disk, or None if it is not one."""
+    if not isinstance(row, dict):
+        return None
+    ok = (isinstance(row.get("lab_id"), str) and row["lab_id"].strip()
+          and row.get("mode") in REVIEW_MODES and row.get("outcome") in _PENDING_OUTCOMES
+          and isinstance(row.get("by"), str) and row["by"].strip()
+          and isinstance(row.get("at"), (int, float)) and not isinstance(row.get("at"), bool))
+    return dict(row) if ok else None
 
 
 class PendingVerdicts:
@@ -1642,12 +1740,18 @@ class PendingVerdicts:
 
     Bounded: past ``cap`` the oldest entry is dropped with an ERROR naming it
     (that mark then lives only in its reviewer's own ledger). Only the newest
-    mark per key is kept — an older one arriving later is ignored."""
+    mark per key is kept — an older one arriving later is ignored. With a
+    ``path`` it survives a restart: ``save()`` (coalesced — the cleanup
+    worker calls it each cycle, and the exit path once) writes atomically
+    when something changed; ``load()`` reads it back at startup. Replaying
+    a stale entry is safe: the store only applies a mark over older work."""
 
-    def __init__(self, cap: int = MAX_PENDING_VERDICTS) -> None:
+    def __init__(self, cap: int = MAX_PENDING_VERDICTS, path: Optional[Path] = None) -> None:
         self._cap = max(1, int(cap))
         self._items: "OrderedDict[Tuple[str, str], dict]" = OrderedDict()
         self._lock = threading.Lock()
+        self._path = path
+        self._dirty = False
 
     def __len__(self) -> int:
         with self._lock:
@@ -1661,9 +1765,10 @@ class PendingVerdicts:
             if old is not None and old.get("at", 0.0) > entry.get("at", 0.0):
                 return
             self._items.pop(key, None)
-            self._items[key] = dict(entry)
+            self._items[key] = {k: v for k, v in entry.items() if k not in ("lab_id", "mode")}
             if len(self._items) > self._cap:
                 dropped = self._items.popitem(last=False)
+            self._dirty = True
             size = len(self._items)
         if dropped is not None:
             (d_lab, d_mode), d = dropped
@@ -1695,19 +1800,71 @@ class PendingVerdicts:
             entry = self._items.get(key)
             if entry is not None and entry.get("at") == at:
                 del self._items[key]
+                self._dirty = True
                 return True
             return False
 
+    def bump(self, key: Tuple[str, str], at: float) -> int:
+        """Count one more failed attempt at the entry made at ``at``."""
+        with self._lock:
+            entry = self._items.get(key)
+            if entry is None or entry.get("at") != at:
+                return 0
+            entry["attempts"] = int(entry.get("attempts") or 0) + 1
+            self._dirty = True
+            return entry["attempts"]
 
-pending_verdicts = PendingVerdicts()
+    def save(self) -> bool:
+        """Write the queue if it changed. True if written. Never raises."""
+        if self._path is None:
+            return False
+        with self._lock:
+            if not self._dirty:
+                return False
+            rows = [dict(e, lab_id=k[0], mode=k[1]) for k, e in self._items.items()]
+            self._dirty = False
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(rows, default=str), encoding="utf-8")
+            os.replace(tmp, self._path)
+            return True
+        except OSError as exc:
+            verdict_log.warning("could not save %d pending verdict(s): %s", len(rows), exc)
+            with self._lock:
+                self._dirty = True
+            return False
+
+    def load(self) -> int:
+        """Read a saved queue back (at most ``cap`` entries). Never raises."""
+        if self._path is None or not self._path.exists():
+            return 0
+        try:
+            rows = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            verdict_log.warning("pending verdicts file unreadable, starting empty: %s", exc)
+            return 0
+        if not isinstance(rows, list):
+            verdict_log.warning("pending verdicts file is not a list; starting empty")
+            return 0
+        loaded = 0
+        for row in rows[:self._cap * 2]:
+            entry = _valid_pending(row)
+            if entry is None:
+                continue
+            if loaded >= self._cap:
+                break
+            self.put(entry["lab_id"], entry["mode"], entry)
+            loaded += 1
+        with self._lock:
+            self._dirty = False
+        if loaded:
+            verdict_log.warning("%d shared verdict write(s) pending from the last run; "
+                                "retrying", loaded)
+        return loaded
 
 
-def _note_mode(ustate: "UserState", raw: Any) -> str:
-    """The mode a request speaks for; remembered on the session. Anything
-    but a known mode falls back to the session's current mode."""
-    if raw in REVIEW_MODES:
-        ustate.mode = raw
-    return ustate.mode
+pending_verdicts = PendingVerdicts(path=PENDING_VERDICTS_FILE)
 
 
 def _no_tags() -> dict:
@@ -1754,41 +1911,58 @@ def _verdict_date(at: Any) -> Optional[str]:
         return None
 
 
-def _apply_shared(ustate: "UserState", rec: SampleRecord, verdict: Optional[dict]) -> bool:
-    """Make ``rec`` show the shared verdict for this session's mode. True if
-    it changed. Absent (None) changes nothing — a store outage or a sample
-    nobody has judged must never un-judge anyone; only an explicit tombstone
-    does. Never touches the preview."""
+def _unjudge(rec: SampleRecord) -> None:
+    """Back to "rendered, awaiting review" — READY, never PENDING, when a COA
+    exists (see mark_sample's uncheck). Caller holds the records lock."""
+    rec.status = STATUS_READY if rec.preview_url else STATUS_PENDING
+    rec.reason, rec.cc_task_id, rec.verdict_mode = "", None, None
+
+
+def _apply_shared(ustate: "UserState", rec: SampleRecord, verdict: Optional[dict],
+                  mode: str) -> bool:
+    """Make ``rec`` show the shared ``mode`` verdict. True if anything a
+    reviewer sees changed. Absent (None) changes nothing — a store outage or
+    a sample nobody has judged must never un-judge anyone; only an explicit
+    tombstone does. A verdict no newer than the one the record shows is
+    ignored, so a stale read can never overwrite a fresher fan-out."""
     if verdict is None:
         return False
+    at = float(verdict.get("at") or 0.0)
     outcome = verdict.get("outcome")
-    if outcome == "cleared":
-        if rec.status not in (STATUS_GOOD, STATUS_BAD):
+    with ustate.records_lock:
+        if at <= rec.shared_at:
             return False
-        # READY, never PENDING, when a COA exists (see mark_sample's uncheck).
-        rec.status = STATUS_READY if rec.preview_url else STATUS_PENDING
-        rec.reason, rec.cc_task_id = "", None
-        ustate.clear_result(rec.tab, rec.lab_id)
-        ustate.forget_verdict(rec.tab, rec.lab_id)
+        if outcome == "cleared":
+            rec.shared_at = at
+            if rec.status not in (STATUS_GOOD, STATUS_BAD):
+                return False
+            _unjudge(rec)
+            ustate.clear_result(rec.tab, rec.lab_id, mode)
+            ustate.forget_verdict(rec.tab, rec.lab_id, mode)
+            return True
+        if outcome not in _OUTCOME_LABEL:
+            return False
+        rec.shared_at = at
+        status = STATUS_GOOD if outcome == "good" else STATUS_BAD
+        reason, by = verdict.get("reason") or "", verdict.get("by")
+        row = ustate.result_for(rec.tab, rec.lab_id, mode)
+        if (rec.status == status and rec.reason == reason
+                and rec.cc_task_id == verdict.get("cc_task_id")
+                and row is not None and row.get("reviewer") == by):
+            return False
+        rec.status, rec.reason = status, reason
+        rec.cc_task_id = verdict.get("cc_task_id")
+        rec.verdict_mode = mode
+        mine = ustate.verdicts.get((rec.tab, rec.lab_id))
+        if mine is not None and mine.get("status") != status:
+            ustate.forget_verdict(rec.tab, rec.lab_id, mode)   # superseded; don't resurrect it
+        ustate.record_result(rec, _OUTCOME_LABEL[outcome], reason,
+                             date_str=_verdict_date(at), reviewer=by, mode=mode)
         return True
-    if outcome not in _OUTCOME_LABEL:
-        return False
-    status = STATUS_GOOD if outcome == "good" else STATUS_BAD
-    reason = verdict.get("reason") or ""
-    if rec.status == status and rec.reason == reason \
-            and rec.cc_task_id == verdict.get("cc_task_id"):
-        return False
-    rec.status = status
-    rec.reason = reason
-    rec.cc_task_id = verdict.get("cc_task_id")
-    ustate.record_result(rec, _OUTCOME_LABEL[outcome], reason,
-                         date_str=_verdict_date(verdict.get("at")),
-                         reviewer=verdict.get("by"))
-    return True
 
 
 def _apply_shared_to_records(ustate: "UserState", records: List[SampleRecord],
-                             mode: str) -> Dict[str, dict]:
+                             mode: str, persist: bool = True) -> Dict[str, dict]:
     """Tab load: one batched store read, apply the session-mode verdicts,
     return ``{lab_id: tags}``. Store unreadable → records untouched, no tags."""
     started = time.perf_counter()
@@ -1801,27 +1975,64 @@ def _apply_shared_to_records(ustate: "UserState", records: List[SampleRecord],
         return {}
     tags: Dict[str, dict] = {}
     changed = 0
-    for r in records:
-        merged = _merged_verdicts(r.lab_id, stored.get(r.lab_id))
-        if merged:
-            tags[r.lab_id] = _tags_from(merged)
-        if _apply_shared(ustate, r, merged.get(mode)):
-            changed += 1
-    if changed:
+    with ustate.records_lock:
+        for r in records:
+            merged = _merged_verdicts(r.lab_id, stored.get(r.lab_id))
+            if merged:
+                tags[r.lab_id] = _tags_from(merged)
+            if _apply_shared(ustate, r, merged.get(mode), mode):
+                changed += 1
+    if changed and persist:
         ustate.persist()
     verdict_log.debug("tab load (%s): %d record(s), %d changed by shared verdicts, %.1f ms",
                       mode, len(records), changed, (time.perf_counter() - started) * 1000)
     return tags
 
 
-def _fan_out(actor: "UserState", rec: SampleRecord, mode: str,
-             verdict: Optional[dict]) -> int:
-    """Apply ``verdict`` to every live session in ``mode`` holding the lab id,
-    except the actor's own record that was just marked. Returns records
-    changed. The session lock is held only to copy the list; snapshots are
-    written after, outside it."""
-    if verdict is None:
-        return 0
+def _note_mode(ustate: "UserState", raw: Any) -> str:
+    """The mode a request speaks for; remembered on the session. Anything
+    but a known mode falls back to the session's current mode. A change
+    re-derives every record for the new mode (_switch_mode)."""
+    if raw in REVIEW_MODES and raw != ustate.mode:
+        _switch_mode(ustate, raw)
+    return ustate.mode
+
+
+def _switch_mode(ustate: "UserState", mode: str) -> None:
+    """Verdicts are per mode, so a switch sets aside every verdict made in
+    the other mode (its export rows and ledger entries are kept, and come
+    back on the way back), then applies this mode's: ledger first, then one
+    batched shared read (newer wins)."""
+    with ustate.records_lock:
+        if ustate.mode == mode:
+            return      # a concurrent request (restoreAllTabs) got here first
+        old, ustate.mode = ustate.mode, mode
+        recs = list(ustate.records.values())
+        set_aside = 0
+        for r in recs:
+            if r.status in (STATUS_GOOD, STATUS_BAD) and r.verdict_mode == mode:
+                continue
+            r.shared_at = 0.0
+            if r.status in (STATUS_GOOD, STATUS_BAD):
+                _unjudge(r)
+                set_aside += 1
+        for r in recs:
+            ustate._reapply_verdict(r)
+    _apply_shared_to_records(ustate, recs, mode, persist=False)
+    ustate.persist()
+    verdict_log.info("%s switched review mode %s → %s: %d verdict(s) set aside",
+                     ustate.name, old, mode, set_aside)
+
+
+def _fan_out(actor: "UserState", vmap: Dict[Tuple[str, str], dict],
+             skip: set) -> Tuple[List["UserState"], int]:
+    """Apply ``vmap`` ((lab_id, mode) → verdict) to every live session whose
+    mode matches, except the actor's records in ``skip``. The sessions lock
+    is held only to copy the list; each session's own lock only while its
+    records change; SSE after. Returns (sessions changed, records changed)."""
+    if not vmap:
+        return [], 0
+    labs = {lid for lid, _ in vmap}
     with _sessions_lock:
         sessions = list(user_sessions.values())
     if len(sessions) > MAX_FANOUT_SESSIONS:
@@ -1831,20 +2042,98 @@ def _fan_out(actor: "UserState", rec: SampleRecord, mode: str,
     touched: List["UserState"] = []
     total = 0
     for us in sessions:
-        if us.mode != mode:
-            continue
-        changed = [r for (t, lid), r in list(us.records.items())
-                   if lid == rec.lab_id and not (us is actor and t == rec.tab)
-                   and _apply_shared(us, r, verdict)]
-        for r in changed:
-            us.emit_sse({"type": "sample_status", "tab": r.tab, "lab_id": r.lab_id,
-                         "status": r.status})
+        changed = []
+        with us.records_lock:
+            for (t, lid), r in list(us.records.items()):
+                v = vmap.get((lid, us.mode)) if lid in labs else None
+                if v is None or (us is actor and (t, lid) in skip):
+                    continue
+                if _apply_shared(us, r, v, us.mode):
+                    changed.append((r.tab, r.lab_id, r.status))
+        for t, lid, st in changed:
+            us.emit_sse({"type": "sample_status", "tab": t, "lab_id": lid, "status": st})
         if changed:
             touched.append(us)
             total += len(changed)
+    return touched, total
+
+
+def _mark_item(actor: "UserState", rec: SampleRecord, outcome: str, mode: str, at: float,
+               *, when: str = "always", cause: Optional[str] = None) -> dict:
+    """One shared-store mark (the shape apply_marks and pending entries use)."""
+    stored = "cleared" if outcome == "uncheck" else outcome
+    item = {"lab_id": rec.lab_id, "mode": mode, "outcome": stored,
+            "reason": "" if stored == "cleared" else rec.reason,
+            "cc_task_id": None if stored == "cleared" else rec.cc_task_id,
+            "sample_id": rec.sample_id, "by": actor.name, "at": at, "tab": rec.tab,
+            "when": when}
+    if cause:
+        item["extra_detail"] = {"cause": cause}
+    return item
+
+
+def _write_marks(items: List[dict]) -> List[Optional[dict]]:
+    """apply_marks in bounded chunks; one result (or None) per item."""
+    out: List[Optional[dict]] = []
+    for start in range(0, len(items), MAX_MARKS_PER_BATCH):
+        chunk = items[start:start + MAX_MARKS_PER_BATCH]
+        try:
+            res = state.shared.apply_marks(chunk)
+        except Exception:
+            verdict_log.exception("shared verdict write raised (%d mark(s))", len(chunk))
+            res = None
+        out.extend(res if res is not None else [None] * len(chunk))
+    return out
+
+
+def _share_marks(actor: "UserState", items: List[dict],
+                 skip: set) -> Dict[str, Optional[dict]]:
+    """Write marks to the store (a failed write is queued as pending), fan
+    them out, write the changed sessions down, broadcast tags and history.
+    Returns ``{lab_id: tags or None}`` (None = unknown). Never raises."""
+    results = _write_marks(items)
+    vmap: Dict[Tuple[str, str], dict] = {}
+    stored_by_lab: Dict[str, Dict[str, dict]] = {}
+    kinds: Dict[str, str] = {}
+    failed_labs: List[str] = []
+    superseded: set = set()
+    for item, res in zip(items, results):
+        key = (item["lab_id"], item["mode"])
+        if res is None:
+            pending_verdicts.put(item["lab_id"], item["mode"], item)
+            verdict_log.warning("shared verdict %s/%s (%s by %s) not written — kept locally, "
+                                "queued for retry (%d pending)", key[0], key[1],
+                                item["outcome"], item["by"], len(pending_verdicts))
+            vmap[key] = item
+            failed_labs.append(item["lab_id"])
+            continue
+        if res.get("skipped"):
+            continue
+        stored_by_lab[item["lab_id"]] = res.get("verdicts") or {}
+        kinds[item["lab_id"]] = "unmark" if item["outcome"] == "cleared" else "mark"
+        if not res.get("applied", True):
+            superseded.add(item["lab_id"])
+        verdict_log.info("shared verdict %s/%s → %s by %s%s", key[0], key[1], item["outcome"],
+                         item["by"], "" if res.get("applied", True) else " (superseded)")
+        vmap[key] = _merged_verdicts(item["lab_id"], res.get("verdicts")).get(item["mode"])
+    # A superseded mark: the actor's own record follows the verdict that won.
+    skip = {k for k in skip if k[1] not in superseded}
+    touched, changed = _fan_out(actor, {k: v for k, v in vmap.items() if v}, skip)
     for us in touched:
-        us.persist()
-    return total
+        if failed_labs:
+            us.persist()          # the store does not have it: write it down now
+        else:
+            us.dirty = True       # the cleanup worker writes it within a cycle
+    tags: Dict[str, Optional[dict]] = {}
+    for lab_id, verdicts in stored_by_lab.items():
+        tags[lab_id] = _broadcast_verdict_change(
+            lab_id, _merged_verdicts(lab_id, verdicts), kinds[lab_id])
+    for lab_id in dict.fromkeys(failed_labs):
+        if lab_id not in tags:
+            tags[lab_id] = _tags_after_failed_write(lab_id)
+    verdict_log.debug("shared verdicts: %d mark(s), %d record(s) in %d session(s) changed",
+                      len(items), changed, len(touched))
+    return tags
 
 
 def _broadcast_verdict_change(lab_id: str, verdicts: Dict[str, dict], kind: str) -> dict:
@@ -1854,106 +2143,128 @@ def _broadcast_verdict_change(lab_id: str, verdicts: Dict[str, dict], kind: str)
     return tags
 
 
-def _share_verdict(actor: "UserState", rec: SampleRecord, outcome: str, mode: str) -> dict:
-    """Write the actor's mark to the shared store (one transaction, which
-    also writes its history row), fan it out, broadcast tags. Returns the
-    tags. Never raises: a failed write is queued in ``pending_verdicts``."""
-    started = time.perf_counter()
-    stored = "cleared" if outcome == "uncheck" else outcome
-    entry = {"outcome": stored, "reason": "" if stored == "cleared" else rec.reason,
-             "cc_task_id": None if stored == "cleared" else rec.cc_task_id,
-             "sample_id": rec.sample_id, "by": actor.name, "at": _mark_clock(),
-             "tab": rec.tab}
-    kind = "unmark" if stored == "cleared" else "mark"
-    result = None
-    try:
-        result = state.shared.apply_mark(
-            rec.lab_id, mode, stored, by=actor.name, reason=entry["reason"],
-            cc_task_id=entry["cc_task_id"], sample_id=rec.sample_id, tab=rec.tab,
-            at=entry["at"])
-    except Exception:
-        verdict_log.exception("shared verdict write raised for %s/%s", rec.lab_id, mode)
-    if result is None:
-        pending_verdicts.put(rec.lab_id, mode, entry)
-        verdict_log.warning("shared verdict %s/%s (%s by %s) not written — kept locally, "
-                            "queued for retry (%d pending)", rec.lab_id, mode, stored,
-                            actor.name, len(pending_verdicts))
-        verdict = entry
-    else:
-        verdict_log.info("shared verdict %s/%s → %s by %s%s", rec.lab_id, mode, stored,
-                         actor.name, "" if result.get("applied", True) else " (superseded)")
-        verdict = _merged_verdicts(rec.lab_id, result.get("verdicts")).get(mode)
-    changed = _fan_out(actor, rec, mode, verdict)
-    if result is not None:
-        tags = _broadcast_verdict_change(
-            rec.lab_id, _merged_verdicts(rec.lab_id, result.get("verdicts")), kind)
-    else:
-        tags = _tags_after_failed_write(rec.lab_id)
-    verdict_log.debug("shared verdict %s/%s fan-out: %d record(s) changed, %.1f ms",
-                      rec.lab_id, mode, changed, (time.perf_counter() - started) * 1000)
-    return tags
-
-
-def _tags_after_failed_write(lab_id: str) -> dict:
-    """Tags when the write failed: the other mode comes from a read if the
-    store is still readable; if not, no tags event (it would blank a pill)."""
+def _tags_after_failed_write(lab_id: str) -> Optional[dict]:
+    """Tags when the write failed: from a fresh read (plus the pending write)
+    if the store is still readable. If it is not, None — unknown — and no
+    tags event, which would blank the other mode's pill."""
     try:
         stored = state.shared.verdicts_for([lab_id])
     except Exception:
         stored = None
     if stored is None:
-        return _tags_from(_merged_verdicts(lab_id, None))
+        return None
     tags = _tags_from(_merged_verdicts(lab_id, stored.get(lab_id)))
     state.broadcast_sse({"type": "tags", "lab_id": lab_id, "tags": tags})
     return tags
 
 
+def _share_verdict(actor: "UserState", rec: SampleRecord, outcome: str, mode: str,
+                   at: Optional[float] = None) -> Optional[dict]:
+    """Share the actor's mark (good / bad / uncheck) made at ``at``. Returns
+    the lab id's tags (None = unknown). Never raises."""
+    started = time.perf_counter()
+    at = _mark_clock() if at is None else at
+    tags = _share_marks(actor, [_mark_item(actor, rec, outcome, mode, at)],
+                        {(rec.tab, rec.lab_id)}).get(rec.lab_id)
+    verdict_log.debug("shared verdict %s/%s done in %.1f ms", rec.lab_id, mode,
+                      (time.perf_counter() - started) * 1000)
+    return tags
+
+
+def _share_regenerate(actor: "UserState", recs: List[SampleRecord], cause: str,
+                      at: float) -> None:
+    """A regenerated COA is a new document, so neither review of the old one
+    stands: clear BOTH modes' shared verdicts for each lab id — only where
+    one exists (``when="if_judged"``: nothing to clear writes no history) —
+    in bounded batches, with the cause in the history row. Never raises."""
+    firsts = list({r.lab_id: r for r in recs}.values())
+    if not firsts:
+        return
+    items = [_mark_item(actor, r, "uncheck", m, at, when="if_judged", cause=cause)
+             for r in firsts for m in REVIEW_MODES]
+    _share_marks(actor, items, {(r.tab, r.lab_id) for r in recs})
+
+
 def _retry_pending_verdicts(limit: int = MAX_PENDING_RETRY_PER_CYCLE) -> int:
     """Cleanup-worker step: retry failed shared-verdict writes, oldest first,
-    at most ``limit``; stop at the first failure (the store is still down).
-    Each retry carries its original time, so it never overwrites newer work
-    (its history row is still written, flagged superseded). Returns done."""
+    at most ``limit``. Each retry carries its original time, so it never
+    overwrites newer work (its history row is still written, flagged
+    superseded). The store being down stops the cycle; an entry the store
+    itself rejects ("keep") is skipped and dropped after
+    MAX_PENDING_ATTEMPTS; an invalid one is dropped at once. Returns done."""
     if not len(pending_verdicts):
         return 0
     done = 0
-    for (lab_id, mode), e in pending_verdicts.oldest(limit):
+    for key, e in pending_verdicts.oldest(limit):
+        item = dict(e, lab_id=key[0], mode=key[1])
         try:
-            result = state.shared.apply_mark(
-                lab_id, mode, e["outcome"], by=e["by"], reason=e.get("reason") or "",
-                cc_task_id=e.get("cc_task_id"), sample_id=e.get("sample_id"),
-                tab=e.get("tab"), at=e["at"])
+            res = state.shared.apply_marks([item])
+        except ValueError as exc:
+            pending_verdicts.remove_if_same(key, e.get("at"))
+            verdict_log.error("dropping invalid pending verdict %s/%s (%s by %s): %s",
+                              key[0], key[1], e.get("outcome"), e.get("by"), exc)
+            continue
         except Exception:
-            verdict_log.exception("pending verdict retry raised for %s/%s", lab_id, mode)
-            result = None
-        if result is None:
-            verdict_log.warning("pending verdict retry failed for %s/%s; %d still pending",
-                                lab_id, mode, len(pending_verdicts))
-            break
-        pending_verdicts.remove_if_same((lab_id, mode), e["at"])
+            verdict_log.exception("pending verdict retry raised for %s/%s", *key)
+            res = None
+        if res is None:
+            if state.shared.last_write_error != "keep":
+                verdict_log.warning("pending verdict retry: store unavailable (%s); "
+                                    "%d still pending", state.shared.last_write_error,
+                                    len(pending_verdicts))
+                break
+            _count_failed_retry(key, e)
+            continue
+        pending_verdicts.remove_if_same(key, e["at"])
         done += 1
-        verdict_log.info("shared verdict %s/%s → %s by %s (retried%s)", lab_id, mode,
-                         e["outcome"], e["by"],
-                         "" if result.get("applied", True) else ", superseded")
-        _broadcast_verdict_change(lab_id, _merged_verdicts(lab_id, result.get("verdicts")),
+        r = res[0]
+        if r.get("skipped"):
+            continue
+        verdict_log.info("shared verdict %s/%s → %s by %s (retried%s)", key[0], key[1],
+                         e["outcome"], e["by"], "" if r.get("applied", True) else ", superseded")
+        _broadcast_verdict_change(key[0], _merged_verdicts(key[0], r.get("verdicts")),
                                   "unmark" if e["outcome"] == "cleared" else "mark")
     return done
+
+
+def _count_failed_retry(key: Tuple[str, str], e: dict) -> None:
+    n = pending_verdicts.bump(key, e["at"])
+    if n >= MAX_PENDING_ATTEMPTS:
+        pending_verdicts.remove_if_same(key, e["at"])
+        verdict_log.error("dropping pending verdict %s/%s (%s by %s) after %d rejected "
+                          "attempts — it stays only in that reviewer's ledger",
+                          key[0], key[1], e.get("outcome"), e.get("by"), n)
+    else:
+        verdict_log.warning("pending verdict %s/%s rejected by the store (attempt %d/%d)",
+                            key[0], key[1], n, MAX_PENDING_ATTEMPTS)
+
+
+def _persist_dirty_sessions(limit: int = MAX_DIRTY_PERSISTS_PER_CYCLE) -> int:
+    """Write down sessions a fan-out changed (bounded per call)."""
+    with _sessions_lock:
+        dirty = [us for us in user_sessions.values() if us.dirty][:limit]
+    for us in dirty:
+        us.dirty = False
+        us.persist()
+    return len(dirty)
 
 
 # ── one-time ledger migration ────────────────────────────────────────────────
 
 def _ledger_candidate(v: Any, name: str) -> Optional[dict]:
-    """One fresh ledger entry as a shared verdict, or None."""
+    """One fresh ledger entry as a shared-store mark, or None."""
     if not isinstance(v, dict) or not _verdict_is_fresh(v):
         return None
+    tab = str(v.get("tab") or "")
+    mode = _MIGRATION_TAB_MODES.get(tab)
     outcome = {STATUS_GOOD: "good", STATUS_BAD: "bad"}.get(v.get("status"))
     lab_id = str(v.get("lab_id") or "").strip()
-    if not outcome or not lab_id:
+    if not mode or not outcome or not lab_id:
         return None
-    tab = str(v.get("tab") or "")
-    return {"lab_id": lab_id, "mode": "info" if tab == "Intaked" else "tests",
-            "outcome": outcome, "by": name, "reason": v.get("reason") or "",
-            "cc_task_id": v.get("cc_task_id"), "tab": tab or None,
-            "at": float(v["judged_at"])}
+    return {"lab_id": lab_id, "mode": mode, "outcome": outcome, "by": name,
+            "reason": v.get("reason") or "", "cc_task_id": v.get("cc_task_id"),
+            "tab": tab, "at": float(v["judged_at"]), "when": "if_absent",
+            "extra_detail": {"migrated": True}}
 
 
 def _ledger_candidates() -> Dict[Tuple[str, str], dict]:
@@ -1974,7 +2285,9 @@ def _ledger_candidates() -> Dict[Tuple[str, str], dict]:
         for v in verdicts[:MAX_MIGRATION_VERDICTS_PER_FILE]:
             c = _ledger_candidate(v, name)
             key = (c["lab_id"], c["mode"]) if c else None
-            if c and (key not in out or out[key]["at"] < c["at"]):
+            if c is None or (key not in out and len(out) >= MAX_MIGRATION_CANDIDATES):
+                continue
+            if key not in out or out[key]["at"] < c["at"]:
                 out[key] = c
     return out
 
@@ -1983,30 +2296,23 @@ def migrate_ledgers_once() -> int:
     """Carry each account's fresh 12 h verdicts into the shared store, once.
 
     Before v4 a mark lived only in its reviewer's review_state file; this
-    shares the morning's work when a lab upgrades mid-day. Intaked is Info
-    mode's tab; every other tab is Tests. Insert-only: any existing row for
-    (lab_id, mode) — a tombstone included — wins. Written with the original
-    mark time, so a live mark racing the migration is never overwritten.
-    If the store cannot be read or a write fails, the flag stays unset and
-    the next start tries again. Returns verdicts moved."""
+    shares the morning's work when a lab upgrades mid-day. Only tabs whose
+    mode is certain move (Intaked → info, Re-review → tests). Insert-only
+    inside the transaction (``when="if_absent"``: any existing row, a
+    tombstone included, wins), with the original mark time and
+    ``detail.migrated`` on the history row. If a write fails the flag
+    stays unset and the next start tries again. Returns verdicts moved."""
     store = state.shared
     if store.get_meta("ledger_migrated"):
         return 0
-    candidates = _ledger_candidates()
-    existing = store.verdicts_for({lab for lab, _ in candidates}) if candidates else {}
-    if existing is None:
-        verdict_log.warning("ledger migration: shared store unreadable; will retry next start")
-        return 0
+    items = list(_ledger_candidates().values())
     moved = failed = 0
-    for (lab_id, mode), c in candidates.items():
-        if existing.get(lab_id, {}).get(mode):
+    for start in range(0, len(items), MAX_MARKS_PER_BATCH):
+        res = store.apply_marks(items[start:start + MAX_MARKS_PER_BATCH])
+        if res is None:
+            failed += len(items[start:start + MAX_MARKS_PER_BATCH])
             continue
-        result = store.apply_mark(lab_id, mode, c["outcome"], by=c["by"], reason=c["reason"],
-                                  cc_task_id=c["cc_task_id"], tab=c["tab"], at=c["at"])
-        if result is None:
-            failed += 1
-        elif result.get("applied"):
-            moved += 1
+        moved += sum(1 for r in res if not r.get("skipped") and r.get("applied"))
     if failed:
         verdict_log.warning("ledger migration: %d write(s) failed; will retry next start", failed)
         return moved
@@ -2120,6 +2426,14 @@ def _session_cleanup_cycle(now: float) -> None:
         _retry_pending_verdicts()
     except Exception:
         verdict_log.exception("pending verdict retry failed")
+    try:
+        pending_verdicts.save()
+    except Exception:
+        verdict_log.exception("pending verdict save failed")
+    try:
+        _persist_dirty_sessions()
+    except Exception:
+        logger.exception("writing fanned-out sessions failed")
 
 
 def _session_cleanup_worker(cycles: Optional[int] = None,
@@ -2297,6 +2611,11 @@ def _save_state_for_exit() -> None:
         state.presence.close_all("restart")   # queues every close, then flushes
     except Exception:
         logger.exception("could not save presence before exit")
+    try:
+        pending_verdicts.save()
+        _persist_dirty_sessions()
+    except Exception:
+        logger.exception("could not save shared-verdict state before exit")
     _flush_log_handlers()
 
 
@@ -2971,20 +3290,25 @@ def _render_preview(rec: SampleRecord, tab: str, lab_id: str, ustate: UserState)
     # A judged sample rendering after a re-pull or a restore keeps its
     # verdict: it is never shown as `loading`, and a failed render costs the
     # preview, not the mark. An unjudged one goes loading -> ready / error.
-    verdict = rec.status if rec.status in (STATUS_GOOD, STATUS_BAD) else None
-    if verdict is None:
-        if rec.status not in (STATUS_PENDING, STATUS_ERROR, STATUS_LOADING):
+    with ustate.records_lock:
+        verdict = rec.status if rec.status in (STATUS_GOOD, STATUS_BAD) else None
+        if verdict is None:
+            if rec.status not in (STATUS_PENDING, STATUS_ERROR, STATUS_LOADING):
+                return
+            rec.status = STATUS_LOADING
+        elif rec.preview_url:
             return
-        rec.status = STATUS_LOADING
+    if verdict is None:
         ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_LOADING})
-    elif rec.preview_url:
-        return
 
     def _render_failed() -> None:
-        if verdict is not None:
-            rec.render_failed = True
-            return
-        rec.status = STATUS_ERROR
+        # Judged *now* (maybe by a verdict that landed mid-render): the
+        # failure costs the preview, never the mark; un-judged now: error.
+        with ustate.records_lock:
+            if rec.status in (STATUS_GOOD, STATUS_BAD):
+                rec.render_failed = True
+                return
+            rec.status = STATUS_ERROR
         ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_ERROR})
 
     sample_id = rec.sample_id
@@ -3032,13 +3356,18 @@ def _render_preview(rec: SampleRecord, tab: str, lab_id: str, ustate: UserState)
             except Exception:
                 pass
 
-            rec.preview_url = viewable_url
-            rec.render_failed = False
-            rec.status = verdict or STATUS_READY
+            # The CURRENT status decides, not the one the render began with:
+            # a shared verdict (or an un-check) may have landed meanwhile.
+            with ustate.records_lock:
+                rec.preview_url = viewable_url
+                rec.render_failed = False
+                if rec.status not in (STATUS_GOOD, STATUS_BAD):
+                    rec.status = STATUS_READY
+                status = rec.status
             # `has_preview` tells the browser a COA now exists even when the
             # status is a verdict rather than `ready`.
             ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id,
-                             "status": rec.status, "has_preview": True})
+                             "status": status, "has_preview": True})
             ustate.emit_status(f"Preview ready: {lab_id}")
 
             IO_POOL.submit(cache_pdf, lab_id, viewable_url, ustate)
@@ -3646,6 +3975,7 @@ def start_pulling():
     mode = body.get("mode") if isinstance(body, dict) else None
     if mode not in ("info", "tests"):
         mode = "tests"
+    # The list was just cleared, so there is nothing to re-derive: set it.
     ustate.mode = mode
 
     yesterday = business_days_ago(2)
@@ -4659,6 +4989,42 @@ def sample_info(lab_id: str):
 
 # ── Good / Bad / Regenerate ──────────────────────────────────────────────────
 
+def _mark_locally(ustate: UserState, rec: SampleRecord, outcome: str, reason: str,
+                  cc_task_id: Any, mode: str, at: float) -> None:
+    """The reviewer's own mark on their own record. Caller holds the lock."""
+    rec.shared_at = at
+    if outcome == "good":
+        # Deliberately does not close anything. The old code auto-completed
+        # the Double Check row under hardcoded initials; whether to complete a
+        # Command Center listing is now the reviewer's explicit choice, made
+        # in the complete / continue / back-out prompt before this call.
+        rec.status, rec.reason, rec.verdict_mode = STATUS_GOOD, "", mode
+        ustate.record_result(rec, "Good", mode=mode)
+        ustate.remember_verdict(rec, judged_at=at)
+    elif outcome == "bad":
+        rec.status, rec.reason, rec.verdict_mode = STATUS_BAD, reason, mode
+        # The listing itself is created by /api/cc/tasks before this call, so
+        # a conflict can be resolved while the sample is still unmarked.
+        if cc_task_id is not None:
+            try:
+                rec.cc_task_id = int(cc_task_id)
+            except (TypeError, ValueError):
+                rec.cc_task_id = None
+        ustate.record_result(rec, "Bad", reason, mode=mode)
+        ustate.remember_verdict(rec, judged_at=at)
+    else:
+        # Back to "rendered, awaiting review" — NOT pending. The frontend
+        # derives has_preview from status (see updateSampleStatus in app.js),
+        # so pending would make an already-rendered COA display as though it
+        # had never rendered: the preview visibly disappears even though the
+        # PDF is still cached here. Nothing about changing your mind on a
+        # verdict requires re-rendering, so the preview and cache are left
+        # untouched.
+        _unjudge(rec)
+        ustate.clear_result(rec.tab, rec.lab_id, mode)
+        ustate.forget_verdict(rec.tab, rec.lab_id, mode)
+
+
 @app.route("/api/mark", methods=["POST"])
 @require_portal
 def mark_sample():
@@ -4674,50 +5040,15 @@ def mark_sample():
     rec = ustate.records.get(key)
     if not rec:
         return jsonify({"error": "Sample not found"}), 404
-
-    if outcome == "good":
-        # Deliberately does not close anything. The old code auto-completed
-        # the Double Check row under hardcoded initials; whether to complete a
-        # Command Center listing is now the reviewer's explicit choice, made
-        # in the complete / continue / back-out prompt before this call.
-        rec.status = STATUS_GOOD
-        rec.reason = ""
-        ustate.record_result(rec, "Good")
-        ustate.remember_verdict(rec)
-
-    elif outcome == "bad":
-        reason = reason.strip()
-        if not reason:
-            return jsonify({"error": "Reason required"}), 400
-        rec.status = STATUS_BAD
-        rec.reason = reason
-        # The listing itself is created by /api/cc/tasks before this call, so
-        # a conflict can be resolved while the sample is still unmarked.
-        cc_task_id = body.get("cc_task_id")
-        if cc_task_id is not None:
-            try:
-                rec.cc_task_id = int(cc_task_id)
-            except (TypeError, ValueError):
-                rec.cc_task_id = None
-        ustate.record_result(rec, "Bad", reason)
-        ustate.remember_verdict(rec)
-
-    elif outcome == "uncheck":
-        # Back to "rendered, awaiting review" — NOT pending. The frontend
-        # derives has_preview from status (see updateSampleStatus in app.js),
-        # so pending would make an already-rendered COA display as though it
-        # had never rendered: the preview visibly disappears even though the
-        # PDF is still cached here. Nothing about changing your mind on a
-        # verdict requires re-rendering, so the preview and cache are left
-        # untouched.
-        rec.status = STATUS_READY if rec.preview_url else STATUS_PENDING
-        rec.reason = ""
-        rec.cc_task_id = None
-        ustate.clear_result(tab, lab_id)
-        ustate.forget_verdict(tab, lab_id)
-
-    else:
+    if outcome not in ("good", "bad", "uncheck"):
         return jsonify({"error": "Invalid outcome"}), 400
+    reason = (reason or "").strip()
+    if outcome == "bad" and not reason:
+        return jsonify({"error": "Reason required"}), 400
+
+    at = _mark_clock()
+    with ustate.records_lock:
+        _mark_locally(ustate, rec, outcome, reason, body.get("cc_task_id"), mode, at)
 
     state.change_log.review(
         "unmark" if outcome == "uncheck" else "mark",
@@ -4737,8 +5068,10 @@ def mark_sample():
 
     ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": rec.status})
     # After the local mark is safe: the shared store and other reviewers.
-    # Never fails the mark (a store failure queues a pending write).
-    tags = _share_verdict(ustate, rec, outcome, mode)
+    # Never fails the mark (a store failure queues a pending write). If a
+    # newer verdict already won, the record now shows that one (and a
+    # sample_status for it has gone out), so report what it really is.
+    tags = _share_verdict(ustate, rec, outcome, mode, at=at)
     labels = {"good": "Good", "bad": "Bad", "uncheck": "un-marked"}
     ustate.emit_status(f"{lab_id} {labels[outcome]}")
     return jsonify({"ok": True, "status": rec.status, "tags": tags})
@@ -5049,15 +5382,17 @@ def sync_sample_info(lab_id: str):
     # Sample info feeds the COA, so the rendered preview is stale the moment
     # this lands. Re-render the one sample that changed.
     regenerated = False
-    for (tab, lid), rec in list(ustate.records.items()):
-        if lid != lab_id:
-            continue
-        _reset_for_regenerate(ustate, rec)
-        ustate.emit_sse({"type": "sample_status", "tab": tab,
+    at = _mark_clock()
+    synced = [rec for (tab, lid), rec in list(ustate.records.items()) if lid == lab_id]
+    for rec in synced:
+        _reset_for_regenerate(ustate, rec, at=at)
+        ustate.emit_sse({"type": "sample_status", "tab": rec.tab,
                          "lab_id": lab_id, "status": STATUS_LOADING})
         if state.coa_session and state.logged_in:
-            PREVIEW_POOL.submit(generate_preview_for_sample, tab, lab_id, ustate)
+            PREVIEW_POOL.submit(generate_preview_for_sample, rec.tab, lab_id, ustate)
         regenerated = True
+    # New sample information is a new document for every reviewer.
+    _share_regenerate(ustate, synced, "labvision_sync", at)
 
     return jsonify({
         "ok": True, "updated": fields, "regenerated": regenerated,
@@ -5090,34 +5425,45 @@ def regenerate_preview():
     # An explicit regenerate submits its own render; one already waiting in
     # the window for the same sample would make it render twice.
     _drop_queued(ustate, key)
-    _reset_for_regenerate(ustate, rec)
+    at = _mark_clock()
+    _reset_for_regenerate(ustate, rec, at=at)
     ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_LOADING})
+    _share_regenerate(ustate, [rec], "regenerate", at)
     PREVIEW_POOL.submit(generate_preview_for_sample, tab, lab_id, ustate)
     return jsonify({"ok": True})
 
 
-def _reset_for_regenerate(ustate: UserState, rec: SampleRecord) -> None:
+def _reset_for_regenerate(ustate: UserState, rec: SampleRecord, *,
+                          at: Optional[float] = None, all_modes: bool = True,
+                          persist: bool = True) -> bool:
     """Clear every cached artefact for one sample so it re-renders from scratch.
 
     A regenerated COA is a new document, so the verdict goes with the old
-    render: from the list (it always did), from the export row (it used to
-    linger, so Export disagreed with the list) and from the remembered marks
-    a re-pull would otherwise bring back.
+    render: from the list (it always did), from the export rows — every
+    mode's, since neither review of the old document stands — and from the
+    remembered marks a re-pull would otherwise bring back. The shared store
+    is the caller's job (_share_regenerate, batched), made at ``at``.
+    ``all_modes=False`` is Regenerate Pending's refresh of unjudged samples:
+    only this mode's leftovers, as before. Returns whether anything a
+    snapshot holds changed; ``persist=False`` leaves writing it to a caller
+    resetting many samples at once.
     """
-    judged = rec.status in (STATUS_GOOD, STATUS_BAD)
-    rec.status = STATUS_LOADING
-    rec.preview_url = None
-    rec.render_failed = False
-    rec.reason = ""
-    rec.cc_task_id = None
-    if judged:
-        ustate.clear_result(rec.tab, rec.lab_id)
-        ustate.forget_verdict(rec.tab, rec.lab_id)
+    with ustate.records_lock:
+        judged = rec.status in (STATUS_GOOD, STATUS_BAD)
+        rec.status = STATUS_LOADING
+        rec.preview_url = None
+        rec.render_failed = False
+        rec.reason = ""
+        rec.cc_task_id = None
+        rec.verdict_mode = None
+        if at is not None:
+            rec.shared_at = max(rec.shared_at, at)
+        removed = False
+        if judged or all_modes:
+            removed = ustate.clear_result(rec.tab, rec.lab_id, all_modes=all_modes)
+            removed = ustate.verdicts.pop((rec.tab, rec.lab_id), None) is not None or removed
+    if (judged or removed) and persist:
         ustate.persist()
-        # The verdict belongs to the sample, so the new document un-judges
-        # it for everyone in this mode; otherwise the next tab load would
-        # bring the shared verdict straight back. Never raises.
-        _share_verdict(ustate, rec, "uncheck", ustate.mode)
     rec.attachments = None
     rec.tests_data = None
     rec.sif_pdf_bytes = None
@@ -5133,6 +5479,7 @@ def _reset_for_regenerate(ustate: UserState, rec: SampleRecord) -> None:
         with state._sif_cache_lock:
             state.sif_order_cache.pop(int(rec.order_id), None)
             state.sif_absence_cache.pop(int(rec.order_id), None)
+    return judged or removed
 
 
 @app.route("/api/regenerate-pending", methods=["POST"])
@@ -5164,7 +5511,9 @@ def regenerate_pending():
              if r.status not in (STATUS_GOOD, STATUS_BAD)]
 
     for rec in stale:
-        _reset_for_regenerate(ustate, rec)
+        # Refreshing expired previews of unjudged samples: nobody's verdict
+        # is touched, here or in the shared store.
+        _reset_for_regenerate(ustate, rec, all_modes=False)
         rec.status = STATUS_PENDING
         ustate.emit_sse({
             "type": "sample_status", "tab": tab,
@@ -5202,13 +5551,19 @@ def regenerate_selected():
         if rec is not None:
             picked.append(rec)
 
+    at = _mark_clock()
+    changed = False
     for rec in picked:
         _drop_queued(ustate, (rec.tab, rec.lab_id))
-        _reset_for_regenerate(ustate, rec)
+        changed = _reset_for_regenerate(ustate, rec, at=at, persist=False) or changed
         ustate.emit_sse({
             "type": "sample_status", "tab": tab,
             "lab_id": rec.lab_id, "status": STATUS_LOADING,
         })
+    if changed:
+        ustate.persist()        # once, not once per sample
+    # One batched store write for all of them, not one per sample.
+    _share_regenerate(ustate, picked, "regenerate", at)
 
     if picked and state.coa_session and state.logged_in:
         for rec in picked:
@@ -5264,9 +5619,10 @@ def good_links():
     selected_tabs = body.get("tabs", REVIEW_TABS)
     origin = _review_origin(body)
     links = []
+    rows = ustate.results_for_mode()      # this session's review mode only
 
     for tab in selected_tabs:
-        tab_rows = [r for r in ustate.session_results if r["tab"] == tab]
+        tab_rows = [r for r in rows if r["tab"] == tab]
         if not tab_rows or tab not in LINK_TABS:
             continue
         good_rows = [r for r in tab_rows if r["outcome"] == "Good" and r["sample_id"]]
@@ -5288,7 +5644,8 @@ def good_links():
 @require_portal
 def export_csv():
     ustate = get_user_state()
-    if not ustate.session_results:
+    rows = ustate.results_for_mode()      # this session's review mode only
+    if not rows:
         return jsonify({"error": "Nothing to export"}), 400
 
     body = request.json or {}
@@ -5304,7 +5661,7 @@ def export_csv():
 
     first = True
     for tab in selected_tabs:
-        tab_rows = [r for r in ustate.session_results if r["tab"] == tab]
+        tab_rows = [r for r in rows if r["tab"] == tab]
         if not tab_rows:
             continue
         if not first:
@@ -5521,6 +5878,12 @@ if __name__ == "__main__":
         _tidy_after_last_run(state.shared)
     except Exception:
         logger.exception("Could not tidy up after the last run")
+    # Shared-verdict writes still pending when the last run stopped. After
+    # the port guard, so a duplicate launch never replays them.
+    try:
+        pending_verdicts.load()
+    except Exception:
+        verdict_log.exception("could not load pending verdicts")
     # Share pre-v4 marks once. A background thread so boot is not delayed;
     # after the port guard, so a duplicate launch never writes the store.
     threading.Thread(target=_migrate_ledgers_safely, name="ledger-migration",

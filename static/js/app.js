@@ -338,7 +338,11 @@ function initReviewModeModal() {
 // editor, Tests shows the existing test editor + Re-review. Also flips
 // to the mode's default tab if the main app is already running (so
 // mid-session mode changes don't strand the user on a hidden tab).
+let _appliedReviewMode = null;
+
 function applyReviewMode(mode) {
+    const switched = _appliedReviewMode !== null && _appliedReviewMode !== mode;
+    _appliedReviewMode = mode;
     document.body.classList.toggle("mode-info",  mode === "info");
     document.body.classList.toggle("mode-tests", mode === "tests");
     if (typeof switchTab === "function" && state && state.currentTab !== undefined) {
@@ -350,6 +354,11 @@ function applyReviewMode(mode) {
     if (typeof renderLabVisionData === "function" && LV.labId) {
         if (LV.labId === state?.currentSample?.lab_id) renderLabVisionData();
         else if (state?.currentSample) loadLabVisionData(state.currentSample.lab_id);
+    }
+    // Verdicts are per mode: on a switch the server re-derives every record
+    // for the new mode, so every tab this page holds is stale — reload them.
+    if (switched && typeof restoreAllTabs === "function" && state && state.samples) {
+        restoreAllTabs();
     }
 }
 

@@ -116,13 +116,20 @@ def lab(monkeypatch, tmp_path):
 
 
 def _break_writes(monkeypatch, store):
-    """apply_mark fails (returns None) until the returned switch is flipped."""
-    real = store.apply_mark
+    """Mark writes fail as if the store were down (None, "unavailable")
+    until the returned switch is flipped."""
+    real_one, real_many = store.apply_mark, store.apply_marks
     down = {"on": True}
 
-    def flaky(*a, **k):
-        return None if down["on"] else real(*a, **k)
-    monkeypatch.setattr(store, "apply_mark", flaky)
+    def wrap(real):
+        def flaky(*a, **k):
+            if down["on"]:
+                store._last_write_error = "unavailable"
+                return None
+            return real(*a, **k)
+        return flaky
+    monkeypatch.setattr(store, "apply_mark", wrap(real_one))
+    monkeypatch.setattr(store, "apply_marks", wrap(real_many))
     return down
 
 
@@ -150,7 +157,9 @@ def test_mark_fans_out_to_same_mode_sessions_holding_the_lab(lab):
     statuses = b.events("sample_status")
     assert {"type": "sample_status", "tab": "Due Out", "lab_id": LAB,
             "status": "good"} in statuses
-    # the change is written down for B too
+    # the change is written down for B too — by the cleanup worker
+    assert b.ustate.dirty is True
+    app_module._persist_dirty_sessions()
     snap = json.loads(next((app_module.REVIEW_STATE_DIR).glob("sam-k.json"))
                       .read_text(encoding="utf-8"))
     assert any(r["lab_id"] == LAB and r["status"] == "good" for r in snap["records"])
@@ -341,34 +350,48 @@ def _entry(tab, lab_id, status, judged_at=None, reason=""):
             "date": "2026-09-25"}
 
 
-def test_ledger_migration_moves_fresh_verdicts_once(lab):
+def test_ledger_migration_moves_only_tabs_whose_mode_is_certain(lab):
+    """Intaked is only ever Info and Re-review only Tests; a Yesterday or
+    Due Out mark could have been either, so it stays in its ledger."""
     app_module, _ = lab
     _ledger(app_module.REVIEW_STATE_DIR, "Dana P", [
         _entry("Intaked", LAB, "good"),
-        _entry("Due Out", OTHER, "bad", reason="Low"),
-        _entry("Due Out", "092526-50003", "good", judged_at=time.time() - 13 * 3600),
+        _entry("Re-review", OTHER, "bad", reason="Low"),
+        _entry("Due Out", "092526-50003", "good"),
+        _entry("Yesterday", "092526-50004", "good"),
+        _entry("Intaked", "092526-50005", "good", judged_at=time.time() - 13 * 3600),
     ])
     assert app_module.migrate_ledgers_once() == 2
-    got = app_module.state.shared.verdicts_for([LAB, OTHER, "092526-50003"])
+    got = app_module.state.shared.verdicts_for(
+        [LAB, OTHER, "092526-50003", "092526-50004", "092526-50005"])
     assert got[LAB]["info"]["by"] == "Dana P" and got[LAB]["info"]["outcome"] == "good"
     assert got[OTHER]["tests"]["outcome"] == "bad" and got[OTHER]["tests"]["reason"] == "Low"
-    assert "092526-50003" not in got                      # stale: not carried
+    assert set(got) == {LAB, OTHER}
+    assert app_module.state.shared.history(LAB)[0]["detail"]["migrated"] is True
     assert app_module.state.shared.get_meta("ledger_migrated")
     assert app_module.migrate_ledgers_once() == 0
+
+
+def test_ledger_migration_keeps_the_original_mark_time(lab):
+    app_module, _ = lab
+    judged = time.time() - 3600
+    _ledger(app_module.REVIEW_STATE_DIR, "Dana P", [_entry("Intaked", LAB, "good", judged_at=judged)])
+    app_module.migrate_ledgers_once()
+    assert app_module.state.shared.verdicts_for([LAB])[LAB]["info"]["at"] == judged
 
 
 def test_ledger_migration_never_overwrites_an_existing_row(lab):
     app_module, _ = lab
     app_module.state.shared.apply_mark(LAB, "tests", "cleared", by="Sam K")
-    _ledger(app_module.REVIEW_STATE_DIR, "Dana P", [_entry("Due Out", LAB, "good")])
+    _ledger(app_module.REVIEW_STATE_DIR, "Dana P", [_entry("Re-review", LAB, "good")])
     assert app_module.migrate_ledgers_once() == 0
     assert app_module.state.shared.verdicts_for([LAB])[LAB]["tests"]["outcome"] == "cleared"
 
 
-def test_ledger_migration_waits_when_store_unreadable(lab, monkeypatch):
+def test_ledger_migration_waits_when_the_store_cannot_be_written(lab, monkeypatch):
     app_module, _ = lab
-    _ledger(app_module.REVIEW_STATE_DIR, "Dana P", [_entry("Due Out", LAB, "good")])
-    monkeypatch.setattr(app_module.state.shared, "verdicts_for", lambda ids: None)
+    _ledger(app_module.REVIEW_STATE_DIR, "Dana P", [_entry("Re-review", LAB, "good")])
+    monkeypatch.setattr(app_module.state.shared, "apply_marks", lambda items: None)
     assert app_module.migrate_ledgers_once() == 0
     assert app_module.state.shared.get_meta("ledger_migrated") is None
 
@@ -378,8 +401,9 @@ def test_ledger_migration_is_not_run_at_import():
     import inspect
     src = inspect.getsource(app_module)
     main = src[src.index('if __name__ == "__main__":'):]
-    assert "_migrate_ledgers_safely" in main
+    assert "_migrate_ledgers_safely" in main and "pending_verdicts.load()" in main
     assert main.index("_wait_for_port") < main.index("_migrate_ledgers_safely")
+    assert main.index("_wait_for_port") < main.index("pending_verdicts.load()")
     assert "migrate_ledgers_once()" in inspect.getsource(app_module._migrate_ledgers_safely)
     assert app_module.state.shared.get_meta("ledger_migrated") is None
 
@@ -491,9 +515,10 @@ def test_pending_verdicts_keep_the_newer_entry():
 def test_retry_is_bounded_per_cycle(lab, monkeypatch):
     app_module, _ = lab
     calls = []
-    monkeypatch.setattr(app_module.state.shared, "apply_mark",
-                        lambda *a, **k: calls.append(a) or {"before": None, "applied": True,
-                                                            "verdicts": {}})
+    monkeypatch.setattr(app_module.state.shared, "apply_marks",
+                        lambda items: calls.append(items) or [
+                            {"before": None, "applied": True, "skipped": False,
+                             "verdicts": {}}])
     for i in range(app_module.MAX_PENDING_RETRY_PER_CYCLE + 50):
         app_module.pending_verdicts.put(f"L{i}", "tests",
                                         {"outcome": "good", "by": "x", "at": float(i),
@@ -553,3 +578,432 @@ def test_regenerate_clears_the_shared_verdict(lab, monkeypatch):
     assert b.rec().status == "ready"
     # the tab load must not bring the old verdict back
     assert a.tab(mode="tests")[LAB]["status"] == "loading"
+
+
+# ══ critic round: render, locking, actor, persistence, modes, retry ══════
+
+def _clocked(monkeypatch, app_module, t=TEN):
+    clock = Clock(t)
+    monkeypatch.setattr(app_module, "_mark_clock", clock)
+    return clock
+
+
+class _Session:
+    """A fake QBench web session whose render runs `during` mid-render."""
+
+    def __init__(self, during=None, url="https://example.invalid/coa.pdf"):
+        self.during = during
+        self.url = url
+        self._session = MagicMock()
+        self._session.get.return_value = MagicMock(url=url)
+
+    def generate_preview(self, **kw):
+        if self.during:
+            self.during()
+        return self.url
+
+
+def _render(app_module, monkeypatch, reviewer, during, url="https://example.invalid/coa.pdf"):
+    monkeypatch.setattr(app_module.state, "coa_session", _Session(during, url))
+    api = MagicMock()
+    api.fetch_all_attachments_for_sample.return_value = []
+    monkeypatch.setattr(app_module.state, "api_client", api)
+    monkeypatch.setattr(app_module, "IO_POOL", MagicMock())
+    app_module.generate_preview_for_sample(TAB, LAB, reviewer.ustate)
+
+
+# ── 1: a render finishing never reverts a verdict that landed meanwhile ──
+
+def test_fan_out_good_landing_mid_render_stays_good(lab, monkeypatch):
+    app_module, reviewer = lab
+    a = reviewer("Dana P")
+    b = reviewer("Sam K", holds=())
+    b.hold(TAB, LAB, preview=False)
+    _render(app_module, monkeypatch, b, lambda: a.mark("good"))
+    assert b.rec().status == "good"
+    assert b.rec().preview_url
+    last = b.events("sample_status")[-1]
+    assert last["status"] == "good" and last.get("has_preview") is True
+
+
+def test_uncheck_landing_mid_render_of_a_judged_record_stays_unjudged(lab, monkeypatch):
+    app_module, reviewer = lab
+    clock = _clocked(monkeypatch, app_module)
+    a = reviewer("Dana P")
+    b = reviewer("Sam K", holds=())
+    b.hold(TAB, LAB, preview=False)
+    a.mark("good")
+    assert b.rec().status == "good"
+
+    def uncheck():
+        clock.t += 1
+        a.mark("uncheck")
+    _render(app_module, monkeypatch, b, uncheck)
+    assert b.rec().status == "ready"
+    assert (TAB, LAB) not in b.results()
+
+
+def test_failed_render_keeps_a_verdict_that_landed_mid_render(lab, monkeypatch):
+    app_module, reviewer = lab
+    a = reviewer("Dana P")
+    b = reviewer("Sam K", holds=())
+    b.hold(TAB, LAB, preview=False)
+    _render(app_module, monkeypatch, b, lambda: a.mark("good"), url=None)
+    assert b.rec().status == "good"
+    assert b.rec().render_failed is True
+
+
+# ── 2: locking and ordering ──────────────────────────────────────────────
+
+def test_concurrent_record_and_clear_result_lose_no_rows():
+    import sys
+    import threading
+    import app as app_module
+    us = app_module.UserState("u-conc", "Dana P")
+    keep = [app_module.SampleRecord(lab_id=f"K{i}", tab=TAB) for i in range(300)]
+    churn = [app_module.SampleRecord(lab_id=f"C{i}", tab=TAB) for i in range(300)]
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        def add():
+            for r in keep:
+                us.record_result(r, "Good")
+
+        def churner():
+            for r in churn:
+                us.record_result(r, "Good")
+                us.clear_result(r.tab, r.lab_id)
+        threads = [threading.Thread(target=add), threading.Thread(target=churner),
+                   threading.Thread(target=churner)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(old)
+    got = {r["lab_id"] for r in us.session_results}
+    assert {r.lab_id for r in keep} <= got
+    assert not any(x.startswith("C") for x in got)
+
+
+def test_stale_tab_load_never_overwrites_a_fresher_fan_out(lab, monkeypatch):
+    app_module, reviewer = lab
+    clock = _clocked(monkeypatch, app_module)
+    a = reviewer("Dana P")
+    b = reviewer("Sam K")
+    a.mark("good")
+    stale = app_module.state.shared.verdicts_for([LAB])      # good @ TEN
+    clock.t += 5
+    a.mark("uncheck")
+    assert b.rec().status == "ready"
+    monkeypatch.setattr(app_module.state.shared, "verdicts_for", lambda ids: stale)
+    assert b.tab(mode="tests")[LAB]["status"] == "ready"
+
+
+# ── 3: the actor's own record follows a newer verdict ────────────────────
+
+def test_actor_gets_the_winning_verdict_when_its_mark_is_superseded(lab, monkeypatch):
+    app_module, reviewer = lab
+    _clocked(monkeypatch, app_module)
+    app_module.state.shared.apply_mark(LAB, "tests", "good", by="Sam K", at=TEN + 600)
+    a = reviewer("Dana P")
+    resp = a.mark("bad", reason="Low")
+    assert resp["status"] == "good"
+    assert a.rec().status == "good" and a.rec().reason == ""
+    assert resp["tags"]["tests"]["by"] == "Sam K"
+    assert a.events("sample_status")[-1]["status"] == "good"
+    assert a.results()[(TAB, LAB)]["reviewer"] == "Sam K"
+
+
+# ── 4: persistence of fanned-out changes ─────────────────────────────────
+
+def _count_persists(monkeypatch, r):
+    calls = []
+    real = r.ustate.persist
+    monkeypatch.setattr(r.ustate, "persist", lambda: (calls.append(1), real()))
+    return calls
+
+
+def test_fan_out_marks_sessions_dirty_and_the_worker_writes_them(lab, monkeypatch):
+    app_module, reviewer = lab
+    a = reviewer("Dana P")
+    b = reviewer("Sam K")
+    calls = _count_persists(monkeypatch, b)
+    a.mark("good")
+    assert calls == [] and b.ustate.dirty is True
+    b.ustate.last_active = time.time()
+    app_module._session_cleanup_cycle(time.time())
+    assert calls == [1] and b.ustate.dirty is False
+
+
+def test_fan_out_of_a_pending_write_persists_at_once(lab, monkeypatch):
+    app_module, reviewer = lab
+    _break_writes(monkeypatch, app_module.state.shared)
+    a = reviewer("Dana P")
+    b = reviewer("Sam K")
+    calls = _count_persists(monkeypatch, b)
+    a.mark("good")
+    assert calls == [1]
+
+
+def test_regenerate_selected_shares_its_unmarks_in_one_batch(lab, monkeypatch):
+    app_module, reviewer = lab
+    monkeypatch.setattr(app_module, "PREVIEW_POOL", MagicMock())
+    labs = [LAB, OTHER, "092526-50003"]
+    a = reviewer("Dana P", holds=[(TAB, x) for x in labs])
+    b = reviewer("Sam K", holds=[(TAB, x) for x in labs])
+    for x in labs:
+        a.mark("good", lab=x)
+    store = app_module.state.shared
+    batches, singles = [], []
+    real_many = store.apply_marks
+    monkeypatch.setattr(store, "apply_marks", lambda items: (batches.append(len(items)),
+                                                             real_many(items))[1])
+    monkeypatch.setattr(store, "apply_mark", lambda *a_, **k: singles.append(1))
+    calls = _count_persists(monkeypatch, b)
+    resp = a.client.post("/api/regenerate-selected", json={"tab": TAB, "lab_ids": labs})
+    assert resp.status_code == 200
+    assert len(batches) == 1 and singles == []
+    assert calls == []
+    assert all(b.rec(x).status == "ready" for x in labs)
+    ev = store.history(LAB)[0]
+    assert ev["kind"] == "unmark" and ev["detail"]["cause"] == "regenerate"
+
+
+def test_regenerate_clears_both_modes(lab, monkeypatch):
+    app_module, reviewer = lab
+    monkeypatch.setattr(app_module, "PREVIEW_POOL", MagicMock())
+    store = app_module.state.shared
+    store.apply_mark(LAB, "info", "good", by="Cy L", at=time.time() - 60)
+    a = reviewer("Dana P")
+    a.mark("good")
+    a.client.post("/api/regenerate", json={"tab": TAB, "lab_id": LAB})
+    got = store.verdicts_for([LAB])[LAB]
+    assert got["tests"]["outcome"] == "cleared" and got["info"]["outcome"] == "cleared"
+
+
+def test_regenerate_of_a_never_judged_sample_writes_no_history(lab, monkeypatch):
+    app_module, reviewer = lab
+    monkeypatch.setattr(app_module, "PREVIEW_POOL", MagicMock())
+    a = reviewer("Dana P")
+    a.client.post("/api/regenerate", json={"tab": TAB, "lab_id": LAB})
+    assert app_module.state.shared.history(LAB) == []
+
+
+# ── 5: one session speaks for one mode ───────────────────────────────────
+
+def test_switching_mode_hides_the_other_modes_verdicts_and_export(lab):
+    app_module, reviewer = lab
+    a = reviewer("Dana P")
+    a.mark("good")
+    samples = a.tab(mode="info")
+    assert samples[LAB]["status"] == "ready"
+    links = a.client.post("/api/good-links", json={"tabs": [TAB]}).get_json()["links"]
+    assert links == []
+    assert a.client.post("/api/export", json={"tabs": [TAB]}).status_code == 400
+
+    samples = a.tab(mode="tests")
+    assert samples[LAB]["status"] == "good"
+    links = a.client.post("/api/good-links", json={"tabs": [TAB]}).get_json()["links"]
+    assert links and links[0]["lab_ids"] == [LAB]
+
+
+def test_switch_back_brings_the_mark_back_from_the_ledger_when_the_store_is_down(lab, monkeypatch):
+    app_module, reviewer = lab
+    a = reviewer("Dana P")
+    a.mark("good")
+    monkeypatch.setattr(app_module.state.shared, "verdicts_for", lambda ids: None)
+    assert a.tab(mode="info")[LAB]["status"] == "ready"
+    assert a.tab(mode="tests")[LAB]["status"] == "good"
+
+
+def test_an_info_verdict_does_not_overwrite_a_tests_row(lab):
+    app_module, reviewer = lab
+    a = reviewer("Dana P")
+    a.mark("bad", reason="Low")
+    a.tab(mode="info")
+    a.mark("good", mode="info")
+    rows = [r for r in a.ustate.session_results if r["lab_id"] == LAB]
+    assert sorted((r["mode"], r["outcome"]) for r in rows) == [("info", "Good"), ("tests", "Bad")]
+
+
+def test_the_ledger_only_brings_back_marks_of_the_session_mode(lab):
+    import app as app_module
+    us = app_module.UserState("u-ledger", "Dana P")
+    us.mode = "info"
+    us.verdicts[(TAB, LAB)] = {"tab": TAB, "lab_id": LAB, "status": "good", "reason": "",
+                               "cc_task_id": None, "judged_at": time.time(),
+                               "date": "2026-09-25", "mode": "tests"}
+    rec = app_module.SampleRecord(lab_id=LAB, tab=TAB)
+    us.add_record(rec)
+    assert rec.status == "pending"
+
+
+def test_restore_keeps_the_mode(lab):
+    app_module, reviewer = lab
+    a = reviewer("Dana P")
+    a.tab(mode="info")
+    a.mark("good", mode="info")
+    doc = app_module.load_review_state("Dana P")
+    assert doc["mode"] == "info"
+    us = app_module.UserState("u-restored", "Dana P")
+    us.hydrate(doc)
+    assert us.mode == "info"
+    assert us.records[(TAB, LAB)].status == "good"
+
+
+# ── 7: retries — one bad entry never blocks the queue ────────────────────
+
+def _pend(app_module, lab_id, at, **kw):
+    entry = {"outcome": "good", "by": "x", "at": at, "reason": "", "cc_task_id": None,
+             "sample_id": None, "tab": TAB}
+    entry.update(kw)
+    app_module.pending_verdicts.put(lab_id, "tests", entry)
+
+
+def test_a_bad_entry_is_skipped_and_the_rest_retried(lab, monkeypatch, caplog):
+    app_module, _ = lab
+    store = app_module.state.shared
+    real = store.apply_marks
+
+    def picky(items):
+        if items[0]["lab_id"] == "BAD":
+            store._last_write_error = "keep"
+            return None
+        return real(items)
+    monkeypatch.setattr(store, "apply_marks", picky)
+    _pend(app_module, "BAD", 1.0)
+    _pend(app_module, "GOOD", 2.0)
+    app_module._retry_pending_verdicts()
+    assert app_module.pending_verdicts.get("GOOD", "tests") is None
+    assert app_module.pending_verdicts.get("BAD", "tests")["attempts"] == 1
+    for _ in range(app_module.MAX_PENDING_ATTEMPTS):
+        app_module._retry_pending_verdicts()
+    assert app_module.pending_verdicts.get("BAD", "tests") is None
+    assert any("BAD" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+
+
+def test_store_down_stops_the_retry_cycle(lab, monkeypatch):
+    app_module, _ = lab
+    store = app_module.state.shared
+    calls = []
+
+    def down(items):
+        calls.append(1)
+        store._last_write_error = "busy"
+        return None
+    monkeypatch.setattr(store, "apply_marks", down)
+    _pend(app_module, "A", 1.0)
+    _pend(app_module, "B", 2.0)
+    app_module._retry_pending_verdicts()
+    assert calls == [1]
+    assert app_module.pending_verdicts.get("A", "tests").get("attempts", 0) == 0
+
+
+def test_an_invalid_entry_is_dropped_at_once(lab, caplog):
+    app_module, _ = lab
+    _pend(app_module, "A", 1.0, outcome="meh")
+    app_module._retry_pending_verdicts()
+    assert len(app_module.pending_verdicts) == 0
+    assert any(r.levelname == "ERROR" and "A" in r.getMessage() for r in caplog.records)
+
+
+# ── 8: pending writes survive a restart ──────────────────────────────────
+
+def test_pending_verdicts_save_and_load(tmp_path):
+    import app as app_module
+    path = tmp_path / "pending_verdicts.json"
+    pv = app_module.PendingVerdicts(path=path)
+    pv.put(LAB, "tests", {"outcome": "good", "by": "Dana P", "at": 5.0, "tab": TAB})
+    assert not path.exists()                    # coalesced: nothing until save()
+    assert pv.save() is True
+    assert pv.save() is False                   # clean: no second write
+    again = app_module.PendingVerdicts(path=path)
+    assert again.load() == 1
+    assert again.get(LAB, "tests")["by"] == "Dana P"
+    pv.remove_if_same((LAB, "tests"), 5.0)
+    pv.save()
+    fresh = app_module.PendingVerdicts(path=path)
+    assert fresh.load() == 0
+
+
+def test_pending_verdicts_load_is_bounded_and_skips_junk(tmp_path):
+    import app as app_module
+    path = tmp_path / "pending_verdicts.json"
+    rows = [{"lab_id": f"L{i}", "mode": "tests", "outcome": "good", "by": "x", "at": float(i)}
+            for i in range(10)]
+    rows.append({"lab_id": "J", "mode": "nope", "outcome": "good", "by": "x", "at": 1.0})
+    rows.append("junk")
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    pv = app_module.PendingVerdicts(cap=5, path=path)
+    assert pv.load() == 5
+    assert pv.get("J", "nope") is None
+
+
+def test_pending_verdicts_load_survives_a_corrupt_file(tmp_path):
+    import app as app_module
+    path = tmp_path / "pending_verdicts.json"
+    path.write_text("{not json", encoding="utf-8")
+    assert app_module.PendingVerdicts(path=path).load() == 0
+
+
+def test_cleanup_cycle_and_exit_save_pending(lab, monkeypatch, tmp_path):
+    app_module, _ = lab
+    pv = app_module.PendingVerdicts(path=tmp_path / "p.json")
+    monkeypatch.setattr(app_module, "pending_verdicts", pv)
+    monkeypatch.setattr(app_module.state.shared, "apply_marks", lambda items: None)
+    _pend(app_module, "A", 1.0)
+    app_module._session_cleanup_cycle(time.time())
+    assert (tmp_path / "p.json").exists()
+    _pend(app_module, "B", 2.0)
+    app_module._save_state_for_exit()
+    assert "B" in (tmp_path / "p.json").read_text(encoding="utf-8")
+
+
+# ── minors ───────────────────────────────────────────────────────────────
+
+def test_failed_write_with_unreadable_store_reports_no_tags(lab, monkeypatch):
+    app_module, reviewer = lab
+    _break_writes(monkeypatch, app_module.state.shared)
+    monkeypatch.setattr(app_module.state.shared, "verdicts_for", lambda ids: None)
+    a = reviewer("Dana P")
+    assert a.mark("good")["tags"] is None
+
+
+def test_a_repeat_good_by_someone_else_renames_the_export_reviewer(lab, monkeypatch):
+    app_module, reviewer = lab
+    clock = _clocked(monkeypatch, app_module)
+    a = reviewer("Dana P")
+    b = reviewer("Sam K")
+    c = reviewer("Cy L", holds=())
+    c.hold(TAB, LAB)
+    a.mark("good")
+    assert c.results()[(TAB, LAB)]["reviewer"] == "Dana P"
+    clock.t += 5
+    b.mark("good")
+    assert c.results()[(TAB, LAB)]["reviewer"] == "Sam K"
+
+
+def test_a_mid_session_mode_switch_reloads_every_tab_in_the_browser():
+    from pathlib import Path
+    import re
+    src = (Path(__file__).resolve().parent.parent / "static" / "js" / "app.js").read_text(
+        encoding="utf-8")
+    body = src[src.index("function applyReviewMode"):]
+    body = body[:body.index("\n}\n")]
+    assert re.search(r"if \(switched[^)]*\)[^{]*\{\s*restoreAllTabs\(\)", body)
+
+
+def test_a_tombstone_in_one_mode_keeps_the_other_modes_ledger_entry(lab):
+    import app as app_module
+    us = app_module.UserState("u-ledger2", "Dana P")
+    rec = app_module.SampleRecord(lab_id=LAB, tab=TAB)
+    rec.preview_url = "/pdf"
+    us.add_record(rec)
+    us.verdicts[(TAB, LAB)] = {"tab": TAB, "lab_id": LAB, "status": "good", "reason": "",
+                               "cc_task_id": None, "judged_at": time.time(),
+                               "date": "2026-09-25", "mode": "info"}
+    rec.status, rec.verdict_mode = "good", "tests"
+    app_module._apply_shared(us, rec, {"outcome": "cleared", "at": time.time() + 1}, "tests")
+    assert rec.status == "ready"
+    assert (TAB, LAB) in us.verdicts
