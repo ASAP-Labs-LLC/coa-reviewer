@@ -25,8 +25,14 @@ that reaches the lab:
   that was still being served and then serve nothing. Probing by connecting
   rather than binding is not a style preference here.
 * **A restart may ask for a switch.** ``switch-requested`` in the data dir is
-  the app's restart button asking for the already-staged release; it passes
-  the same ``may_switch`` gate.
+  the app's Restart button asking to switch to the already-staged release
+  instead of respawning the same version. It is honoured only if the request
+  is fresh, GitHub still calls that tag *latest*, the tag was not rolled back
+  from before, and the normal ``may_switch`` gate (staged, healthy, matches
+  what was requested) passes — any one of those failing means an ordinary
+  restart instead, never a switch nobody asked for. This is the *only* way a
+  switch happens without a person typing the ``switch`` command: it is not
+  wired to the app's 3 AM self-restart, which stays a same-version respawn.
 
 Layout per app::
 
@@ -62,7 +68,7 @@ import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence, Tuple
 
 # ── actions ─────────────────────────────────────────────────────────────────
 
@@ -349,59 +355,228 @@ def write_staged(data_dir: Path | str, *, tag: str, healthy: bool, notes: str,
 
 
 # ── restart-requested switch ─────────────────────────────────────────────────
+#
+# A reviewer's Restart button can ask for the already-staged release instead
+# of respawning the same version (see restart_update.py in the app). The
+# marker is never just deleted: it is *claimed* by renaming it into
+# switch-accepted or switch-refused (with the reason), because a silently
+# vanished request is indistinguishable from one that was never seen.
 
 SWITCH_REQUEST_FILE = "switch-requested"
+SWITCH_ACCEPTED_FILE = "switch-accepted"   # must match restart_update.ACCEPTED_FILE
+SWITCH_REFUSED_FILE = "switch-refused"     # must match restart_update.REFUSED_FILE
+HELD_TAGS_FILE = "held-tags.json"
+
+MAX_MARKER_BYTES = 4096   # a switch request is three short fields; more is not one
+MAX_TAG_LEN = 64
+MAX_HELD_TAGS = 20
+
+# Must stay well under the app's restart_update.PICKUP_SECONDS (60s): the app
+# gives up waiting and restarts normally after that, so a request must not
+# still look "fresh" to the updater once the app has already moved on.
+MAX_REQUEST_AGE_SECONDS = 45.0
+
+# marker path -> mtime we already failed to claim (rename AND unlink both
+# failed). Skip that exact file on later ticks instead of retrying forever —
+# see honour_switch_request.
+_CLAIM_FAILURES: dict[str, float] = {}
 
 
-def take_switch_request(data_dir: Path | str) -> Optional[dict]:
-    """Consume the app's restart-time switch request.
-
-    Deleted *before* acting, so a switch that crashes the updater cannot be
-    retried in a loop. ``None`` = no request; ``{}`` = unreadable request
-    (acted on as "no tag", i.e. refused)."""
-    path = Path(data_dir) / SWITCH_REQUEST_FILE
+def _read_switch_marker(path: Path) -> Tuple[Optional[dict], str]:
+    """Read and shape-validate the marker. ``(doc, "")`` if it is usable,
+    ``(partial_or_None, why)`` if not — ``why`` is always a ready-to-log
+    refusal reason. Bounded to MAX_MARKER_BYTES so a corrupt or hostile file
+    is never read unbounded into memory."""
     try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except (OSError, UnicodeDecodeError) as exc:
-        log.warning("could not read %s: %s", path, exc)
-        return None
-    try:
-        path.unlink()
+        with open(path, "rb") as fh:
+            raw = fh.read(MAX_MARKER_BYTES)
     except OSError as exc:
-        log.warning("could not remove %s (%s); ignoring it rather than looping", path, exc)
-        return None
+        return None, f"could not read switch request: {exc}"
     try:
-        got = json.loads(raw)
-    except ValueError:
-        return {}
-    return got if isinstance(got, dict) else {}
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, "malformed switch request"
+    if not isinstance(doc, dict):
+        return None, "malformed switch request"
+    tag, at = doc.get("tag"), doc.get("at")
+    valid_tag = isinstance(tag, str) and 0 < len(tag) <= MAX_TAG_LEN
+    valid_at = isinstance(at, (int, float)) and not isinstance(at, bool)
+    if not valid_tag or not valid_at:
+        return doc, "malformed switch request"
+    return doc, ""
 
 
-def honour_switch_request(app: "App") -> bool:
+def _read_held_tags(data_dir: Path | str) -> list[str]:
+    try:
+        got = json.loads((Path(data_dir) / HELD_TAGS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return []
+    return [str(t) for t in got] if isinstance(got, list) else []
+
+
+def _write_held_tags(data_dir: Path | str, held: list[str]) -> None:
+    data_dir = Path(data_dir)
+    tmp = data_dir / f"{HELD_TAGS_FILE}.tmp"
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(held[-MAX_HELD_TAGS:]), encoding="utf-8")
+        os.replace(tmp, data_dir / HELD_TAGS_FILE)
+    except OSError as exc:
+        log.warning("could not write %s: %s", HELD_TAGS_FILE, exc)
+
+
+def hold_tag(data_dir: Path | str, tag: Optional[str]) -> None:
+    """Remember that ``tag`` was abandoned (rolled back from) so a
+    restart-time switch request cannot silently walk back into it. Bounded to
+    MAX_HELD_TAGS — this is a recent-history guard, not a permanent record."""
+    if not tag:
+        return
+    held = [t for t in _read_held_tags(data_dir) if differs_from(t, tag)]
+    held.append(tag)
+    _write_held_tags(data_dir, held)
+
+
+def release_tag(data_dir: Path | str, tag: Optional[str]) -> None:
+    """A person deliberately switching to ``tag`` (the CLI ``switch``
+    command) clears any hold on it — the hold exists to stop an *automatic*
+    request from walking back into a known-bad release, not to override a
+    human who explicitly asked for it."""
+    if not tag:
+        return
+    held = [t for t in _read_held_tags(data_dir) if differs_from(t, tag)]
+    _write_held_tags(data_dir, held)
+
+
+def _is_held(data_dir: Path | str, tag: Optional[str]) -> bool:
+    if not tag:
+        return False
+    return any(not differs_from(t, tag) for t in _read_held_tags(data_dir))
+
+
+def _pause_reason(data_dir: Path | str) -> Optional[str]:
+    """Which marker would block a restart-time switch, so the refusal names
+    the actual reason instead of a generic "paused"."""
+    d = Path(data_dir)
+    if (d / "switching").exists():
+        return "a switch is already in progress"
+    if (d / "paused").exists():
+        return "app is paused"
+    return None
+
+
+def _refuse_switch_request(app: "App", *, tag: Optional[str], at: Optional[float],
+                           staged: Optional[dict], poll_interval: float) -> str:
+    """The reason a restart-time switch request must be refused, or ``""``
+    if every gate passes."""
+    reason = _pause_reason(app.data_dir)
+    if reason:
+        return reason
+    now = time.time()
+    age = now - float(at)
+    if age < -5.0 or age > MAX_REQUEST_AGE_SECONDS:
+        return f"stale request (age {age:.0f}s)"
+    ok, why = may_switch(staged=staged, requested_tag=tag or "")
+    if not ok:
+        return why
+    canonical = (staged or {}).get("tag")
+    if not differs_from(app.current_version(), canonical):
+        return "already on this release"
+    cached = _LATEST_CACHE.get(app.name)
+    if not cached or now - cached[1] > 2 * poll_interval:
+        return "no recent poll to confirm this is still GitHub's latest release"
+    if differs_from(canonical, cached[0]):
+        return "staged release is no longer GitHub's latest"
+    if _is_held(app.data_dir, canonical):
+        return f"{canonical} was rolled back; switch it manually"
+    return ""
+
+
+def _claim_marker(path: Path, dest: Path, payload: dict) -> bool:
+    """Turn the marker into its outcome file, atomically, then fill in its
+    content.
+
+    The rename comes first and never writes into ``path`` beforehand — a
+    failed attempt must leave the marker byte-for-byte and mtime-for-mtime
+    unchanged, because the caller uses its mtime to recognise "already tried
+    and failed to claim this exact file" and skip it on the next tick rather
+    than retrying forever. On a rename failure (e.g. a Windows sharing
+    violation from a process still holding the file) fall back to deleting
+    the marker, so the request is still consumed at the cost of the audit
+    file. If even deletion fails, return False — the caller remembers this
+    exact file and leaves it alone."""
+    try:
+        os.replace(path, dest)
+    except OSError as exc:
+        log.warning("[claim] could not turn %s into %s (%s); deleting it instead",
+                   path.name, dest.name, exc)
+        try:
+            path.unlink()
+            return True
+        except OSError as exc2:
+            log.warning("[claim] could not remove %s either (%s); leaving it — "
+                       "it will not be retried", path, exc2)
+            return False
+    try:
+        dest.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError as exc:
+        log.warning("[claim] claimed %s but could not write its outcome content: %s",
+                   dest.name, exc)
+    return True
+
+
+def honour_switch_request(app: "App", *, poll_interval: float = DEFAULT_POLL_SECONDS) -> bool:
     """A reviewer clicked Restart while a release was staged: switch now.
 
-    Same gate as a manual ``switch``; idleness is not required because the
-    person asking is choosing to restart anyway. Anything that fails the gate
-    is logged and left alone — the app restarts itself normally."""
-    req = take_switch_request(app.data_dir)
-    if req is None:
+    Every gate a normal switch passes still applies (staged, healthy, not
+    paused, not mid-switch), plus three restart-specific ones: the request
+    must be fresh, GitHub must still call the staged tag *latest*, and the
+    tag must not have been rolled back from before. The marker is claimed by
+    renaming it to switch-accepted/switch-refused rather than deleted, so the
+    outcome is visible to whoever asked. Returns True only when a switch was
+    actually performed."""
+    path = Path(app.data_dir) / SWITCH_REQUEST_FILE
+    try:
+        st = path.stat()
+    except FileNotFoundError:
         return False
-    tag = str(req.get("tag") or "")
-    who = req.get("by") or "someone"
-    if is_paused(app.data_dir):
-        log.info("[%s] %s asked for %s on restart, but the app is paused", app.name, who, tag)
+    except OSError as exc:
+        log.warning("[%s] could not stat switch request: %s", app.name, exc)
         return False
-    ok, why = may_switch(staged=read_staged(app.data_dir), requested_tag=tag)
+
+    key = str(path)
+    if _CLAIM_FAILURES.get(key) == st.st_mtime:
+        return False  # already failed to claim this exact file; do not loop on it
+
+    doc, why = _read_switch_marker(path)
+    tag = doc.get("tag") if isinstance(doc, dict) else None
+    at = doc.get("at") if isinstance(doc, dict) else None
+    by = (doc.get("by") if isinstance(doc, dict) else None) or "someone"
+
+    staged = read_staged(app.data_dir)
+    if not why:
+        why = _refuse_switch_request(app, tag=tag, at=at, staged=staged,
+                                     poll_interval=poll_interval)
+
+    now = time.time()
+    if why:
+        log.warning("[%s] restart-time switch requested by %r refused: %s",
+                   app.name, by, why)
+        ok = _claim_marker(path, Path(app.data_dir) / SWITCH_REFUSED_FILE,
+                           {"tag": tag, "by": by, "at": at, "why": why,
+                            "refused_at": now})
+        if not ok:
+            _CLAIM_FAILURES[key] = st.st_mtime
+        return False
+
+    canonical_tag = staged["tag"]   # the gate proved this is staged and healthy
+    log.warning("[%s] %r restarted the app with %s staged — switching now",
+               app.name, by, canonical_tag)
+    ok = _claim_marker(path, Path(app.data_dir) / SWITCH_ACCEPTED_FILE,
+                       {"tag": tag, "by": by, "at": at, "accepted_at": now})
     if not ok:
-        log.warning("[%s] restart-time switch to %r refused: %s", app.name, tag, why)
+        _CLAIM_FAILURES[key] = st.st_mtime
         return False
-    if not differs_from(app.current_version(), tag):
-        log.info("[%s] restart-time switch: already on %s", app.name, tag)
-        return False
-    log.warning("[%s] %s restarted the app with %s staged — switching now", app.name, who, tag)
-    return switch(app, tag)
+    return switch(app, canonical_tag)
 
 
 # ── GitHub ──────────────────────────────────────────────────────────────────
@@ -991,9 +1166,13 @@ def switch(app: App, tag: str, *, force: bool = False) -> bool:
                      notes=f"unhealthy after switch and no rollback target: {notes}")
         return False
 
-    _stop_app(app)
-    repoint_junction(app.current, app.releases_dir / previous)
-    _start_app(app)
+    # Abandoned: a restart-time switch request must not silently walk back
+    # into a release just proven unhealthy.
+    hold_tag(app.data_dir, tag)
+    with _switch_guard(app):
+        _stop_app(app)
+        repoint_junction(app.current, app.releases_dir / previous)
+        _start_app(app)
     back_ok, back_notes = _verify_live(app, expected=previous)
     write_staged(app.data_dir, tag=tag, healthy=False, notes=(
         f"switch failed ({notes}); rolled back to {previous} "
@@ -1030,6 +1209,9 @@ def rollback(app: App) -> bool:
     for name in app.release_names_newest_first():
         if name != current:
             log.info("[%s] rolling back to %s", app.name, name)
+            # A person decided current is bad enough to abandon; a
+            # restart-time switch request must not walk back into it.
+            hold_tag(app.data_dir, current)
             return switch(app, name, force=True)
     log.error("[%s] no other release to roll back to", app.name)
     return False
@@ -1105,6 +1287,12 @@ def prune(app: App, *, protected: Iterable[str] = ()) -> None:
 
 _START_HISTORY: dict = {}
 
+# app name -> (latest tag GitHub reported, wall time.time() of that poll).
+# honour_switch_request refuses a restart-time switch unless this is recent —
+# "the staged release is still what GitHub calls latest" is otherwise
+# unknowable without another network call on every supervision tick.
+_LATEST_CACHE: dict = {}
+
 
 def supervise(app: App) -> str:
     """Restart ``app`` if it has stopped serving.
@@ -1177,6 +1365,10 @@ def supervise(app: App) -> str:
 def poll_once(app: App, token: Optional[str]) -> str:
     release = latest_release(app.repo, token)
     latest = release.get("tag_name") if release else None
+    if latest:
+        # A successful poll, whatever it decides to do about it — this is what
+        # honour_switch_request checks "is the staged tag still latest?" against.
+        _LATEST_CACHE[app.name] = (latest, time.time())
     current = app.current_version()
     staged = read_staged(app.data_dir)
     action = plan_poll(current=current, latest=latest, staged=staged)
@@ -1318,6 +1510,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log.warning("--force: skipping the staged/healthy guard. The "
                         "post-switch health check and automatic rollback still "
                         "apply — those are not bypassable.")
+        # A person is explicitly choosing this tag; any earlier automatic
+        # hold on it (from a rollback) must not block their own decision.
+        for a in chosen:
+            release_tag(a.data_dir, args.tag)
         return 0 if all(switch(a, args.tag, force=args.force) for a in chosen) else 1
 
     if args.command == "rollback":
@@ -1349,7 +1545,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 log.exception("[%s] unhandled error while supervising", a.name)
 
             try:
-                honour_switch_request(a)
+                honour_switch_request(a, poll_interval=interval)
             except Exception:
                 log.exception("[%s] unhandled error honouring a switch request", a.name)
 

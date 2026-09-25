@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -553,6 +554,13 @@ def test_pick_assets_refuses_a_release_with_no_zip():
 
 
 # ── switch-requested (restart asking the updater for the staged release) ────
+#
+# Protocol: the marker is claimed, never deleted-and-forgotten — it becomes
+# switch-accepted or switch-refused (with why), so a reviewer's restart
+# button gets a real answer. honour_switch_request's gate is: shape-valid,
+# fresh, not paused/mid-switch, staged+healthy+matching (may_switch), not
+# already on that release, still GitHub's latest (a recent poll_once cache),
+# and not a tag that was just rolled back from (held-tags.json).
 
 def _coa_app(tmp_path):
     """An App rooted at tmp_path, with its data dir created — reuses the
@@ -562,35 +570,61 @@ def _coa_app(tmp_path):
     return app
 
 
-def test_take_switch_request_consumes_marker(tmp_path):
-    (tmp_path / "switch-requested").write_text('{"tag": "v4.0.0", "by": "x"}')
-    assert updater.take_switch_request(tmp_path) == {"tag": "v4.0.0", "by": "x"}
-    assert not (tmp_path / "switch-requested").exists()
-    assert updater.take_switch_request(tmp_path) is None
+def _write_marker(app, tag="v4.0.0", by="x", at=None):
+    at = time.time() if at is None else at
+    (app.data_dir / "switch-requested").write_text(
+        json.dumps({"tag": tag, "by": by, "at": at}), encoding="utf-8")
 
 
-def test_take_switch_request_corrupt_is_empty_dict(tmp_path):
-    (tmp_path / "switch-requested").write_text("garbage")
-    assert updater.take_switch_request(tmp_path) == {}
+def _seed_latest(monkeypatch, app, tag, *, age=0.0):
+    """Make honour_switch_request believe poll_once last saw ``tag`` as
+    latest ``age`` seconds ago. Replaces the whole cache dict rather than
+    mutating the shared module one, so tests cannot leak into each other."""
+    monkeypatch.setattr(updater, "_LATEST_CACHE", {app.name: (tag, time.time() - age)})
+
+
+def _ready(app, monkeypatch, *, staged_tag="v4.0.0", current="v3.5.0"):
+    """Stage a healthy release, make it look like the latest GitHub poll,
+    and set current_version — the state under which a switch is allowed."""
+    updater.write_staged(app.data_dir, tag=staged_tag, healthy=True, notes="ok")
+    monkeypatch.setattr(app, "current_version", lambda: current)
+    _seed_latest(monkeypatch, app, staged_tag)
+
+
+@pytest.fixture(autouse=True)
+def _reset_claim_failures():
+    """_CLAIM_FAILURES is process-lifetime state in production (skip a file
+    that could not be claimed); tests must not see a previous test's entry."""
+    updater._CLAIM_FAILURES.clear()
+    yield
+    updater._CLAIM_FAILURES.clear()
 
 
 def test_honour_switch_request_switches_to_staged(tmp_path, monkeypatch):
-    app = _coa_app(tmp_path)     # helper: App with data_dir under tmp_path
-    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
-    (app.data_dir / "switch-requested").write_text('{"tag": "v4.0.0", "by": "x"}')
-    monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
+    app = _coa_app(tmp_path)
+    _ready(app, monkeypatch)
+    _write_marker(app, tag="v4.0.0", by="Dana P")
     calls = []
     monkeypatch.setattr(updater, "switch", lambda a, tag, **kw: calls.append(tag) or True)
     assert updater.honour_switch_request(app) is True
     assert calls == ["v4.0.0"]
+    assert not (app.data_dir / "switch-requested").exists()
 
 
-def test_honour_switch_request_refuses_mismatch(tmp_path, monkeypatch):
+def test_accepted_file_is_written_before_switch_is_called(tmp_path, monkeypatch):
     app = _coa_app(tmp_path)
-    updater.write_staged(app.data_dir, tag="v4.0.1", healthy=True, notes="ok")
-    (app.data_dir / "switch-requested").write_text('{"tag": "v4.0.0"}')
-    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
-    assert updater.honour_switch_request(app) is False
+    _ready(app, monkeypatch)
+    _write_marker(app, tag="v4.0.0", by="Dana P")
+    seen = {}
+
+    def fake_switch(a, tag, **kw):
+        seen["accepted_exists"] = (app.data_dir / "switch-accepted").exists()
+        return True
+    monkeypatch.setattr(updater, "switch", fake_switch)
+    assert updater.honour_switch_request(app) is True
+    assert seen["accepted_exists"] is True
+    doc = json.loads((app.data_dir / "switch-accepted").read_text())
+    assert doc["tag"] == "v4.0.0" and doc["by"] == "Dana P" and "accepted_at" in doc
 
 
 def test_honour_switch_request_noop_without_marker(tmp_path, monkeypatch):
@@ -599,22 +633,230 @@ def test_honour_switch_request_noop_without_marker(tmp_path, monkeypatch):
     assert updater.honour_switch_request(app) is False
 
 
-def test_honour_switch_request_does_not_switch_while_paused(tmp_path, monkeypatch):
-    """A person paused the app deliberately; a restart-time switch request
-    must not override that hold."""
+def test_honour_switch_request_unhealthy_staged_refused(tmp_path, monkeypatch):
     app = _coa_app(tmp_path)
-    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
-    (app.data_dir / "switch-requested").write_text('{"tag": "v4.0.0", "by": "x"}')
-    (app.data_dir / "paused").write_text("down for maintenance", encoding="utf-8")
+    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=False, notes="boom")
     monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
+    _seed_latest(monkeypatch, app, "v4.0.0")
+    _write_marker(app, tag="v4.0.0")
     monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
     assert updater.honour_switch_request(app) is False
+    doc = json.loads((app.data_dir / "switch-refused").read_text())
+    assert "health check" in doc["why"]
+
+
+def test_honour_switch_request_switching_marker_refused(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    _ready(app, monkeypatch)
+    _write_marker(app)
+    (app.data_dir / "switching").write_text("switch in progress", encoding="utf-8")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+    doc = json.loads((app.data_dir / "switch-refused").read_text())
+    assert "already in progress" in doc["why"]
+
+
+def test_honour_switch_request_paused_refused(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    _ready(app, monkeypatch)
+    _write_marker(app)
+    (app.data_dir / "paused").write_text("down for maintenance", encoding="utf-8")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+    doc = json.loads((app.data_dir / "switch-refused").read_text())
+    assert doc["why"] == "app is paused"
 
 
 def test_honour_switch_request_noop_when_already_on_tag(tmp_path, monkeypatch):
     app = _coa_app(tmp_path)
-    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
-    (app.data_dir / "switch-requested").write_text('{"tag": "v4.0.0", "by": "x"}')
-    monkeypatch.setattr(app, "current_version", lambda: "v4.0.0")
+    _ready(app, monkeypatch, staged_tag="v4.0.0", current="v4.0.0")
+    _write_marker(app, tag="v4.0.0")
     monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
     assert updater.honour_switch_request(app) is False
+
+
+@pytest.mark.parametrize("bad_marker", [
+    "garbage",                                    # not JSON
+    "[]",                                          # not an object
+    json.dumps({"tag": "", "at": 1.0}),            # empty tag
+    json.dumps({"tag": "v4.0.0"}),                 # missing at
+    json.dumps({"tag": "v4.0.0", "at": "now"}),    # at not a number
+    json.dumps({"tag": "v4.0.0", "at": True}),     # bool is not a number here
+    json.dumps({"tag": "x" * 65, "at": 1.0}),      # tag too long
+])
+def test_malformed_switch_request_never_switches_and_leaves_refused(
+        tmp_path, monkeypatch, bad_marker):
+    app = _coa_app(tmp_path)
+    _ready(app, monkeypatch)
+    (app.data_dir / "switch-requested").write_text(bad_marker, encoding="utf-8")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+    assert not (app.data_dir / "switch-requested").exists()
+    doc = json.loads((app.data_dir / "switch-refused").read_text())
+    assert doc["why"] == "malformed switch request"
+
+
+def test_stale_switch_request_refused(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    _ready(app, monkeypatch)
+    _write_marker(app, at=time.time() - (updater.MAX_REQUEST_AGE_SECONDS + 1))
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+    doc = json.loads((app.data_dir / "switch-refused").read_text())
+    assert "stale" in doc["why"]
+
+
+def test_switch_request_from_slightly_in_the_future_is_tolerated(tmp_path, monkeypatch):
+    """Small clock skew between the app and the updater must not refuse a
+    request that was, from the app's clock, made just now."""
+    app = _coa_app(tmp_path)
+    _ready(app, monkeypatch)
+    _write_marker(app, at=time.time() + 3.0)
+    monkeypatch.setattr(updater, "switch", lambda a, tag, **kw: True)
+    assert updater.honour_switch_request(app) is True
+
+
+def test_switch_request_refused_without_a_recent_poll(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
+    monkeypatch.setattr(updater, "_LATEST_CACHE", {})   # never polled
+    _write_marker(app, tag="v4.0.0")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+    doc = json.loads((app.data_dir / "switch-refused").read_text())
+    assert "latest" in doc["why"]
+
+
+def test_switch_request_refused_when_a_newer_poll_beat_it(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
+    _seed_latest(monkeypatch, app, "v4.0.1")   # GitHub has moved on
+    _write_marker(app, tag="v4.0.0")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+    doc = json.loads((app.data_dir / "switch-refused").read_text())
+    assert "no longer GitHub's latest" in doc["why"]
+
+
+def test_switch_request_refused_when_the_poll_cache_is_stale(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    _ready(app, monkeypatch)
+    _seed_latest(monkeypatch, app, "v4.0.0", age=updater.DEFAULT_POLL_SECONDS * 3)
+    _write_marker(app, tag="v4.0.0")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+
+
+def test_held_tag_refuses_a_restart_time_switch(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    _ready(app, monkeypatch)
+    updater.hold_tag(app.data_dir, "v4.0.0")
+    _write_marker(app, tag="v4.0.0")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+    doc = json.loads((app.data_dir / "switch-refused").read_text())
+    assert "rolled back" in doc["why"]
+
+
+def test_release_tag_clears_a_hold(tmp_path):
+    """What the CLI `switch` command does before calling switch(): a human
+    explicitly choosing a tag overrides an earlier automatic hold on it."""
+    app = _coa_app(tmp_path)
+    updater.hold_tag(app.data_dir, "v4.0.0")
+    assert updater._is_held(app.data_dir, "v4.0.0")
+    updater.release_tag(app.data_dir, "v4.0.0")
+    assert not updater._is_held(app.data_dir, "v4.0.0")
+
+
+def test_held_tags_file_is_bounded(tmp_path):
+    for i in range(updater.MAX_HELD_TAGS + 10):
+        updater.hold_tag(tmp_path, f"v0.0.{i}")
+    assert len(updater._read_held_tags(tmp_path)) == updater.MAX_HELD_TAGS
+
+
+def test_rollback_holds_the_abandoned_release(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    monkeypatch.setattr(app, "current_target_name", lambda: "v3.5.0")
+    monkeypatch.setattr(app, "release_names_newest_first",
+                        lambda: ["v3.5.0", "v3.4.0"])
+    monkeypatch.setattr(updater, "switch", lambda a, tag, **kw: True)
+    assert updater.rollback(app) is True
+    assert updater._is_held(app.data_dir, "v3.5.0")
+
+
+def test_switch_rollback_after_unhealthy_holds_the_bad_tag_and_uses_switch_guard(
+        tmp_path, monkeypatch):
+    """Covers both C2 (an unhealthy switch holds the tag it rolled back from)
+    and M7 (the rollback's stop/repoint/start is inside _switch_guard, so
+    supervision does not race in while the app is deliberately stopped)."""
+    app = _coa_app(tmp_path)
+    (app.releases_dir / "v4.0.0").mkdir(parents=True)
+    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    monkeypatch.setattr(app, "current_target_name", lambda: "v3.5.0")
+    monkeypatch.setattr(updater, "_stop_app", lambda a: None)
+    monkeypatch.setattr(updater, "repoint_junction", lambda link, target: None)
+    marker_seen_during_rollback = []
+
+    def fake_start_app(a):
+        marker_seen_during_rollback.append((a.data_dir / "switching").exists())
+    monkeypatch.setattr(updater, "_start_app", fake_start_app)
+
+    calls = {"n": 0}
+
+    def fake_verify(a, *, expected):
+        calls["n"] += 1
+        return (False, "boom") if calls["n"] == 1 else (True, "recovered")
+    monkeypatch.setattr(updater, "_verify_live", fake_verify)
+
+    assert updater.switch(app, "v4.0.0") is False
+    assert updater._is_held(app.data_dir, "v4.0.0")
+    # _start_app is called once for the initial switch (guarded) and once for
+    # the rollback (also guarded) — both must see the marker.
+    assert marker_seen_during_rollback == [True, True]
+    assert not (app.data_dir / "switching").exists()   # cleared afterwards
+
+
+def test_claim_failure_is_not_retried_on_the_next_tick(tmp_path, monkeypatch):
+    """If neither the rename nor the fallback unlink can claim the marker
+    (e.g. a Windows sharing violation), the updater must not keep trying
+    every tick — it remembers the exact file and leaves it alone."""
+    app = _coa_app(tmp_path)
+    _ready(app, monkeypatch)
+    _write_marker(app, tag="v4.0.0")
+    attempts = []
+
+    def fail_replace(*a, **k):
+        attempts.append("replace")
+        raise OSError("sharing violation")
+
+    def fail_unlink(self):
+        attempts.append("unlink")
+        raise OSError("sharing violation")
+
+    monkeypatch.setattr(updater.os, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    monkeypatch.setattr(updater, "switch", lambda a, tag, **kw: True)
+
+    assert updater.honour_switch_request(app) is False
+    first_attempts = len(attempts)
+    assert first_attempts > 0
+
+    # Second tick, same unclaimed marker still on disk: must not attempt again.
+    assert updater.honour_switch_request(app) is False
+    assert len(attempts) == first_attempts
+
+
+def test_loop_wiring_calls_honour_after_supervise(tmp_path):
+    """Source-level guard: the run loop's exceptions-contained supervise/
+    honour ordering (verified functionally above) must not silently regress
+    to only one of the two, or to honour running first."""
+    src = (Path(__file__).resolve().parent.parent / "deploy" / "updater"
+          / "updater.py").read_text(encoding="utf-8")
+    loop = src[src.index("while True:"):]
+    i_supervise = loop.index("supervise(a)")
+    i_honour = loop.index("honour_switch_request(a")
+    assert i_supervise < i_honour
+    between = loop[i_supervise:i_honour]
+    assert between.count("except Exception:") >= 1
