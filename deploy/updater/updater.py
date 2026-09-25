@@ -24,6 +24,9 @@ that reaches the lab:
   mid-tree, and Windows ``SO_REUSEADDR`` letting a second server bind a port
   that was still being served and then serve nothing. Probing by connecting
   rather than binding is not a style preference here.
+* **A restart may ask for a switch.** ``switch-requested`` in the data dir is
+  the app's restart button asking for the already-staged release; it passes
+  the same ``may_switch`` gate.
 
 Layout per app::
 
@@ -343,6 +346,62 @@ def write_staged(data_dir: Path | str, *, tag: str, healthy: bool, notes: str,
     tmp = data_dir / "staged.json.tmp"
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     os.replace(tmp, data_dir / "staged.json")
+
+
+# ── restart-requested switch ─────────────────────────────────────────────────
+
+SWITCH_REQUEST_FILE = "switch-requested"
+
+
+def take_switch_request(data_dir: Path | str) -> Optional[dict]:
+    """Consume the app's restart-time switch request.
+
+    Deleted *before* acting, so a switch that crashes the updater cannot be
+    retried in a loop. ``None`` = no request; ``{}`` = unreadable request
+    (acted on as "no tag", i.e. refused)."""
+    path = Path(data_dir) / SWITCH_REQUEST_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        log.warning("could not read %s: %s", path, exc)
+        return None
+    try:
+        path.unlink()
+    except OSError as exc:
+        log.warning("could not remove %s (%s); ignoring it rather than looping", path, exc)
+        return None
+    try:
+        got = json.loads(raw)
+    except ValueError:
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def honour_switch_request(app: "App") -> bool:
+    """A reviewer clicked Restart while a release was staged: switch now.
+
+    Same gate as a manual ``switch``; idleness is not required because the
+    person asking is choosing to restart anyway. Anything that fails the gate
+    is logged and left alone — the app restarts itself normally."""
+    req = take_switch_request(app.data_dir)
+    if req is None:
+        return False
+    tag = str(req.get("tag") or "")
+    who = req.get("by") or "someone"
+    if is_paused(app.data_dir):
+        log.info("[%s] %s asked for %s on restart, but the app is paused", app.name, who, tag)
+        return False
+    ok, why = may_switch(staged=read_staged(app.data_dir), requested_tag=tag)
+    if not ok:
+        log.warning("[%s] restart-time switch to %r refused: %s", app.name, tag, why)
+        return False
+    if not differs_from(app.current_version(), tag):
+        log.info("[%s] restart-time switch: already on %s", app.name, tag)
+        return False
+    log.warning("[%s] %s restarted the app with %s staged — switching now", app.name, who, tag)
+    return switch(app, tag)
 
 
 # ── GitHub ──────────────────────────────────────────────────────────────────
@@ -1288,6 +1347,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 supervise(a)
             except Exception:
                 log.exception("[%s] unhandled error while supervising", a.name)
+
+            try:
+                honour_switch_request(a)
+            except Exception:
+                log.exception("[%s] unhandled error honouring a switch request", a.name)
 
         if now >= next_release_check:
             for a in chosen:

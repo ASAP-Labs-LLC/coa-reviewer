@@ -550,3 +550,71 @@ def test_pick_assets_refuses_a_release_with_no_zip():
     assets = [{"name": "coa.zip.sha256", "browser_download_url": "u2"}]
     with pytest.raises(updater.ReleaseError):
         updater.pick_assets(assets)
+
+
+# ── switch-requested (restart asking the updater for the staged release) ────
+
+def _coa_app(tmp_path):
+    """An App rooted at tmp_path, with its data dir created — reuses the
+    module's own ``_app`` helper rather than duplicating its config keys."""
+    app = _app(root=str(tmp_path))
+    app.data_dir.mkdir(parents=True, exist_ok=True)
+    return app
+
+
+def test_take_switch_request_consumes_marker(tmp_path):
+    (tmp_path / "switch-requested").write_text('{"tag": "v4.0.0", "by": "x"}')
+    assert updater.take_switch_request(tmp_path) == {"tag": "v4.0.0", "by": "x"}
+    assert not (tmp_path / "switch-requested").exists()
+    assert updater.take_switch_request(tmp_path) is None
+
+
+def test_take_switch_request_corrupt_is_empty_dict(tmp_path):
+    (tmp_path / "switch-requested").write_text("garbage")
+    assert updater.take_switch_request(tmp_path) == {}
+
+
+def test_honour_switch_request_switches_to_staged(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)     # helper: App with data_dir under tmp_path
+    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    (app.data_dir / "switch-requested").write_text('{"tag": "v4.0.0", "by": "x"}')
+    monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
+    calls = []
+    monkeypatch.setattr(updater, "switch", lambda a, tag, **kw: calls.append(tag) or True)
+    assert updater.honour_switch_request(app) is True
+    assert calls == ["v4.0.0"]
+
+
+def test_honour_switch_request_refuses_mismatch(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    updater.write_staged(app.data_dir, tag="v4.0.1", healthy=True, notes="ok")
+    (app.data_dir / "switch-requested").write_text('{"tag": "v4.0.0"}')
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+
+
+def test_honour_switch_request_noop_without_marker(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+
+
+def test_honour_switch_request_does_not_switch_while_paused(tmp_path, monkeypatch):
+    """A person paused the app deliberately; a restart-time switch request
+    must not override that hold."""
+    app = _coa_app(tmp_path)
+    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    (app.data_dir / "switch-requested").write_text('{"tag": "v4.0.0", "by": "x"}')
+    (app.data_dir / "paused").write_text("down for maintenance", encoding="utf-8")
+    monkeypatch.setattr(app, "current_version", lambda: "v3.5.0")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
+
+
+def test_honour_switch_request_noop_when_already_on_tag(tmp_path, monkeypatch):
+    app = _coa_app(tmp_path)
+    updater.write_staged(app.data_dir, tag="v4.0.0", healthy=True, notes="ok")
+    (app.data_dir / "switch-requested").write_text('{"tag": "v4.0.0", "by": "x"}')
+    monkeypatch.setattr(app, "current_version", lambda: "v4.0.0")
+    monkeypatch.setattr(updater, "switch", lambda *a, **k: pytest.fail("must not switch"))
+    assert updater.honour_switch_request(app) is False
