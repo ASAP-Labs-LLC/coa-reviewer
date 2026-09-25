@@ -59,6 +59,7 @@ class PresenceTracker:
         self._store = store
         self._now = now or time.time
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()      # single-flight for flush()
         self._spans: Dict[str, _Span] = {}      # live, still "here"
         self._closing: List[_Span] = []          # retired, awaiting close-flush
         self._last_capacity_warn = 0.0
@@ -76,10 +77,16 @@ class PresenceTracker:
                 self._retire_locked(key, span, span.last_seen, "gap")
                 span = None
             if span is not None:
-                close_at = self._midnight_split(span, now)
-                if close_at is not None:
-                    self._retire_locked(key, span, close_at, "gap")
-                    span = None
+                midnight = self._midnight_split(span, now)
+                if midnight is not None:
+                    # Close the old span exactly at the boundary and open
+                    # the new one there too, so "today" and "yesterday"
+                    # split cleanly with no gap and no overlap — then this
+                    # same touch still counts, via last_seen=now below, so
+                    # the first touch after midnight is never lost.
+                    self._retire_locked(key, span, midnight, "midnight")
+                    self._open_locked(key, name, now, started=midnight)
+                    return
             if span is None:
                 self._open_locked(key, name, now)
                 return
@@ -115,25 +122,41 @@ class PresenceTracker:
                           if now - s.last_seen <= GAP_SECONDS)
 
     def close_all(self, reason: str) -> int:
-        """Queue a close for everyone (graceful shutdown), then flush."""
+        """Queue a close for everyone (graceful shutdown), then flush —
+        blocking briefly if another flush is already in flight, so a
+        shutdown doesn't skip its own cycle and lose the closes."""
         _require_reason(reason)
         with self._lock:
             for key, span in list(self._spans.items())[:MAX_TRACKED_USERS]:
                 self._retire_locked(key, span, span.last_seen, reason)
-        return self.flush()
+        return self.flush(blocking=True)
 
     # ── flush: the only place that talks to the store ──────────────────────
 
-    def flush(self) -> int:
-        """Write pending opens/touches/closes in one batch. Returns how many
-        were successfully written (bounded by tracked users).
+    def flush(self, blocking: bool = False, timeout: float = 5.0) -> int:
+        """Write pending opens/touches/closes in one batch. Single-flight:
+        concurrent callers don't race each other into duplicate writes.
 
-        A span that is still live gets an "open" (first time) or "touch".
-        A retired span gets a "close" — or, if it never reached the store
-        at all (opened and closed again before any flush ran), an "open"
-        immediately followed by a "close" referencing that open's new id
-        (``"$prev"``), so nothing about its brief visit is lost.
+        ``blocking=False`` (the default — what a periodic worker should
+        use) skips this cycle and returns 0 immediately if a flush is
+        already running, logging at DEBUG; the next cycle will catch
+        whatever this one would have. ``blocking=True`` (what
+        ``close_all`` uses) waits up to ``timeout`` seconds instead, so a
+        shutdown doesn't drop its own closes.
         """
+        acquired = (self._flush_lock.acquire(timeout=timeout) if blocking
+                   else self._flush_lock.acquire(blocking=False))
+        if not acquired:
+            logger.debug("presence: flush already in progress; skipping this cycle")
+            return 0
+        try:
+            return self._flush_locked()
+        finally:
+            self._flush_lock.release()
+
+    def _flush_locked(self) -> int:
+        """The actual flush body; only ``flush()`` calls this, always
+        holding ``_flush_lock``."""
         with self._lock:
             live = list(self._spans.items())[:MAX_TRACKED_USERS]
             closing = list(self._closing)[:MAX_TRACKED_USERS]
@@ -174,11 +197,16 @@ class PresenceTracker:
         with self._lock:
             for (kind, key, span, snapshot), result in zip(plan, results):
                 if kind == "open":
+                    # N3: the span object is the identity, whether or not
+                    # it's still in self._spans — it may have been retired
+                    # (logged out, gapped, ...) while this call was in
+                    # flight. Assigning the id unconditionally is what lets
+                    # the next flush find and close the right row instead
+                    # of opening a second, orphaning the first forever.
+                    span.span_id = result
                     still_here = self._spans.get(key) is span
-                    if still_here:
-                        span.span_id = result
-                        if span.last_seen <= snapshot:
-                            span.dirty = False
+                    if still_here and span.last_seen <= snapshot:
+                        span.dirty = False
                     written += 1
                 elif kind == "open_then_close":
                     pass   # its paired "close" entry below counts the write
@@ -190,8 +218,10 @@ class PresenceTracker:
                         written += 1
                     elif still_here:
                         # closed behind our back (e.g. a restart sweep) —
-                        # reopen fresh rather than silently losing the user.
+                        # reopen fresh, starting now (not the stale original
+                        # start time), rather than silently losing the user.
                         span.span_id = None
+                        span.started = span.last_seen
                         span.dirty = True
                         logger.info("presence: %s span closed elsewhere; reopening",
                                    span.user)
@@ -207,20 +237,21 @@ class PresenceTracker:
 
     def _midnight_split(self, span: "_Span", now: float) -> Optional[float]:
         """``None`` unless ``now`` has crossed into a new local calendar day
-        since ``span`` started; otherwise the instant to close the old span
-        at (the new span opens at ``now``, via the normal open path)."""
+        since ``span`` started; otherwise local midnight of ``now``'s day —
+        the exact instant the old span closes at and the new one opens at."""
         started_day = datetime.fromtimestamp(span.started).date()
         now_day = datetime.fromtimestamp(now).date()
         if started_day == now_day:
             return None
-        midnight = datetime(now_day.year, now_day.month, now_day.day).timestamp()
-        return span.last_seen if span.last_seen < midnight else midnight
+        return datetime(now_day.year, now_day.month, now_day.day).timestamp()
 
-    def _open_locked(self, key: str, name: str, now: float) -> None:
+    def _open_locked(self, key: str, name: str, now: float, *,
+                     started: Optional[float] = None) -> None:
         if len(self._spans) >= MAX_TRACKED_USERS:
             self._warn_capacity(name)
             return
-        self._spans[key] = _Span(user=name, span_id=None, started=now,
+        self._spans[key] = _Span(user=name, span_id=None,
+                                 started=started if started is not None else now,
                                  last_seen=now, dirty=True)
         logger.info("presence: %s online", name)
 

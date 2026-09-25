@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import date
+import datetime as dt
+import threading
+import time
 
 import pytest
 
@@ -161,13 +163,16 @@ def test_store_down_then_up_flushes_later(tmp_path):
 def test_closed_behind_our_back_reopens(env):
     """If another process (or a restart sweep) closes a span's row directly
     in the store, the next touch's flush must notice the touch was
-    rejected and reopen a fresh span rather than silently losing it."""
+    rejected and reopen a fresh span — starting at the moment we noticed,
+    not inheriting the stale original start time — rather than silently
+    losing it."""
     tr, store, clock = env
     tr.touch("u")
     tr.flush()
     span_id = store.spans_between(0, 1e9)[0]["id"]
     assert store.close_span(span_id, clock.t, "restart")
     clock.t += 5
+    reopen_point = clock.t
     tr.touch("u")               # tracker still thinks the old span is open
     first = tr.flush()          # the touch is rejected; span queued to reopen
     assert first == 0
@@ -177,29 +182,103 @@ def test_closed_behind_our_back_reopens(env):
     assert len(spans) == 2
     assert spans[0]["end_reason"] == "restart"
     assert spans[1]["open"]
+    assert spans[1]["start"] == reopen_point   # not the old span's original start
 
 
-def test_midnight_split(env):
+def test_midnight_split_is_exact_and_not_zero_length(env):
     """A span that survives past local midnight (continuous touches, never
-    gapping) is split into two: one ending at the last touch before
-    midnight, a fresh one starting at the first touch after."""
+    gapping) is split into two exactly at the boundary: the old span ends
+    at midnight (reason "midnight"), the new one starts at midnight — and
+    the first touch after midnight must not be lost, so the new span's
+    last_seen reflects it rather than leaving a zero-length row."""
     tr, store, clock = env
-    before_midnight = date.fromtimestamp(clock.t + 40 * 3600)
-    # advance the clock to just before a local midnight
-    import datetime as dt
-    midnight = dt.datetime.fromtimestamp(clock.t).date()
+    midnight_date = dt.datetime.fromtimestamp(clock.t).date()
     next_midnight_ts = dt.datetime(
-        midnight.year, midnight.month, midnight.day).timestamp() + 86400
-    clock.t = next_midnight_ts - 30       # 30s before midnight
+        midnight_date.year, midnight_date.month, midnight_date.day).timestamp() + 86400
+    clock.t = next_midnight_ts - 30       # 23:59:30
     tr.touch("u")
-    clock.t = next_midnight_ts + 30       # 30s after midnight (60s gap, < GAP_SECONDS)
+    clock.t = next_midnight_ts + 29       # 00:00:29 (59s later, < GAP_SECONDS)
     tr.touch("u")
     tr.flush()
-    spans = store.spans_between(0, 1e9)
+    spans = store.spans_between(0, next_midnight_ts + 100)
     assert len(spans) == 2
-    assert spans[0]["end_reason"] == "gap"
-    assert spans[0]["end"] < next_midnight_ts <= spans[1]["start"]
+    assert spans[0]["end"] == next_midnight_ts and spans[0]["end_reason"] == "midnight"
+    assert spans[1]["start"] == next_midnight_ts
+    assert spans[1]["end"] == next_midnight_ts + 29   # the touch isn't lost
     assert spans[1]["open"]
+
+
+# ── N3: a span's identity survives being retired mid-flush ─────────────────
+
+def test_open_result_applies_even_if_span_retired_during_the_db_call(env):
+    """If the user logs out while an "open" apply_presence call for their
+    span is in flight, the id that call returns must still land on the
+    (now-retired) span object — otherwise the next flush can't find it by
+    id to close it, and instead opens a *second*, duplicate row while the
+    first is left open forever."""
+    tr, store, clock = env
+    real_apply = store.apply_presence
+
+    def wrapper(ops):
+        if any(op["op"] == "open" for op in ops):
+            tr.end("u", "logout")   # concurrent logout while this call is "in flight"
+        return real_apply(ops)
+
+    store.apply_presence = wrapper
+    tr.touch("u")
+    tr.flush()    # the open's result must be applied despite the concurrent end()
+    tr.flush()    # closes using that id rather than opening a second row
+    spans = store.spans_between(0, 1e12)
+    assert len(spans) == 1
+    assert spans[0]["end_reason"] == "logout" and not spans[0]["open"]
+
+
+# ── N4: flush() is single-flight ────────────────────────────────────────────
+
+def test_concurrent_flushes_do_not_duplicate_a_span(env):
+    tr, store, clock = env
+    tr.touch("u")
+    real_apply = store.apply_presence
+
+    def slow_apply(ops):
+        time.sleep(0.05)
+        return real_apply(ops)
+
+    store.apply_presence = slow_apply
+    results = []
+
+    def run():
+        results.append(tr.flush())
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sorted(results) == [0, 1]   # one flushed, the other skipped its cycle
+    assert len(store.spans_between(0, 1e12)) == 1
+
+
+def test_flush_blocking_waits_instead_of_skipping(env):
+    tr, store, clock = env
+    tr.touch("u")
+    real_apply = store.apply_presence
+
+    def slow_apply(ops):
+        time.sleep(0.05)
+        return real_apply(ops)
+
+    store.apply_presence = slow_apply
+    results = []
+
+    def run(blocking):
+        results.append(tr.flush(blocking=blocking, timeout=1.0))
+
+    t1 = threading.Thread(target=run, args=(False,))
+    t1.start()
+    time.sleep(0.01)   # let t1 grab the flush lock first
+    run(True)          # blocks until t1 releases it, then runs for real
+    t1.join()
+    assert sorted(results) == [0, 1]
+    assert len(store.spans_between(0, 1e12)) == 1
 
 
 def test_close_all_queues_and_flushes(env):
@@ -216,7 +295,26 @@ def test_close_all_queues_and_flushes(env):
     assert tr.online() == []
 
 
-def test_flush_cadence_constant_is_unchanged():
-    """FLUSH_SECONDS is the cadence the app's own periodic worker should
-    call flush() at; presence.py no longer flushes on its own."""
-    assert FLUSH_SECONDS == 30.0
+def test_bare_flush_is_non_blocking_and_skips_a_busy_cycle(env):
+    """The default flush() call (what a periodic worker uses) must not
+    block: if a flush is already running, it skips this cycle rather than
+    waiting, so the worker's loop cadence (FLUSH_SECONDS) is never stalled
+    by a slow write."""
+    tr, store, clock = env
+    tr.touch("u")
+    real_apply = store.apply_presence
+
+    def slow_apply(ops):
+        time.sleep(0.1)
+        return real_apply(ops)
+
+    store.apply_presence = slow_apply
+    t0 = time.perf_counter()
+    t1 = threading.Thread(target=tr.flush)
+    t1.start()
+    time.sleep(0.02)   # let t1 acquire the flush lock
+    skipped = tr.flush()   # bare call: must return immediately, not wait ~0.1s
+    elapsed = time.perf_counter() - t0
+    t1.join()
+    assert skipped == 0
+    assert elapsed < 0.09
