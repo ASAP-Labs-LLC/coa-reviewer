@@ -1804,3 +1804,87 @@ Layout (desktop first, works down to 360 px):
 - [ ] Full suite: `.venv/bin/pytest -o addopts="" -q` → all pass (report count).
 - [ ] Smoke boot: `COA_DATA_DIR=$(mktemp -d) PORT=5599 COA_NO_TRAY=1 .venv/bin/python app.py &` then `curl -s localhost:5599/healthz`, `curl -s -o /dev/null -w '%{http_code}' localhost:5599/activity` (200), `curl -s localhost:5599/api/activity` (401); kill it. Check `coa_shared.db` was created in the temp dir.
 - [ ] Commit docs; push `main`; `git tag -a v4.0.0 -m "Shared marks with INFO/TEST tags, per-sample history, Time Online, Restart installs a staged update"`; `git push origin v4.0.0`; confirm `gh run list --workflow=release.yml -L 1` succeeds and `gh release view v4.0.0` lists the zip + sha256.
+
+---
+
+## Revisions after critic review (supersede the task text above where they conflict)
+
+Two critic passes (Tasks 1–3 and Task 4) changed the module APIs. Tasks 5–10
+must use these, not the earlier snippets.
+
+### Store API (shared_store.py, after hardening)
+
+- `apply_mark(lab_id, mode, outcome, *, by, reason="", cc_task_id=None, sample_id=None, tab=None)`
+  with `outcome ∈ {"good","bad","cleared"}` — ONE transaction: reads the previous
+  outcome, upserts the verdict (or a **tombstone** `outcome="cleared"`), inserts
+  the `mark`/`unmark` history row. Returns `{"before": prev_or_None, "verdicts": {mode: v}}`
+  or `None` on failure.
+- `verdicts_for(ids)` returns tombstones too (`outcome == "cleared"`). **Absent key
+  = no shared record → leave the local record alone.** Only an explicit tombstone
+  (or a different shared verdict) changes a session's record. So a store outage
+  never un-judges anyone, and the one-time ledger migration is still useful (to
+  share pre-v4 marks) but no longer load-bearing.
+- `event_marks_between(start, end)` (user, at, kind only) is what `/api/activity` uses.
+- Reads use a bounded reader pool; writes one locked writer; busy/locked never
+  drops the connection.
+
+### Presence API (presence.py, after hardening)
+
+- `touch(user)` is memory-only (call it from `track_activity` and heartbeat).
+- `flush()` writes pending opens/touches/closes in one transaction — call it from
+  `_session_cleanup_worker` every cycle (and it is cheap when nothing is dirty).
+- `end(user, reason)` / `sweep()` queue closes; `close_all("restart")` then
+  `flush()` from `_graceful_shutdown` (before exit) so a clean restart loses nothing.
+
+### Task 5 (restart) — revised
+
+- **Drop the 3 AM hookup entirely.** `_auto_restart_worker` is unchanged. The
+  updater's own `auto_switch` idle policy owns unattended deploys.
+- `request_restart(source, *, by=None)` — `by` is the reviewer's name from
+  `/api/restart` (`ustate.name`), `"tray"` from the tray. Single-flight: a
+  module-level `_restart_lock` + `_restart_pending: Optional[str|bool]`; a
+  second call while one is pending returns the pending tag (or None) and does
+  nothing else.
+- Flow: `tag = restart_update.staged_update(DATA_DIR, APP_VERSION)` (upgrade-only
+  now). If tag: flush logs + `state.presence.close_all("restart"); state.presence.flush()`
+  first (the switch kills us with taskkill /F, skipping `_graceful_shutdown`), then
+  `write_switch_request(...)`. If the write returns False → `clear_switch_files`
+  and normal restart.
+- `_await_switch(tag, pickup=PICKUP_SECONDS, accepted_wait=45.0)`: poll every
+  second (bounded) `read_switch_outcome`:
+  - `refused` → log WARNING with `why`, `clear_switch_files`, normal restart now.
+  - `accepted` → wait up to `accepted_wait` to be killed, then log WARNING,
+    `clear_switch_files`, normal restart.
+  - marker still present after `pickup` → `withdraw_switch_request`; if it
+    returns True → normal restart; if False (updater claimed it in the same
+    instant) → keep polling for the outcome for up to `accepted_wait`.
+- At startup (`AppState.__init__`): `n = restart_update.clear_switch_files(DATA_DIR)`;
+  if n: WARNING "removed N leftover switch file(s) — a new process means the
+  restart already happened".
+- `/api/restart` returns `update: tag|null`. Tests per the Task 4 critic list:
+  second concurrent request is a no-op; write failure falls back with no marker
+  left; startup clears leftovers; refused fast path; accepted-but-not-killed
+  fallback.
+
+### Task 6 (shared verdicts) — revised
+
+- `_share_verdict` calls `state.shared.apply_mark(...)` once (outcome `"cleared"`
+  for uncheck). If it returns None: log WARNING, still broadcast nothing, keep the
+  local verdict (the per-account ledger keeps it) — the mark must never fail.
+  Otherwise fan out using the returned verdict, then broadcast `tags` computed
+  from `result["verdicts"]` merged with a fresh `verdicts_for([lab_id])` only if
+  the other mode is needed (or just call `verdicts_for` once — one indexed read).
+  Broadcast `sample_event` for the lab_id (the history row was written by apply_mark;
+  do NOT call record_event again for marks).
+- `_apply_shared(ustate, rec, verdict)`: `verdict is None` (absent) → no change.
+  `outcome == "cleared"` → un-judge only if the local record is judged. good/bad →
+  apply as before. `_tags_from` ignores tombstones.
+- `get_tab`: as before, but absent keys never un-judge (see above).
+- Migration: insert-only via `set_verdict` when `verdicts_for` shows no row at
+  all for that (lab_id, mode) — a tombstone counts as a row (someone cleared it).
+
+### Task 7 — unchanged except `_sample_event` is used for non-mark kinds only.
+
+### Task 8 — `/api/activity` uses `event_marks_between` and passes
+`online=state.presence.online()`, `is_today=...`, `truncated=` (True when either
+spans or events hit `MAX_RANGE_ROWS`) into `activity.build_day` (see its new kwargs).
