@@ -41,6 +41,9 @@ service_account*.json
 *.sqlite
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.tar.gz
 *.tgz
 *.zip
