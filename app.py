@@ -46,7 +46,8 @@ from qbench_client import QBenchAPIClient, QBenchAPIError
 from labcore_client import LabCoreClient, LabCoreUnavailable
 from change_log import ChangeLog
 from presence import PresenceTracker
-from shared_store import MAX_MARKS_PER_BATCH, SharedStore
+from shared_store import (MAX_EVENTS_PER_BATCH, MAX_MARKS_PER_BATCH, MAX_OBSERVE_FIELDS,
+                          SharedStore, same_value)
 import restart_update
 import tray
 
@@ -862,6 +863,10 @@ class UploadQueue:
         self.results: List[dict] = []
         self._lock = threading.Lock()
         self.sse_broadcast: Optional[Callable[[dict], None]] = None
+        # (lab_id, comments) once QBench confirms a comment write — moves the
+        # history snapshot so the reviewer's own comment never reads as a
+        # change made outside COA Reviewer.
+        self.on_comment_saved: Optional[Callable[[str, str], None]] = None
         self.thread = threading.Thread(target=self._worker_loop, daemon=True)
         if start_worker:
             self.thread.start()
@@ -952,6 +957,11 @@ class UploadQueue:
         try:
             self.api_client.update_sample_comments(int(sample_id), comments)
             logger.info("Saved comments for %s (sample %s)", lab_id or "?", sample_id)
+            if self.on_comment_saved and lab_id:
+                try:
+                    self.on_comment_saved(lab_id, comments)
+                except Exception:
+                    logger.exception("UploadQueue comment-saved hook failed for %s", lab_id)
             self._emit({"type": "comment_saved", "lab_id": lab_id,
                         "sample_id": sample_id, "comments": comments, "uid": payload.get("uid")})
         except (QBenchAPIError, _requests.exceptions.RequestException) as exc:
@@ -3003,6 +3013,9 @@ def fetch_samples_for_tab(tab_name: str, target_date: date, ustate: UserState) -
         # /api/focus for the tab it is looking at, and the window renders
         # from the sample it selects; tabs nobody is looking at stay pending.
         ustate.emit_sse({"type": "tab_loaded", "tab": tab_name, "count": len(samples)})
+        # The bulk payload already carries results: compare them with what
+        # COA Reviewer last saw (no extra API call; after tab_loaded).
+        _observe_tab_tests(sample_test_map, tests)
 
     except Exception as exc:
         ustate.emit_status(f"[{tab_name}] Error: {exc}")
@@ -3941,6 +3954,7 @@ def login():
         state.logged_in = True
         state.upload_queue = UploadQueue(state.api_client)
         state.upload_queue.sse_broadcast = state._queue_sse
+        state.upload_queue.on_comment_saved = _comment_saved
         ustate.emit_status("Logged in successfully.")
         return jsonify({"ok": True})
     except Exception as exc:
@@ -4407,6 +4421,269 @@ def get_sif(lab_id: str):
     )
 
 
+# ── Sample history (spec §3) and changes made outside COA Reviewer (§3b) ────
+#
+# Every route that changes a sample writes a history row with the value it
+# replaced, and moves that field's snapshot in the same transaction. Every
+# read of QBench / LabVision values "observes" them against the snapshot, so a
+# change made directly in QBench or recorded in LabVision shows up in the
+# history as made outside COA Reviewer. All of it is best-effort: a store that
+# is down costs history, never the edit or the read.
+
+#: Keys a QBench test may carry its last change time under (none is
+#: guaranteed; absent → the history shows the window it changed in).
+_QBENCH_CHANGED_AT_KEYS = ("last_updated", "date_updated", "updated_at", "modified_at",
+                           "date_modified")
+#: A LabVision result is recorded once, so when it was created counts too.
+_LABVISION_CHANGED_AT_KEYS = ("updated_at", "created_at", "recorded_at", "at")
+MAX_OBSERVED_LIST_ITEMS = 200
+MAX_TAB_OBSERVE_SAMPLES = 2000
+
+
+def _sample_event(lab_id: str, kind: str) -> None:
+    """Tell every open History tab for ``lab_id`` to refresh. Non-mark kinds
+    only — marks broadcast theirs in ``_broadcast_verdict_change``."""
+    state.broadcast_sse({"type": "sample_event", "lab_id": lab_id, "kind": kind})
+
+
+def _actor(ustate: Optional["UserState"]) -> str:
+    return (getattr(ustate, "name", "") or "").strip() or "unknown"
+
+
+def _observed_value(raw: Any) -> str:
+    """One comparable line of text for a field value. Unlike
+    ``_display_value`` a list keeps its items ("a, b"), so a tag swapped for
+    another is a change rather than "1 item" both times."""
+    if raw is None:
+        return ""
+    if isinstance(raw, dict):
+        return json.dumps(raw, sort_keys=True, default=str)
+    if isinstance(raw, (list, tuple)):
+        return ", ".join(
+            json.dumps(x, sort_keys=True, default=str) if isinstance(x, (dict, list, tuple))
+            else str(x).strip() for x in list(raw)[:MAX_OBSERVED_LIST_ITEMS])
+    return str(raw).strip()
+
+
+def _history_event(kind: str, user: str, *, field: Optional[str] = None,
+                   before: Any = None, after: Any = None, detail: Optional[dict] = None,
+                   snapshot: Any = None) -> dict:
+    """One history row. An edit to the value already there is still recorded
+    (it documents the attempt) with ``detail.unchanged``."""
+    detail = dict(detail or {})
+    if before is not None and after is not None and same_value(before, after):
+        detail["unchanged"] = True
+    return {"kind": kind, "user": user, "field": field, "before": before,
+            "after": after, "detail": detail or None, "snapshot": snapshot}
+
+
+def _record_history(lab_id: Optional[str], events: List[dict]) -> bool:
+    """Write ``events`` for one lab id in one transaction and tell the
+    browsers. Never raises; a failure is a WARNING."""
+    if not lab_id or not events:
+        return False
+    kinds = list(dict.fromkeys(e["kind"] for e in events))
+    try:
+        ok = state.shared.record_events(lab_id, events[:MAX_EVENTS_PER_BATCH])
+    except Exception as exc:
+        logger.warning("history: could not record %s for %s: %s", kinds, lab_id, exc)
+        return False
+    if not ok:
+        logger.warning("history: %s for %s not recorded (store unavailable)", kinds, lab_id)
+        return False
+    for kind in kinds:
+        _sample_event(lab_id, kind)
+    return True
+
+
+def _observe(lab_id: Optional[str], source: str, values: Dict[str, Any], **kw: Any) -> None:
+    """Compare a read's values with what COA Reviewer last saw; broadcast if
+    anything changed outside it. Never raises, never fails the read."""
+    if not lab_id or not values:
+        return
+    try:
+        n = state.shared.observe(lab_id, source, values, **kw)
+    except Exception as exc:
+        logger.warning("observe %s/%s failed: %s", lab_id, source, exc)
+        return
+    if n:
+        _sample_event(lab_id, "external_change")
+
+
+def _changed_at(entry: Any, keys: Tuple[str, ...]) -> Optional[str]:
+    if not isinstance(entry, dict):
+        return None
+    for key in keys:
+        value = entry.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _last_seen(lab_id: str, source: str, field: str) -> Optional[str]:
+    """The value COA Reviewer last saw or wrote, or None (unknown)."""
+    try:
+        snaps = state.shared.snapshots(lab_id, source)
+    except Exception as exc:
+        logger.warning("history: could not read %s/%s snapshot: %s", lab_id, source, exc)
+        return None
+    return (snaps or {}).get(field)
+
+
+def _comment_saved(lab_id: str, comments: str) -> None:
+    """UploadQueue hook: QBench confirmed a comment write."""
+    try:
+        ok = state.shared.update_snapshots(lab_id, "qbench_comments", {"comments": comments})
+    except Exception as exc:
+        logger.warning("history: comment snapshot for %s failed: %s", lab_id, exc)
+        return
+    if not ok:
+        logger.warning("history: comment snapshot for %s not recorded", lab_id)
+
+
+# ── QBench tests: one field name per test, the same everywhere ──
+
+def _qbench_test_rows(raw_tests: List[dict]) -> List[dict]:
+    """QBench tests as the bottom editor shows them."""
+    out = []
+    for t in raw_tests:
+        assay = t.get("assay") or {}
+        assay_data = assay.get("data") or {}
+        test_name = (
+            assay_data.get("title")
+            or assay.get("custom_formatted_id")
+            or assay.get("name")
+            or f"Assay {t.get('assay_id', '?')}"
+        )
+        out.append({
+            "test_id": t.get("id"),
+            "test_name": str(test_name).strip(),
+            "results": t.get("results") or "",
+            "sample_id": t.get("sample_id"),
+        })
+    return out
+
+
+def _test_fields(tests: List[dict]) -> Dict[Any, str]:
+    """``{test_id: history field}`` — the test's name, or "name (test id)"
+    when one sample carries two tests of the same name."""
+    rows = list(tests or [])[:MAX_OBSERVE_FIELDS]
+    names = [str(t.get("test_name") or t.get("assay") or f"Test {t.get('test_id')}").strip()
+             for t in rows]
+    counts: Dict[str, int] = defaultdict(int)
+    for n in names:
+        counts[n] += 1
+    return {t.get("test_id"): (n if counts[n] == 1 else f"{n} (test {t.get('test_id')})")
+            for t, n in zip(rows, names)}
+
+
+def _observe_qbench_tests(lab_id: str, tests: List[dict],
+                          raw_tests: Optional[List[dict]] = None) -> None:
+    try:
+        fields = _test_fields(tests)
+        values = {fields[t.get("test_id")]: t.get("results")
+                  for t in tests[:MAX_OBSERVE_FIELDS]}
+        meta = {}
+        for t, raw in zip(tests[:MAX_OBSERVE_FIELDS], raw_tests or []):
+            when = _changed_at(raw, _QBENCH_CHANGED_AT_KEYS)
+            if when:
+                meta[fields[t.get("test_id")]] = {"changed_at": when}
+    except Exception as exc:   # a malformed payload costs the observation only
+        logger.warning("observe %s tests: could not read the payload: %s", lab_id, exc)
+        return
+    _observe(lab_id, "qbench_test", values, field_meta=meta or None)
+
+
+def _observe_tab_tests(sample_test_map: Dict[int, Dict[str, Any]], tests: List[dict]) -> None:
+    """Observe test results the bulk tab pull already fetched — no extra
+    API call. Best-effort; runs after ``tab_loaded`` so it never delays it."""
+    started = time.perf_counter()
+    by_sid: Dict[int, List[dict]] = defaultdict(list)
+    try:
+        for t in tests:
+            sid = t.get("sample_id") or (t.get("sample") or {}).get("id")
+            if sid and int(sid) in sample_test_map:
+                by_sid[int(sid)].append(t)
+        for sid in list(by_sid)[:MAX_TAB_OBSERVE_SAMPLES]:
+            raw = by_sid[sid]
+            _observe_qbench_tests(sample_test_map[sid].get("lab_id") or "",
+                                  _qbench_test_rows(raw), raw)
+    except Exception as exc:
+        logger.warning("observing tab tests failed: %s", exc)
+        return
+    logger.debug("observed tests for %d sample(s) in %.1f ms", len(by_sid),
+                 (time.perf_counter() - started) * 1000)
+
+
+# ── Sample Info: read before an edit, snapshot what was written ──
+
+def _flatten_sample(sample: Any) -> Dict[str, Any]:
+    """QBench's sample with ``custom_fields`` lifted onto the top level
+    (a top-level key wins), as the Sample Info GET renders it."""
+    if not isinstance(sample, dict):
+        return {}
+    custom = sample.get("custom_fields")
+    if isinstance(custom, dict):
+        for k, v in custom.items():
+            sample.setdefault(k, v)
+    return sample
+
+
+def _info_values(flat: Dict[str, Any]) -> Dict[str, str]:
+    return {f: _observed_value(flat.get(f)) for f in INFO_OBSERVED_FIELDS}
+
+
+def _sample_before(lab_id: str, sid: int, fields: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Each field's value before an edit, from the same ``fetch_sample`` the
+    GET uses; observes the read too, so anything changed in QBench since we
+    last looked is recorded before our edit overwrites it. A failed read
+    gives ``None`` ("unknown") for every field and never blocks the edit."""
+    try:
+        flat = _flatten_sample(state.api_client.fetch_sample(sid))
+    except Exception as exc:
+        logger.warning("history: could not read %s before edit: %s", lab_id, exc)
+        return {f: None for f in fields}
+    _observe(lab_id, "qbench_info", _info_values(flat))
+    return {f: _observed_value(flat.get(f)) for f in fields}
+
+
+def _info_snapshot(field: str, value: Any) -> Optional[tuple]:
+    if field == "comments":
+        return ("qbench_comments", "comments", _observed_value(value))
+    if field in INFO_OBSERVED_FIELDS:
+        return ("qbench_info", field, _observed_value(value))
+    return None
+
+
+def _record_sample_fields(lab_id: str, kind: str, user: str, fields: Dict[str, Any],
+                          before: Dict[str, Optional[str]],
+                          detail: Optional[dict] = None) -> None:
+    _record_history(lab_id, [
+        _history_event(kind, user, field=f, before=before.get(f),
+                       after=_observed_value(v), detail=detail,
+                       snapshot=_info_snapshot(f, v))
+        for f, v in list(fields.items())[:MAX_EVENTS_PER_BATCH]])
+
+
+def _observe_labvision_tests(lab_id: str, raw: Any) -> None:
+    """LabVision results, each attributed to its operator when LabVision
+    names one, with LabVision's own time when it gives one."""
+    if not isinstance(raw, list):
+        return
+    values: Dict[str, str] = {}
+    meta: Dict[str, dict] = {}
+    for entry in raw[:MAX_OBSERVE_FIELDS]:
+        if not isinstance(entry, dict):
+            continue
+        name = _display_value(entry.get("test"))
+        if not name:
+            continue
+        values[name] = _display_value(entry.get("result"))
+        meta[name] = {"actor": _display_value(entry.get("operator")) or None,
+                      "changed_at": _changed_at(entry, _LABVISION_CHANGED_AT_KEYS)}
+    _observe(lab_id, "labvision_test", values, field_meta=meta)
+
+
 # ── Tests (for the bottom editor) ───────────────────────────────────────────
 
 @app.route("/api/tests/<lab_id>")
@@ -4427,26 +4704,13 @@ def get_tests(lab_id: str):
 
     try:
         raw_tests = state.api_client.fetch_tests_for_sample_ids([rec.sample_id])
-        tests_out = []
-        for t in raw_tests:
-            assay = t.get("assay") or {}
-            assay_data = assay.get("data") or {}
-            test_name = (
-                assay_data.get("title")
-                or assay.get("custom_formatted_id")
-                or assay.get("name")
-                or f"Assay {t.get('assay_id', '?')}"
-            )
-            tests_out.append({
-                "test_id": t.get("id"),
-                "test_name": str(test_name).strip(),
-                "results": t.get("results") or "",
-                "sample_id": t.get("sample_id"),
-            })
+        tests_out = _qbench_test_rows(raw_tests)
         rec.tests_data = tests_out
-        return jsonify({"tests": tests_out})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+    # A fresh read only: the cached copy is our own view, not QBench's.
+    _observe_qbench_tests(lab_id, tests_out, raw_tests)
+    return jsonify({"tests": tests_out})
 
 
 @app.route("/api/tests/<int:test_id>", methods=["PATCH"])
@@ -4466,6 +4730,7 @@ def update_test(test_id: int):
     old_value = None
     edited_lab_id = None
     assay = None
+    history_field = None
     for rec in ustate.records.values():
         if rec.tests_data:
             for t in rec.tests_data:
@@ -4473,6 +4738,7 @@ def update_test(test_id: int):
                     old_value = t.get("results")
                     edited_lab_id = rec.lab_id
                     assay = t.get("assay") or t.get("test_name")
+                    history_field = _test_fields(rec.tests_data).get(test_id)
                     t["results"] = str(value)
                     break
 
@@ -4481,6 +4747,11 @@ def update_test(test_id: int):
         user=ustate.name, test_id=test_id, lab_id=edited_lab_id, assay=assay,
         old_value=old_value, new_value=str(value), ip=request.remote_addr,
     )
+    if edited_lab_id and history_field:
+        _record_history(edited_lab_id, [_history_event(
+            "test_result", _actor(ustate), field=history_field, before=old_value,
+            after=str(value), detail={"test_id": test_id},
+            snapshot=("qbench_test", history_field, str(value)))])
 
     return jsonify({"ok": True, "test_id": test_id, "value": value})
 
@@ -4560,6 +4831,9 @@ def delete_attachment(attachment_id: int):
             user=ustate.name, attachment_id=attachment_id,
             filename=filename, lab_id=owner_lab_id, ip=request.remote_addr,
         )
+        _record_history(owner_lab_id, [_history_event(
+            "attachment_deleted", _actor(ustate), field=filename or f"attachment {attachment_id}",
+            before=filename, detail={"attachment_id": attachment_id})])
         return jsonify({"ok": True})
     return jsonify({"error": "Failed to delete"}), 500
 
@@ -4590,9 +4864,10 @@ def get_comments(lab_id: str):
             text = "\n\n".join(texts)
         else:
             text = str(raw).strip()
-        return jsonify({"comments": text})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+    _observe(lab_id, "qbench_comments", {"comments": text})
+    return jsonify({"comments": text})
 
 
 @app.route("/api/comments/<lab_id>", methods=["PATCH"])
@@ -4624,6 +4899,12 @@ def update_comments(lab_id: str):
         user=ustate.name, lab_id=lab_id, sample_id=rec.sample_id,
         new_value=new_comments, ip=request.remote_addr,
     )
+    # Before = what COA Reviewer last saw or wrote (one local read, no QBench
+    # call). The snapshot itself moves only when the queue confirms the write.
+    _record_history(lab_id, [_history_event(
+        "comments", _actor(ustate), field="comments",
+        before=_last_seen(lab_id, "qbench_comments", "comments"),
+        after=str(new_comments), detail={"queued": True})])
     return jsonify({"ok": True, "queued": True})
 
 
@@ -4644,6 +4925,10 @@ SAMPLE_EDITABLE_FIELDS = frozenset({
     # PATCH rejects it (2026-07-10). It stays in TOP_LEVEL_SAMPLE_FIELDS
     # below so a future re-enable nests it correctly.
 })
+
+#: Sample Info fields compared on every read. Comments have their own source
+#: (qbench_comments); attachments are files, recorded when deleted here.
+INFO_OBSERVED_FIELDS = tuple(sorted(SAMPLE_EDITABLE_FIELDS - {"comments", "attachments"}))
 
 # QBench's PATCH /samples endpoint expects standard sample fields at the
 # top level of each row, but anything custom must be nested under
@@ -4943,6 +5228,7 @@ def sample_info(lab_id: str):
             "PATCH /samples for lab_id=%s sid=%s payload=%s",
             lab_id, sid, payload,
         )
+        before = _sample_before(lab_id, sid, fields)
         try:
             qbench_response = state.api_client.update_sample(sid, payload)
         except Exception as exc:
@@ -4955,6 +5241,7 @@ def sample_info(lab_id: str):
             lab_id=lab_id, sample_id=sid, fields=fields,
             ip=request.remote_addr,
         )
+        _record_sample_fields(lab_id, "sample_info", _actor(ustate), fields, before)
         return jsonify({
             "ok": True,
             "updated": list(fields.keys()),
@@ -4971,10 +5258,8 @@ def sample_info(lab_id: str):
     except Exception as exc:
         logger.exception("fetch_sample failed for %s", lab_id)
         return jsonify({"error": str(exc)}), 500
-    custom = sample.get("custom_fields") if isinstance(sample, dict) else None
-    if isinstance(custom, dict):
-        for k, v in custom.items():
-            sample.setdefault(k, v)
+    if isinstance(sample, dict):
+        _observe(lab_id, "qbench_info", _info_values(_flatten_sample(sample)))
     panels = _normalize_panels(
         sample.get("panels") or sample.get("panel_ids") or sample.get("panel_names")
     )
@@ -5165,6 +5450,15 @@ def cc_lookup(lab_id: str):
     })
 
 
+def _record_listing_created(ustate: "UserState", params: dict, task_id: Any) -> None:
+    lab_ids = [str(s.get("lab_id")).strip() for s in params["sample_ids"]
+               if isinstance(s, dict) and s.get("lab_id")]
+    for lab_id in list(dict.fromkeys(lab_ids))[:MAX_EVENTS_PER_BATCH]:
+        _record_history(lab_id, [_history_event(
+            "listing_created", _actor(ustate), after=params["initial_problem"],
+            detail={"task_id": task_id, "type": params["type"]})])
+
+
 @app.route("/api/cc/tasks", methods=["POST"])
 @require_portal
 def cc_create_task():
@@ -5213,6 +5507,7 @@ def cc_create_task():
             forced=bool(params.get("force_create")),
             ip=request.remote_addr,
         )
+        _record_listing_created(ustate, params, result.get("task_id"))
     return jsonify(result)
 
 
@@ -5220,7 +5515,9 @@ def cc_create_task():
 @require_portal
 def cc_complete_task(task_id: int):
     ustate = get_user_state()
-    notes = str((request.json or {}).get("notes", "")).strip()
+    body = request.json or {}
+    notes = str(body.get("notes", "")).strip()
+    lab_id = str(body.get("lab_id") or "").strip()
     if not notes:
         return jsonify({"error": "Completion notes are required."}), 400
     try:
@@ -5236,6 +5533,9 @@ def cc_complete_task(task_id: int):
             user=ustate.name, task_id=task_id, notes=notes,
             ip=request.remote_addr,
         )
+        _record_history(lab_id, [_history_event(
+            "listing_completed", _actor(ustate), after=notes,
+            detail={"task_id": task_id})])
     return jsonify(result)
 
 
@@ -5281,6 +5581,11 @@ def sync_preview(lab_id: str):
                 qbench_read = True
         except Exception as exc:
             logger.warning("sync-preview: could not read QBench sample %s: %s", sid, exc)
+    if qbench_read:
+        # Observed with the Sample Info GET's flattening (a top-level key
+        # wins), so the two reads can never disagree about one field.
+        _observe(lab_id, "qbench_info", _info_values(_flatten_sample(dict(sample))))
+    _observe_labvision_tests(lab_id, source.get("tests"))
 
     # Re-run / add-on flags and the results behind them live outside the
     # sample record in LabCore. Best-effort: a hiccup here costs the flags,
@@ -5367,6 +5672,7 @@ def sync_sample_info(lab_id: str):
     if custom_fields:
         payload["custom_fields"] = custom_fields
 
+    before = _sample_before(lab_id, sid, fields)
     try:
         qbench_response = state.api_client.update_sample(sid, payload)
     except Exception as exc:
@@ -5378,6 +5684,8 @@ def sync_sample_info(lab_id: str):
         user=ustate.name, lab_id=lab_id, sample_id=sid,
         fields=fields, source="LabVision", ip=request.remote_addr,
     )
+    _record_sample_fields(lab_id, "sample_sync", _actor(ustate), fields, before,
+                          detail={"source": "LabVision"})
 
     # Sample info feeds the COA, so the rendered preview is stale the moment
     # this lands. Re-render the one sample that changed.
@@ -5781,6 +6089,7 @@ def auto_login_from_saved_creds() -> None:
         state.logged_in = True
         state.upload_queue = UploadQueue(state.api_client)
         state.upload_queue.sse_broadcast = state._queue_sse
+        state.upload_queue.on_comment_saved = _comment_saved
         _status("QBench login successful!")
         state.broadcast_sse({"type": "auto_login_done", "ok": True})
     except Exception as exc:

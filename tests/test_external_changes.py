@@ -245,3 +245,209 @@ def test_external_change_is_a_known_kind():
     assert "external_change" in shared_store.EVENT_KINDS
     assert shared_store.SOURCES == ("qbench_test", "qbench_info", "qbench_comments",
                                     "labvision_test")
+
+
+# ══ route level: reads observe, own edits don't resurface ═════════════════
+
+LAB = "073126-41552"
+
+
+@pytest.fixture
+def routes(monkeypatch, tmp_path):
+    """(client, ustate, api, labcore, sse) with QBench and LabCore mocked."""
+    from unittest.mock import MagicMock
+    pytest.importorskip("flask")
+    import app as app_module
+    from app import SampleRecord, UserState
+    from change_log import ChangeLog
+
+    monkeypatch.setattr(app_module.state, "change_log", ChangeLog(tmp_path / "cl"))
+    monkeypatch.setattr(app_module.state, "upload_queue", MagicMock())
+    monkeypatch.setattr(app_module.state, "logged_in", True)
+    api = MagicMock()
+    api.fetch_tests_for_sample_ids.return_value = [
+        {"id": 9, "sample_id": 5, "results": "1.23", "assay": {"name": "Water"}}]
+    api.fetch_sample.return_value = {"id": 5, "lab_id": LAB, "fw": "FW-1",
+                                     "comments": "first", "custom_fields": {"tank": "T1"}}
+    api.update_sample.return_value = {"data": [{"id": 5}]}
+    monkeypatch.setattr(app_module.state, "api_client", api)
+    lc = MagicMock()
+    lc.sample_data.return_value = {"lab_id": LAB, "tests": [
+        {"test": "Water", "result": "", "operator": ""}]}
+    lc.reruns.return_value = []
+    monkeypatch.setattr(app_module.state, "labcore", lc)
+    sse = []
+    monkeypatch.setattr(app_module.state, "broadcast_sse", lambda d: sse.append(d))
+
+    uid = "test-uid-external"
+    ustate = UserState(uid, "Dana P")
+    ustate.add_record(SampleRecord(lab_id=LAB, tab="Yesterday", sample_id=5, test_ids=[9]))
+    with app_module._sessions_lock:
+        app_module.user_sessions[uid] = ustate
+    app_module.app.config["TESTING"] = True
+    client = app_module.app.test_client()
+    with client.session_transaction() as sess:
+        sess["uid"] = uid
+    yield client, ustate, api, lc, sse
+    with app_module._sessions_lock:
+        app_module.user_sessions.pop(uid, None)
+
+
+def _app_external(lab_id=LAB):
+    import app as app_module
+    return [e for e in app_module.state.shared.history(lab_id)
+            if e["kind"] == "external_change"]
+
+
+def _drop_test_cache(ustate):
+    ustate.records[("Yesterday", LAB)].tests_data = None
+
+
+def test_a_test_result_changed_in_qbench_between_reads_is_recorded_once(routes):
+    client, ustate, api, _, sse = routes
+    client.get(f"/api/tests/{LAB}")
+    assert _app_external() == []
+    api.fetch_tests_for_sample_ids.return_value[0]["results"] = "1.50"
+    _drop_test_cache(ustate)
+    assert client.get(f"/api/tests/{LAB}").status_code == 200
+    _drop_test_cache(ustate)
+    client.get(f"/api/tests/{LAB}")
+    [e] = _app_external()
+    assert (e["field"], e["before"], e["after"]) == ("Water", "1.23", "1.50")
+    assert e["user"] == "Outside COA Reviewer" and e["detail"]["source"] == "qbench_test"
+    assert any(x.get("type") == "sample_event" and x.get("kind") == "external_change"
+               for x in sse)
+
+
+def test_qbench_gives_its_own_change_time_when_it_has_one(routes):
+    client, ustate, api, _, _ = routes
+    client.get(f"/api/tests/{LAB}")
+    api.fetch_tests_for_sample_ids.return_value[0].update(
+        {"results": "2", "last_updated": "2026-09-25T09:12:00"})
+    _drop_test_cache(ustate)
+    client.get(f"/api/tests/{LAB}")
+    [e] = _app_external()
+    assert e["detail"]["changed_at"] == "2026-09-25T09:12:00"
+
+
+def test_own_test_edit_then_read_is_not_external(routes):
+    client, ustate, api, _, _ = routes
+    client.get(f"/api/tests/{LAB}")
+    client.patch("/api/tests/9", json={"value": "4.56"})
+    api.fetch_tests_for_sample_ids.return_value[0]["results"] = "4.56"
+    _drop_test_cache(ustate)
+    client.get(f"/api/tests/{LAB}")
+    assert _app_external() == []
+
+
+def test_sample_info_changed_in_qbench_is_recorded(routes):
+    client, _, api, _, _ = routes
+    client.get(f"/api/sample-info/{LAB}")
+    api.fetch_sample.return_value = {"id": 5, "lab_id": LAB, "fw": "FW-2",
+                                     "custom_fields": {"tank": "T1"}}
+    client.get(f"/api/sample-info/{LAB}")
+    [e] = _app_external()
+    assert (e["field"], e["before"], e["after"]) == ("fw", "FW-1", "FW-2")
+    assert e["detail"]["source"] == "qbench_info"
+
+
+def test_own_sample_info_edit_then_read_is_not_external(routes):
+    client, _, api, _, _ = routes
+    client.get(f"/api/sample-info/{LAB}")
+    client.patch(f"/api/sample-info/{LAB}", json={"fw": "FW-9", "tank": "T7"})
+    api.fetch_sample.return_value = {"id": 5, "lab_id": LAB, "fw": "FW-9",
+                                     "comments": "first", "custom_fields": {"tank": "T7"}}
+    client.get(f"/api/sample-info/{LAB}")
+    assert _app_external() == []
+
+
+def test_a_change_before_our_edit_is_caught_by_the_before_read(routes):
+    """QBench changed fw behind our back, then the reviewer edited tank:
+    the pre-edit read records the outside change first."""
+    client, _, api, _, _ = routes
+    client.get(f"/api/sample-info/{LAB}")
+    api.fetch_sample.return_value = {"id": 5, "lab_id": LAB, "fw": "FW-OUT",
+                                     "custom_fields": {"tank": "T1"}}
+    client.patch(f"/api/sample-info/{LAB}", json={"tank": "T7"})
+    [e] = _app_external()
+    assert e["field"] == "fw" and e["after"] == "FW-OUT"
+
+
+def test_comments_changed_in_qbench_are_recorded(routes):
+    client, _, api, _, _ = routes
+    client.get(f"/api/comments/{LAB}")
+    api.fetch_sample.return_value = {"id": 5, "comments": "edited in QBench"}
+    client.get(f"/api/comments/{LAB}")
+    [e] = _app_external()
+    assert (e["before"], e["after"]) == ("first", "edited in QBench")
+
+
+def test_own_comment_confirmed_then_read_is_not_external(routes):
+    import app as app_module
+    client, _, api, _, _ = routes
+    client.get(f"/api/comments/{LAB}")
+    client.patch(f"/api/comments/{LAB}", json={"comments": "mine"})
+    app_module._comment_saved(LAB, "mine")        # the queue confirmed it
+    api.fetch_sample.return_value = {"id": 5, "comments": "mine"}
+    client.get(f"/api/comments/{LAB}")
+    assert _app_external() == []
+
+
+def test_a_labvision_result_is_attributed_to_its_operator(routes):
+    client, _, _, lc, _ = routes
+    client.get(f"/api/sync-preview/{LAB}")
+    lc.sample_data.return_value = {"lab_id": LAB, "tests": [
+        {"test": "Water", "result": "0.02", "operator": "kejuan",
+         "updated_at": "2026-09-25 10:01:00"}]}
+    assert client.get(f"/api/sync-preview/{LAB}").status_code == 200
+    [e] = [x for x in _app_external() if x["detail"]["source"] == "labvision_test"]
+    assert e["user"] == "kejuan"
+    assert (e["before"], e["after"]) == ("", "0.02")
+    assert e["detail"]["changed_at"] == "2026-09-25 10:01:00"
+
+
+def test_sync_preview_observes_the_qbench_fields_it_reads(routes):
+    client, _, api, _, _ = routes
+    client.get(f"/api/sync-preview/{LAB}")
+    api.fetch_sample.return_value = {"id": 5, "lab_id": LAB, "fw": "FW-3",
+                                     "comments": "first", "custom_fields": {"tank": "T1"}}
+    client.get(f"/api/sync-preview/{LAB}")
+    [e] = _app_external()
+    assert e["field"] == "fw" and e["detail"]["source"] == "qbench_info"
+
+
+def test_reads_still_work_with_the_store_down(routes, monkeypatch, tmp_path):
+    import app as app_module
+    client, *_ = routes
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    monkeypatch.setattr(app_module.state, "shared", SharedStore(blocker / "sub" / "db"))
+    assert client.get(f"/api/tests/{LAB}").status_code == 200
+    assert client.get(f"/api/sample-info/{LAB}").status_code == 200
+    assert client.get(f"/api/comments/{LAB}").status_code == 200
+    assert client.get(f"/api/sync-preview/{LAB}").status_code == 200
+
+
+def test_reads_still_work_when_observe_raises(routes, monkeypatch):
+    import app as app_module
+    client, *_ = routes
+
+    def boom(*a, **k):
+        raise RuntimeError("bug")
+    monkeypatch.setattr(app_module.state.shared, "observe", boom)
+    assert client.get(f"/api/tests/{LAB}").status_code == 200
+    assert client.get(f"/api/comments/{LAB}").status_code == 200
+
+
+def test_a_tab_pull_observes_the_results_it_already_fetched(routes):
+    import app as app_module
+    from datetime import date
+    _, ustate, api, _, _ = routes
+    api.fetch_samples_by_lab_id_prefix.return_value = [{"id": 5, "lab_id": LAB}]
+    app_module.fetch_samples_for_tab("Yesterday", date(2026, 7, 31), ustate)
+    assert app_module.state.shared.snapshots(LAB, "qbench_test") == {"Water": "1.23"}
+    api.fetch_tests_for_sample_ids.return_value[0]["results"] = "9"
+    app_module.fetch_samples_for_tab("Yesterday", date(2026, 7, 31), ustate)
+    [e] = _app_external()
+    assert e["after"] == "9"
+    assert api.fetch_tests_for_sample_ids.call_count == 2   # no extra API call

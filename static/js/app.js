@@ -2849,7 +2849,8 @@ async function handleResolveComplete() {
             const resp = await fetch(`/api/cc/tasks/${task.id}/complete`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ notes }),
+                // lab_id puts the completion in that sample's History.
+                body: JSON.stringify({ notes, lab_id: pending.sample && pending.sample.lab_id }),
             });
             if (resp.status === 401) { triggerTimeout(); return; }
             const data = await resp.json();
