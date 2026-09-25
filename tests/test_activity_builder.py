@@ -1,6 +1,11 @@
+import os
+import sys
+import time as time_mod
 from datetime import date, datetime
 
-from activity import BIN_SECONDS, build_day, day_window
+import pytest
+
+from activity import BIN_SECONDS, MAX_SPANS_PER_USER, MAX_USERS, build_day, day_window
 
 
 def ts(h, m=0):
@@ -64,8 +69,84 @@ def test_blocks_split_on_gap():
     assert len(build_day(D, [], ev, now=ts(20))["users"][0]["blocks"]) == 2
 
 
-def test_summary():
+# ── online_now: authoritative live list, gated by is_today ────────────────
+
+def test_summary_online_now_comes_from_the_online_list_when_today():
     spans = [{"user": "a", "start": ts(8), "end": ts(9), "open": True}]
-    out = build_day(D, spans, [{"user": "a", "at": ts(8, 30), "kind": "mark"}], now=ts(9))
+    out = build_day(D, spans, [{"user": "a", "at": ts(8, 30), "kind": "mark"}],
+                    now=ts(9), online=["A"], is_today=True)
     assert out["summary"] == {"people": 1, "online_now": 1, "online_seconds": 3600,
                               "changes": 1}
+
+
+def test_online_now_ignores_open_spans_on_a_past_day():
+    """A span left "open" on a day that isn't today (e.g. the process died
+    mid-span and it was force-closed later) must not count as "online now"
+    just because the row says open — that was the old, buggy heuristic."""
+    spans = [{"user": "a", "start": ts(8), "end": ts(9), "open": True}]
+    out = build_day(D, spans, [], now=ts(9), online=["a"], is_today=False)
+    assert out["summary"]["online_now"] == 0
+
+
+def test_online_now_requires_presence_in_the_online_list():
+    spans = [{"user": "a", "start": ts(8), "end": ts(9), "open": True}]
+    out = build_day(D, spans, [], now=ts(9), online=["someone else"], is_today=True)
+    assert out["summary"]["online_now"] == 0
+
+
+def test_online_now_default_is_zero():
+    out = build_day(D, [], [], now=ts(9))
+    assert out["summary"]["online_now"] == 0
+
+
+# ── truncation flags ────────────────────────────────────────────────────
+
+def test_truncated_flag_defaults_false():
+    assert build_day(D, [], [], now=ts(9))["truncated"] is False
+
+
+def test_truncated_when_users_exceed_max_users():
+    spans = [{"user": f"u{i}", "start": ts(8), "end": ts(9), "open": False}
+             for i in range(MAX_USERS + 5)]
+    out = build_day(D, spans, [], now=ts(9))
+    assert out["truncated"] is True
+    assert len(out["users"]) == MAX_USERS
+
+
+def test_truncated_when_one_users_spans_exceed_max_spans():
+    spans = [{"user": "u", "start": ts(0) + i, "end": ts(0) + i + 0.5, "open": False}
+             for i in range(MAX_SPANS_PER_USER + 5)]
+    out = build_day(D, spans, [], now=ts(20))
+    assert out["truncated"] is True
+
+
+def test_truncated_kwarg_ors_in_from_caller():
+    out = build_day(D, [], [], now=ts(9), truncated=True)
+    assert out["truncated"] is True
+
+
+# ── DST: bounds must use wall-clock hour, not elapsed seconds ─────────────
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="time.tzset is POSIX-only")
+def test_dst_fall_back_day_bounds_use_wall_clock_hour():
+    """America/Los_Angeles, 2026-11-01 is a 25-hour fall-back day. A point
+    25.5 elapsed hours into the day is wall-clock ~01:30, not hour 25 —
+    bounds computed from elapsed seconds would blow past 24."""
+    old_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "America/Los_Angeles"
+    time_mod.tzset()
+    try:
+        day = date(2026, 11, 1)
+        lo, hi = day_window(day)
+        assert hi - lo == 25 * 3600   # confirms this really is the fall-back day
+        late_point = lo + 25.5 * 3600
+        spans = [{"user": "u", "start": lo + 3600, "end": late_point, "open": False}]
+        out = build_day(day, spans, [], now=hi)
+        assert out["bounds"]["end_hour"] <= 24
+        assert out["bounds"]["start_hour"] >= 0
+    finally:
+        if old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old_tz
+        time_mod.tzset()

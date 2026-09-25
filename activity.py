@@ -1,15 +1,25 @@
 """Build the Time Online day payload from presence spans and sample events.
 
-Pure: no I/O, no clock, so every rule is a unit test. Times are epoch seconds
-in, epoch seconds out; the browser formats them in the viewer's local zone.
-Days are the server's local calendar day, which is the lab's.
+Pure: no I/O, no clock of its own — every rule is a unit test. Times are
+epoch seconds in, epoch seconds out; the browser formats them in the
+viewer's local zone. Days are the server's local calendar day, which is the
+lab's.
+
+``online`` and ``is_today`` exist because "is this person online *right
+now*" is not something a day's spans can answer on their own: a span left
+``open`` on a past day (the process died mid-span and got force-closed
+later) is not evidence anyone is online *now* — only the live presence list
+is, and only for today's page. Hour bounds are computed from each point's
+actual wall-clock hour (``datetime.fromtimestamp(...).hour``), not from
+elapsed seconds since local midnight, because a DST fall-back day is 25
+real hours long and elapsed-seconds math would push the end hour past 24.
 """
 
 from __future__ import annotations
 
-import math
+import bisect
 from datetime import date, datetime, timedelta
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 BIN_SECONDS = 300          # editing blocks are built from 5-minute bins
 DEFAULT_START_HOUR = 6
@@ -23,23 +33,28 @@ def day_window(day: date) -> Tuple[float, float]:
     return start.timestamp(), (start + timedelta(days=1)).timestamp()
 
 
-def _merge(spans: List[dict]) -> List[dict]:
+def _merge(spans: List[dict]) -> Tuple[List[dict], bool]:
+    """Merge overlapping spans (already-bounded input, capped further
+    here). Returns ``(merged, truncated)``."""
+    ordered = sorted(spans, key=lambda x: x["start"])
+    truncated = len(ordered) > MAX_SPANS_PER_USER
     merged: List[dict] = []
-    for s in sorted(spans, key=lambda x: x["start"])[:MAX_SPANS_PER_USER]:
+    for s in ordered[:MAX_SPANS_PER_USER]:
         if merged and s["start"] <= merged[-1]["end"]:
             last = merged[-1]
             last["end"] = max(last["end"], s["end"])
             last["open"] = last["open"] or s["open"]
         else:
             merged.append(dict(s))
-    return merged
+    return merged, truncated
 
 
 def _blocks(times: List[float]) -> List[dict]:
     """Group change times into editing blocks; a block continues while each
-    change lands within one empty bin of the previous one."""
+    change lands within one empty bin of the previous one. ``times`` must
+    already be sorted."""
     blocks: List[dict] = []
-    for t in sorted(times):
+    for t in times:
         if blocks and t - blocks[-1]["end"] <= 2 * BIN_SECONDS:
             blocks[-1]["end"] = t
             blocks[-1]["count"] += 1
@@ -50,25 +65,38 @@ def _blocks(times: List[float]) -> List[dict]:
     return blocks
 
 
-def _bounds(points: Iterable[float], lo: float) -> Dict[str, int]:
+def _bounds(points: Iterable[float]) -> Dict[str, int]:
+    """Hour bounds from each point's actual local wall-clock time, so a DST
+    transition day (23 or 25 real hours) never produces an ``end_hour``
+    outside 0..24."""
     start_h, end_h = DEFAULT_START_HOUR, DEFAULT_END_HOUR
     for p in points:
-        hour = (p - lo) / 3600
-        start_h = min(start_h, int(math.floor(hour)))
-        end_h = max(end_h, int(math.ceil(hour)))
+        dt = datetime.fromtimestamp(p)
+        hour = dt.hour + dt.minute / 60
+        floor_h = int(hour)                                  # floor: always <= hour
+        ceil_h = floor_h if hour == floor_h else floor_h + 1  # ceil
+        start_h = min(start_h, floor_h)
+        end_h = max(end_h, ceil_h)
     return {"start_hour": max(0, start_h), "end_hour": min(24, end_h)}
 
 
-def build_day(day: date, spans: List[dict], events: List[dict], *, now: float) -> dict:
+def build_day(day: date, spans: List[dict], events: List[dict], *, now: float,
+             online: Sequence[str] = (), is_today: bool = False,
+             truncated: bool = False) -> dict:
     lo, hi = day_window(day)
     ceiling = min(hi, now)
     per_user: Dict[str, dict] = {}
+    was_truncated = bool(truncated)
 
     def slot(name: str) -> dict:
+        nonlocal was_truncated
         key = name.strip().casefold()
-        if key not in per_user and len(per_user) < MAX_USERS:
+        if key not in per_user:
+            if len(per_user) >= MAX_USERS:
+                was_truncated = True
+                return {"spans": [], "events": []}   # dropped; not tracked
             per_user[key] = {"user": name.strip(), "spans": [], "events": []}
-        return per_user.get(key, {"spans": [], "events": []})
+        return per_user[key]
 
     for s in spans:
         start, end = max(s["start"], lo), min(s["end"], ceiling)
@@ -79,15 +107,20 @@ def build_day(day: date, spans: List[dict], events: List[dict], *, now: float) -
         if lo <= e["at"] < hi:
             slot(e["user"])["events"].append(e)
 
+    online_keys = {u.strip().casefold() for u in online if u and u.strip()}
     users, points = [], []
     for entry in per_user.values():
-        merged = _merge(entry["spans"])
-        times = [e["at"] for e in entry["events"]]
+        merged, span_truncated = _merge(entry["spans"])
+        if span_truncated:
+            was_truncated = True
+        times = sorted(e["at"] for e in entry["events"])
         by_kind: Dict[str, int] = {}
         for e in entry["events"]:
             by_kind[e["kind"]] = by_kind.get(e["kind"], 0) + 1
         for s in merged:
-            s["changes"] = sum(1 for t in times if s["start"] <= t <= s["end"])
+            lo_i = bisect.bisect_left(times, s["start"])
+            hi_i = bisect.bisect_right(times, s["end"])
+            s["changes"] = hi_i - lo_i
             points += [s["start"], s["end"]]
         blocks = _blocks(times)
         points += [b["start"] for b in blocks] + [b["end"] for b in blocks]
@@ -98,13 +131,17 @@ def build_day(day: date, spans: List[dict], events: List[dict], *, now: float) -
                        "changes": len(times), "by_kind": by_kind},
         })
     users.sort(key=lambda u: (u["first"], u["user"].casefold()))
+
+    online_now = (sum(1 for u in users if u["user"].strip().casefold() in online_keys)
+                 if is_today else 0)
     return {
         "date": day.isoformat(),
         "users": users,
-        "bounds": _bounds(points, lo),
+        "bounds": _bounds(points),
+        "truncated": was_truncated,
         "summary": {
             "people": len(users),
-            "online_now": sum(1 for u in users if any(s["open"] for s in u["spans"])),
+            "online_now": online_now,
             "online_seconds": sum(u["totals"]["online_seconds"] for u in users),
             "changes": sum(u["totals"]["changes"] for u in users),
         },
