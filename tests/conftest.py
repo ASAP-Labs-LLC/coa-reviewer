@@ -117,3 +117,28 @@ def isolated_app_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "CONFIG_FILE", cfg_path)
     monkeypatch.setattr(app, "RE_REVIEW_STATE_FILE", state_path)
     return cfg_path, state_path
+
+
+@pytest.fixture(autouse=True)
+def _isolated_shared_store(request, tmp_path_factory, monkeypatch):
+    """Every test gets its own empty shared store and pending-write queue.
+
+    Verdicts are shared across sessions (v4), so one test's mark on a lab id
+    would otherwise reach the next test that pulls the same lab id — the
+    store in COA_DATA_DIR lives for the whole run. The store opens lazily,
+    so tests that never touch it pay nothing. Mark a test
+    ``real_shared_store`` to see the process's own store instead."""
+    if request.node.get_closest_marker("real_shared_store"):
+        yield
+        return
+    try:
+        import app as app_module
+        from shared_store import SharedStore
+    except ImportError:          # flask missing: the app tests skip themselves
+        yield
+        return
+    store = SharedStore(tmp_path_factory.mktemp("shared") / "coa_shared.db")
+    monkeypatch.setattr(app_module.state, "shared", store)
+    monkeypatch.setattr(app_module, "pending_verdicts", app_module.PendingVerdicts())
+    yield
+    store.close()

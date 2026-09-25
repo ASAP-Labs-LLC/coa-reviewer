@@ -49,6 +49,7 @@ def wired(tmp_path, monkeypatch):
 
 # ── what AppState is built with ──────────────────────────────────────────
 
+@pytest.mark.real_shared_store
 def test_state_has_a_shared_store_in_data_dir_and_a_tracker() -> None:
     import app as app_module
     assert isinstance(app_module.state.shared, SharedStore)

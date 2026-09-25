@@ -122,6 +122,10 @@ _UPSERT_VERDICT_SQL = (
     " at=excluded.at"
 )
 
+# apply_mark's upsert: a mark only replaces a verdict that is not newer than
+# it, so a late retry of a failed write can never overwrite newer work.
+_UPSERT_VERDICT_IF_NEWER_SQL = _UPSERT_VERDICT_SQL + " WHERE verdicts.at <= excluded.at"
+
 T = TypeVar("T")
 
 # ── sqlite error classification ─────────────────────────────────────────────
@@ -572,6 +576,14 @@ class SharedStore:
                 kind = _classify(exc)
                 if kind in ("busy", "keep"):
                     logger.warning("shared store %s failed (%s): %s", label, kind, exc)
+                    # The connection is kept, so it must not be left inside
+                    # a transaction ``fn`` opened: every later write would
+                    # silently vanish into it.
+                    try:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                    except sqlite3.Error as rb_exc:
+                        logger.warning("shared store %s rollback failed: %s", label, rb_exc)
                     return default
                 if kind == "corrupt":
                     self._drop_connection(backoff=False)   # our handle first
@@ -696,53 +708,38 @@ class SharedStore:
 
     def apply_mark(self, lab_id: str, mode: str, outcome: str, *, by: str,
                    reason: str = "", cc_task_id: Any = None,
-                   sample_id: Any = None, tab: Optional[str] = None) -> Optional[dict]:
+                   sample_id: Any = None, tab: Optional[str] = None,
+                   at: Optional[float] = None) -> Optional[dict]:
         """Set (or tombstone) a verdict and record the history event for it
         as one atomic transaction: either both happen or neither does.
 
-        Returns ``{"before": <previous outcome or None>, "verdicts": {mode:
-        verdict, ...}}`` for this lab_id, or ``None`` if the write failed —
-        callers must not assume the mark took effect without checking.
+        ``at`` is when the mark was made (default now). A retried write
+        passes its original time: if a newer verdict already exists it is
+        left alone, but the history row is still written at ``at`` with
+        ``detail.superseded = true``.
+
+        Returns ``{"before": <previous outcome or None>, "applied": bool,
+        "verdicts": {mode: verdict, ...}}`` for this lab_id, or ``None`` if
+        the write failed — callers must not assume the mark took effect
+        without checking.
         """
         lab_id = _require_text(lab_id, "lab_id")
         _require(mode in MODES, f"unknown mode {mode!r}")
         _require(outcome in MARK_OUTCOMES, f"unknown outcome {outcome!r}")
         by = _require_text(by, "by")
-        reason = (reason or "")[:MAX_TEXT]
-        now = self._now()
-        cc = _as_int(cc_task_id)
-        sid = _as_int(sample_id)
-        stored_reason = "" if outcome == "cleared" else reason
+        when = self._now() if at is None else _require_float(at, "at")
+        row = (lab_id, mode, outcome, "" if outcome == "cleared" else (reason or "")[:MAX_TEXT],
+               _as_int(cc_task_id), _as_int(sample_id), by, when)
+        detail: Dict[str, Any] = {}
+        if tab is not None:
+            detail["tab"] = tab
+        if reason:
+            detail["reason"] = (reason or "")[:MAX_TEXT]
 
         def op(c: sqlite3.Connection) -> dict:
             c.execute("BEGIN IMMEDIATE")
             try:
-                prev_row = c.execute(
-                    "SELECT outcome FROM verdicts WHERE lab_id=? AND mode=?",
-                    (lab_id, mode)).fetchone()
-                prev_outcome = (prev_row["outcome"]
-                               if prev_row and prev_row["outcome"] != "cleared" else None)
-                c.execute(_UPSERT_VERDICT_SQL,
-                         (lab_id, mode, outcome, stored_reason, cc, sid, by, now))
-                detail: Dict[str, Any] = {}
-                if tab is not None:
-                    detail["tab"] = tab
-                if reason:
-                    detail["reason"] = reason
-                kind = "unmark" if outcome == "cleared" else "mark"
-                after_text = None if outcome == "cleared" else outcome
-                c.execute(
-                    "INSERT INTO sample_events (lab_id, at, user, kind, field,"
-                    " before, after, detail) VALUES (?,?,?,?,?,?,?,?)",
-                    (lab_id, now, by, kind, mode, prev_outcome, after_text,
-                     _encode_detail(detail) if detail else None))
-                rows = c.execute("SELECT * FROM verdicts WHERE lab_id=?",
-                                 (lab_id,)).fetchall()
-                verdicts = {r["mode"]: {
-                    "outcome": r["outcome"], "reason": r["reason"],
-                    "cc_task_id": r["cc_task_id"], "sample_id": r["sample_id"],
-                    "by": r["by_user"], "at": r["at"],
-                } for r in rows}
+                result = self._apply_mark_tx(c, row, dict(detail))
                 c.execute("COMMIT")
             except BaseException:
                 # Not just sqlite3.Error: a ValueError from a bug in this
@@ -753,8 +750,42 @@ class SharedStore:
                 except sqlite3.Error:
                     pass
                 raise
-            return {"before": prev_outcome, "verdicts": verdicts}
+            return result
         return self._run("apply_mark", op, None, key=lab_id)
+
+    @staticmethod
+    def _apply_mark_tx(c: sqlite3.Connection, row: tuple, detail: Dict[str, Any]) -> dict:
+        """The body of apply_mark's transaction (caller owns BEGIN/COMMIT)."""
+        lab_id, mode, outcome, by, when = row[0], row[1], row[2], row[6], row[7]
+        prev_row = c.execute("SELECT outcome, at FROM verdicts WHERE lab_id=? AND mode=?",
+                             (lab_id, mode)).fetchone()
+        applied = prev_row is None or prev_row["at"] <= when
+        if applied:
+            prev_outcome = (prev_row["outcome"]
+                            if prev_row and prev_row["outcome"] != "cleared" else None)
+            c.execute(_UPSERT_VERDICT_IF_NEWER_SQL, row)
+        else:
+            # Superseded: "before" is what was in force at ``when`` — the
+            # last mark/unmark at or before it (one indexed lookup).
+            last = c.execute(
+                "SELECT after FROM sample_events WHERE lab_id=? AND field=?"
+                " AND kind IN ('mark','unmark') AND at<=?"
+                " ORDER BY at DESC, id DESC LIMIT 1", (lab_id, mode, when)).fetchone()
+            prev_outcome = last["after"] if last else None
+            detail["superseded"] = True
+        c.execute(
+            "INSERT INTO sample_events (lab_id, at, user, kind, field,"
+            " before, after, detail) VALUES (?,?,?,?,?,?,?,?)",
+            (lab_id, when, by, "unmark" if outcome == "cleared" else "mark", mode,
+             prev_outcome, None if outcome == "cleared" else outcome,
+             _encode_detail(detail) if detail else None))
+        rows = c.execute("SELECT * FROM verdicts WHERE lab_id=?", (lab_id,)).fetchall()
+        verdicts = {r["mode"]: {
+            "outcome": r["outcome"], "reason": r["reason"],
+            "cc_task_id": r["cc_task_id"], "sample_id": r["sample_id"],
+            "by": r["by_user"], "at": r["at"],
+        } for r in rows}
+        return {"before": prev_outcome, "applied": applied, "verdicts": verdicts}
 
     # ── sample history ───────────────────────────────────────────────────
 

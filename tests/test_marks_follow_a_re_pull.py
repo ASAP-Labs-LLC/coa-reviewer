@@ -233,10 +233,15 @@ def _pull_at(lab, when: float) -> None:
         lab.pull()
 
 
-def test_a_mark_older_than_twelve_hours_is_left_behind(lab) -> None:
+def test_a_mark_older_than_twelve_hours_is_left_behind(lab, monkeypatch) -> None:
+    """The per-account ledger's 12 h window. Since v4 the shared verdict
+    (which does not expire) is what brings a mark back when the store is
+    readable; the ledger is the fallback when it is not, so test it there."""
+    import app as app_module
     lab.pull()
     lab.mark("good", LABS[0])
     judged = time.time()
+    monkeypatch.setattr(app_module.state.shared, "verdicts_for", lambda ids: None)
     lab.start()
     _pull_at(lab, judged + 12 * 3600 + 1)
     assert lab.tab()[LABS[0]]["status"] == "pending"
@@ -252,23 +257,26 @@ def test_a_mark_just_inside_twelve_hours_still_comes_back(lab) -> None:
     assert lab.tab()[LABS[0]]["status"] == "good"
 
 
-def test_marks_belong_to_the_account_that_made_them(lab) -> None:
+def test_marks_are_shared_and_name_the_account_that_made_them(lab) -> None:
+    """v4: a verdict belongs to the sample, per mode — another reviewer's
+    pull shows it, with the marker (not them) as the reviewer."""
     import app as app_module
     lab.pull()
     lab.mark("good", LABS[0])
 
     other = Lab(app_module, "JD", lab._pull)
     other.pull()
-    assert other.tab()[LABS[0]]["status"] == "pending"
-    assert other.results() == {}
+    assert other.tab()[LABS[0]]["status"] == "good"
+    assert other.results()[(TAB, LABS[0])]["reviewer"] == "RC"
+    assert other.ustate.verdicts == {}, "JD's own ledger holds only JD's marks"
 
 
-def test_a_mark_on_one_tab_does_not_mark_the_same_sample_on_another(lab) -> None:
-    """Yesterday and Due Out are two reviews of the same lab ID."""
+def test_a_mark_on_one_tab_marks_the_same_sample_on_another(lab) -> None:
+    """v4: the verdict is per lab ID and mode, not per tab."""
     lab.pull(TAB)
     lab.mark("good", LABS[0])
     lab.pull("Due Out")
-    assert lab.tab("Due Out")[LABS[0]]["status"] == "pending"
+    assert lab.tab("Due Out")[LABS[0]]["status"] == "good"
 
 
 # ── the ledger survives a restart ────────────────────────────────────────

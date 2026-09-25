@@ -1224,7 +1224,10 @@ function switchTab(tabName) {
 
 async function loadTab(tabName) {
     try {
-        const resp = await fetch(`/api/tabs/${encodeURIComponent(tabName)}`);
+        // The mode says which shared verdicts apply; each sample also carries
+        // `tags` (who checked it in either mode), kept as-is on the object.
+        const mode = encodeURIComponent(currentReviewMode || "tests");
+        const resp = await fetch(`/api/tabs/${encodeURIComponent(tabName)}?mode=${mode}`);
         if (resp.status === 401) { triggerTimeout(); return; }
         const data = await resp.json();
         state.samples[tabName] = data.samples || [];
@@ -2497,7 +2500,8 @@ async function applyMark(sample, outcome, extra = {}) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-            tab: sample.tab, lab_id: sample.lab_id, outcome, ...extra,
+            tab: sample.tab, lab_id: sample.lab_id, outcome,
+            mode: currentReviewMode || "tests", ...extra,
         }),
     });
     if (resp.status === 401) { triggerTimeout(); return null; }

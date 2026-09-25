@@ -303,6 +303,69 @@ def test_apply_mark_is_atomic_on_failure(store):
     assert conn is not None and conn.in_transaction is False  # N2: rolled back cleanly
 
 
+# ── apply_mark(at=...): a late retry never overwrites newer work ─────────────
+
+def test_apply_mark_reports_applied(store):
+    result = store.apply_mark("A", "tests", "good", by="x")
+    assert result["applied"] is True
+
+
+def test_apply_mark_uses_the_given_time(store, clock):
+    result = store.apply_mark("A", "tests", "good", by="x", at=clock.t - 60)
+    assert result["verdicts"]["tests"]["at"] == clock.t - 60
+    assert store.history("A")[0]["at"] == clock.t - 60
+
+
+def test_older_apply_mark_does_not_overwrite_a_newer_verdict(store, clock):
+    """Dana's 10:00 uncheck failed and is retried after Sam's 10:05 Bad."""
+    ten = clock.t
+    store.apply_mark("A", "tests", "good", by="Ann", at=ten - 3600)
+    store.apply_mark("A", "tests", "bad", by="Sam", reason="wrong", at=ten + 300)
+    result = store.apply_mark("A", "tests", "cleared", by="Dana", at=ten)
+    assert result["applied"] is False
+    v = store.verdicts_for(["A"])["A"]["tests"]
+    assert v["outcome"] == "bad" and v["by"] == "Sam"
+    assert result["verdicts"]["tests"]["outcome"] == "bad"
+    hist = store.history("A")
+    dana = [h for h in hist if h["user"] == "Dana"]
+    assert len(dana) == 1
+    assert dana[0]["at"] == ten and dana[0]["kind"] == "unmark"
+    assert dana[0]["detail"].get("superseded") is True
+    # the verdict in force at 10:00 was Ann's Good
+    assert dana[0]["before"] == "good"
+    # newest-first by time: Sam's 10:05 row sorts before Dana's 10:00 row
+    assert hist[0]["user"] == "Sam"
+
+
+def test_equal_time_apply_mark_still_applies(store, clock):
+    store.apply_mark("A", "tests", "good", by="x", at=clock.t)
+    result = store.apply_mark("A", "tests", "bad", by="y", at=clock.t)
+    assert result["applied"] is True
+    assert store.verdicts_for(["A"])["A"]["tests"]["outcome"] == "bad"
+
+
+def test_apply_mark_rejects_a_non_numeric_time(store):
+    with pytest.raises(ValueError):
+        store.apply_mark("A", "tests", "good", by="x", at="soon")
+
+
+def test_run_rolls_back_an_open_transaction_on_a_keep_error(store):
+    """A bad-query error raised mid-transaction must not leave the shared
+    writer inside it — every later write would vanish into it."""
+    store.set_verdict("seed", "tests", "good", by="x")
+
+    def op_keep(c):
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("INSERT INTO meta (key, value) VALUES ('k2', 'v')")
+        c.execute("INSERT INTO meta (key, value) VALUES ('k2', 'v')")  # PK clash
+        return True
+    assert store._run("test", op_keep, False) is False
+    conn = store._connection()
+    assert conn is not None and conn.in_transaction is False
+    assert store.get_meta("k2") is None                 # rolled back
+    assert store.set_verdict("B", "tests", "good", by="x") is True
+
+
 # ── lock / corruption handling ──────────────────────────────────────────────
 
 def test_busy_write_returns_default_fast_and_next_write_succeeds(tmp_path):
