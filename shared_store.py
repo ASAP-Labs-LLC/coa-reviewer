@@ -54,7 +54,7 @@ EVENT_KINDS = (
     "mark", "unmark", "test_result", "sample_info", "sample_sync",
     "comments", "attachment_deleted", "listing_created", "listing_completed",
 )
-SPAN_END_REASONS = ("logout", "timeout", "gap", "restart")
+SPAN_END_REASONS = ("logout", "timeout", "gap", "restart", "midnight")
 
 MAX_HISTORY = 500          # rows one History tab can show
 MAX_RANGE_ROWS = 5000      # rows one /activity day can use; len==limit means truncated
@@ -126,32 +126,58 @@ T = TypeVar("T")
 
 # ── sqlite error classification ─────────────────────────────────────────────
 # BUSY/LOCKED is contention, not damage: keep the connection, no backoff.
+# CONSTRAINT/MISUSE/RANGE/a plain SQLITE_ERROR are a bad query, not file
+# damage or contention either — also keep the connection, no backoff ("keep").
 # IOERR/CANTOPEN and "no such table" mean the connection is no good any more.
 # CORRUPT/NOTADB additionally means the *file* is no good — quarantine it.
+#
+# Primary result codes (low byte of ``sqlite_errorcode``, Python >= 3.11);
+# see https://www.sqlite.org/rescode.html. Checked first because it's exact;
+# the message-text fallback below is for older interpreters or odd drivers.
+_SQLITE_ERROR = 1
+_SQLITE_BUSY = 5
+_SQLITE_LOCKED = 6
+_SQLITE_IOERR = 10
+_SQLITE_CORRUPT = 11
+_SQLITE_CANTOPEN = 14
+_SQLITE_CONSTRAINT = 19
+_SQLITE_MISMATCH = 20
+_SQLITE_MISUSE = 21
+_SQLITE_RANGE = 25
+_SQLITE_NOTADB = 26
 
-_BUSY_NAMES = {"SQLITE_BUSY", "SQLITE_LOCKED"}
-_CORRUPT_NAMES = {"SQLITE_CORRUPT", "SQLITE_NOTADB"}
-_DROP_NAMES = {"SQLITE_IOERR", "SQLITE_CANTOPEN"}
+_BUSY_CODES = {_SQLITE_BUSY, _SQLITE_LOCKED}
+_CORRUPT_CODES = {_SQLITE_CORRUPT, _SQLITE_NOTADB}
+_DROP_CODES = {_SQLITE_IOERR, _SQLITE_CANTOPEN}
+_KEEP_CODES = {_SQLITE_ERROR, _SQLITE_CONSTRAINT, _SQLITE_MISMATCH, _SQLITE_MISUSE,
+              _SQLITE_RANGE}
 
 
 def _classify(exc: sqlite3.Error) -> str:
-    """Return ``"busy"``, ``"corrupt"`` or ``"drop"`` for how to react."""
-    name = getattr(exc, "sqlite_errorname", None)
-    if name:
-        base = name.split("_ERROR")[0] if "_ERROR" in name else name
-        if base in _BUSY_NAMES:
-            return "busy"
-        if base in _CORRUPT_NAMES:
-            return "corrupt"
-        if base in _DROP_NAMES:
-            return "drop"
+    """Return ``"busy"``, ``"keep"``, ``"corrupt"`` or ``"drop"`` for how to
+    react. ``"no such table"`` always drops regardless of code — it means
+    the schema is missing, which a plain SQLITE_ERROR code doesn't
+    distinguish from a one-off bad query."""
     text = str(exc).lower()
     if "no such table" in text:
         return "drop"
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        primary = code & 0xFF
+        if primary in _BUSY_CODES:
+            return "busy"
+        if primary in _CORRUPT_CODES:
+            return "corrupt"
+        if primary in _DROP_CODES:
+            return "drop"
+        if primary in _KEEP_CODES:
+            return "keep"
     if "locked" in text or "busy" in text:
         return "busy"
     if "malformed" in text or "not a database" in text or "corrupt" in text:
         return "corrupt"
+    if "constraint" in text or "misuse" in text or "range" in text:
+        return "keep"
     return "drop"   # unrecognised: be conservative and reopen
 
 
@@ -164,6 +190,16 @@ def _require_text(value: Any, name: str) -> str:
     text = str(value or "").strip()
     _require(bool(text), f"{name} must be a non-empty string")
     return text
+
+
+def _require_float(value: Any, name: str) -> float:
+    """Coerce to ``float`` or raise ``ValueError`` — used to validate a
+    read's numeric args *before* acquiring a reader, so a bad argument
+    never ties up (and never even touches) the pool."""
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}") from exc
 
 
 def _as_text(value: Any) -> Optional[str]:
@@ -212,17 +248,68 @@ def _op_label(op: str, key: Optional[str]) -> str:
     return f"{op}[{key}]" if key else op
 
 
+def _validate_presence_span_id(raw: Any, prev_kind: Optional[str]) -> None:
+    if raw == "$prev":
+        _require(prev_kind == "open",
+                 "'$prev' span_id must immediately follow an 'open' op in the batch")
+        return
+    _require(isinstance(raw, int) and not isinstance(raw, bool),
+             f"span_id must be an int or '$prev', got {raw!r}")
+
+
+def _validate_presence_batch(batch: List[dict]) -> None:
+    """Validate every op in an ``apply_presence`` batch before any write
+    begins (see that method's docstring for why). Raises ``ValueError`` on
+    the first problem found."""
+    prev_kind: Optional[str] = None
+    for item in batch:
+        if not isinstance(item, dict):
+            raise ValueError(f"presence op must be a dict, got {item!r}")
+        kind = item.get("op")
+        try:
+            if kind == "open":
+                _require_text(item.get("user"), "user")
+                float(item["started"])
+                float(item["last_seen"])
+            elif kind == "touch":
+                _validate_presence_span_id(item.get("span_id"), prev_kind)
+                float(item["last_seen"])
+            elif kind == "close":
+                _validate_presence_span_id(item.get("span_id"), prev_kind)
+                _require(item.get("reason") in SPAN_END_REASONS,
+                         f"unknown end reason {item.get('reason')!r}")
+                float(item["ended_at"])
+            else:
+                raise ValueError(f"unknown presence op {kind!r}")
+        except KeyError as exc:
+            raise ValueError(f"presence op {item!r} missing field {exc}") from exc
+        except TypeError as exc:
+            raise ValueError(f"presence op {item!r} has an invalid field: {exc}") from exc
+        prev_kind = kind
+
+
 class _ReaderPool:
     """A small, bounded pool of read-only connections so reads never queue
     behind the single writer lock. Opened lazily; each holds
     ``PRAGMA query_only=1`` so a bug here can't accidentally write.
+
+    Every connection is tagged (by identity, since ``sqlite3.Connection``
+    can't carry extra attributes) with the pool's *generation* at the time
+    it was opened. ``invalidate_idle()`` — called before a corrupt file is
+    renamed away — bumps the generation and closes every currently-idle
+    connection; one still checked out by another thread at that moment is
+    closed instead of recycled the next time it's released, so nothing
+    keeps a handle open on the file that's about to move.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, backoff_active: Callable[[], bool]) -> None:
         self._path = path
+        self._backoff_active = backoff_active
         self._pool: "queue.Queue[sqlite3.Connection]" = queue.Queue(maxsize=READER_POOL_SIZE)
         self._created = 0
         self._create_lock = threading.Lock()
+        self._generation = 0
+        self._gen_of: Dict[int, int] = {}   # id(conn) -> generation it was opened in
 
     def _open(self) -> sqlite3.Connection:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,12 +335,19 @@ class _ReaderPool:
             pass
         with self._create_lock:
             if self._created < READER_POOL_SIZE:
+                if self._backoff_active():
+                    # the writer can't open this file right now either;
+                    # don't pile on with more failing connect attempts.
+                    logger.debug("shared store reader %s: writer backoff active,"
+                                " not opening", self._path)
+                    return None
                 try:
                     conn = self._open()
                 except (sqlite3.Error, OSError) as exc:
                     logger.warning("shared store unavailable at %s: %s", self._path, exc)
                     return None
                 self._created += 1
+                self._gen_of[id(conn)] = self._generation
                 return conn
         try:
             return self._pool.get(timeout=READER_ACQUIRE_TIMEOUT_SECONDS)
@@ -262,31 +356,43 @@ class _ReaderPool:
             return None
 
     def release(self, conn: sqlite3.Connection, healthy: bool) -> None:
-        if healthy:
+        stale = self._gen_of.get(id(conn)) != self._generation
+        if healthy and not stale:
             try:
                 self._pool.put_nowait(conn)
                 return
             except queue.Full:  # pragma: no cover - pool sized to _created
                 pass
+        self._close_one(conn)
+
+    def _close_one(self, conn: sqlite3.Connection) -> None:
         try:
             conn.close()
         except sqlite3.Error:
             pass
+        self._gen_of.pop(id(conn), None)
         with self._create_lock:
             self._created = max(0, self._created - 1)
 
-    def close(self) -> None:
+    def invalidate_idle(self) -> None:
+        """Bump the generation and close every idle (pooled) connection.
+        A connection checked out right now finishes its read normally but
+        is closed rather than recycled when ``release()`` sees its stale
+        generation."""
         with self._create_lock:
-            while True:
-                try:
-                    conn = self._pool.get_nowait()
-                except queue.Empty:
-                    break
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
+            self._generation += 1
+        while True:
+            try:
+                conn = self._pool.get_nowait()
+            except queue.Empty:
+                break
+            self._close_one(conn)
+
+    def close(self) -> None:
+        self.invalidate_idle()
+        with self._create_lock:
             self._created = 0
+        self._gen_of.clear()
 
 
 class SharedStore:
@@ -301,7 +407,12 @@ class SharedStore:
         self._backoff = BACKOFF_START_SECONDS
         self._backoff_until: Optional[float] = None
         self._last_skip_log = 0.0
-        self._readers = _ReaderPool(self._path)
+        self._quarantine_disabled = False
+        self._readers = _ReaderPool(self._path, backoff_active=self._writer_backing_off)
+
+    def _writer_backing_off(self) -> bool:
+        return (self._backoff_until is not None
+                and time.monotonic() < self._backoff_until)
 
     @property
     def path(self) -> Path:
@@ -334,7 +445,10 @@ class SharedStore:
         """Open lazily; after a failure, retry with exponential backoff
         (1, 2, 4, ... 30s, reset on success). Caller holds ``_lock``. A
         corrupt file is quarantined and one fresh open is retried
-        immediately (bounded: at most two attempts)."""
+        immediately (bounded: at most two attempts) — unless quarantine
+        has already failed once this process, in which case it degrades
+        to the normal backoff instead of retrying a rename that will just
+        fail again."""
         if self._conn is not None:
             return self._conn
         if (self._backoff_until is not None
@@ -345,8 +459,7 @@ class SharedStore:
             try:
                 conn = self._open_raw()
             except sqlite3.Error as exc:
-                if _classify(exc) == "corrupt":
-                    self._quarantine_files()
+                if _classify(exc) == "corrupt" and self._quarantine_files():
                     continue
                 self._fail_open(exc)
                 return None
@@ -373,10 +486,28 @@ class SharedStore:
             logger.debug("shared store %s: skipped, backoff active", self._path)
             self._last_skip_log = now
 
-    def _quarantine_files(self) -> None:
+    def _quarantine_files(self) -> bool:
+        """Rename the corrupt db file (and ``-wal``/``-shm``) aside so a
+        fresh one can take its place on the next open.
+
+        Order matters: our own writer handle is dropped *before* this is
+        called (see callers), and readers' idle handles are dropped here
+        via ``invalidate_idle()`` — on Windows a rename fails (WinError 32)
+        while any handle is still open on the file, so every handle we
+        control has to be gone first.
+
+        Returns ``False`` if the main file could not be renamed. After
+        that this process stops retrying quarantine (``_quarantine_disabled``)
+        and simply degrades to "unavailable" with the normal exponential
+        backoff instead of hammering a rename that will keep failing.
+        """
+        if self._quarantine_disabled:
+            return False
+        self._readers.invalidate_idle()
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         logger.error("shared store at %s is corrupt; quarantining (tag %s)",
                     self._path, ts)
+        main_ok = True
         for suffix in ("", "-wal", "-shm"):
             src = Path(f"{self._path}{suffix}")
             if not src.exists():
@@ -386,6 +517,15 @@ class SharedStore:
                 src.rename(dest)
             except OSError as exc:
                 logger.warning("shared store: could not quarantine %s: %s", src, exc)
+                if suffix == "":
+                    main_ok = False
+        if not main_ok:
+            self._quarantine_disabled = True
+            logger.error("shared store at %s: quarantine failed; giving up on"
+                        " automatic recovery for this process (falling back to"
+                        " the normal unavailable/backoff path instead of"
+                        " retrying the rename)", self._path)
+        return main_ok
 
     def _drop_connection(self, *, backoff: bool) -> None:
         if self._conn is not None:
@@ -416,8 +556,10 @@ class SharedStore:
     def _run(self, op: str, fn: Callable[[sqlite3.Connection], T], default: T,
              key: Optional[str] = None) -> T:
         """Run ``fn`` under the lock; any sqlite error → WARNING/ERROR +
-        default. BUSY/LOCKED keeps the connection and does not back off;
-        other errors drop it; a corrupt file is quarantined."""
+        default. BUSY/LOCKED/a bad-query error (CONSTRAINT/MISUSE/RANGE/a
+        plain SQLITE_ERROR) keeps the connection and does not back off;
+        an I/O error drops it; a corrupt file is quarantined (writer
+        dropped first, so our own handle can't block the rename)."""
         started = time.perf_counter()
         label = _op_label(op, key)
         with self._lock:
@@ -428,12 +570,16 @@ class SharedStore:
                 result = fn(conn)
             except sqlite3.Error as exc:
                 kind = _classify(exc)
-                if kind == "busy":
-                    logger.warning("shared store %s failed (busy): %s", label, exc)
+                if kind in ("busy", "keep"):
+                    logger.warning("shared store %s failed (%s): %s", label, kind, exc)
                     return default
                 if kind == "corrupt":
-                    self._quarantine_files()
-                    self._drop_connection(backoff=False)
+                    self._drop_connection(backoff=False)   # our handle first
+                    if self._quarantine_files():
+                        self._backoff = BACKOFF_START_SECONDS
+                        self._backoff_until = None
+                    else:
+                        self._fail_open(exc)
                     return default
                 logger.warning("shared store %s failed: %s", label, exc)
                 self._drop_connection(backoff=True)
@@ -449,21 +595,34 @@ class SharedStore:
 
     def _run_read(self, op: str, fn: Callable[[sqlite3.Connection], T], default: T,
                   key: Optional[str] = None) -> T:
+        """Run ``fn`` against a pooled reader. The reader is *always*
+        released — via ``finally`` — even if ``fn`` raises something that
+        isn't a ``sqlite3.Error`` (a programming bug): three such leaks
+        used to exhaust the pool, after which every read would wait out
+        ``READER_ACQUIRE_TIMEOUT_SECONDS`` and return the default forever.
+        ``healthy`` defaults to ``False`` (close, don't recycle) and is
+        only set ``True`` on success or contention (``busy``/``keep``)."""
         started = time.perf_counter()
         label = _op_label(op, key)
         conn = self._readers.acquire()
         if conn is None:
             return default
+        healthy = False
+        succeeded = False
+        result = default
         try:
             result = fn(conn)
+            healthy = True
+            succeeded = True
         except sqlite3.Error as exc:
             kind = _classify(exc)
-            healthy = kind == "busy"
+            healthy = kind in ("busy", "keep")
             logger.warning("shared store %s failed%s: %s", label,
-                           " (busy)" if kind == "busy" else "", exc)
+                           f" ({kind})" if kind in ("busy", "keep") else "", exc)
+        finally:
             self._readers.release(conn, healthy)
+        if not succeeded:
             return default
-        self._readers.release(conn, True)
         elapsed_ms = (time.perf_counter() - started) * 1000
         if elapsed_ms > SLOW_QUERY_MS:
             logger.info("shared store %s slow: %.1f ms", label, elapsed_ms)
@@ -585,7 +744,10 @@ class SharedStore:
                     "by": r["by_user"], "at": r["at"],
                 } for r in rows}
                 c.execute("COMMIT")
-            except sqlite3.Error:
+            except BaseException:
+                # Not just sqlite3.Error: a ValueError from a bug in this
+                # block must not leave the writer sitting mid-transaction —
+                # every later write would silently vanish into it.
                 try:
                     c.execute("ROLLBACK")
                 except sqlite3.Error:
@@ -624,12 +786,14 @@ class SharedStore:
 
     def events_between(self, start: float, end: float,
                        limit: int = MAX_RANGE_ROWS) -> List[dict]:
+        start = _require_float(start, "start")
+        end = _require_float(end, "end")
         limit = max(1, min(int(limit), MAX_RANGE_ROWS))
 
         def op(c: sqlite3.Connection) -> List[dict]:
             rows = c.execute(
                 "SELECT * FROM sample_events WHERE at >= ? AND at < ?"
-                " ORDER BY at, id LIMIT ?", (float(start), float(end), limit)).fetchall()
+                " ORDER BY at, id LIMIT ?", (start, end, limit)).fetchall()
             return [self._event_dict(r) for r in rows]
         rows = self._run_read("events_between", op, [])
         if len(rows) == limit:
@@ -642,12 +806,14 @@ class SharedStore:
         """Like ``events_between`` but only ``user``/``at``/``kind`` — the
         slim shape the Time Online day builder needs, without paying to
         decode every ``detail`` JSON blob for a day with a lot of activity."""
+        start = _require_float(start, "start")
+        end = _require_float(end, "end")
         limit = max(1, min(int(limit), MAX_RANGE_ROWS))
 
         def op(c: sqlite3.Connection) -> List[dict]:
             rows = c.execute(
                 "SELECT user, at, kind FROM sample_events WHERE at >= ? AND at < ?"
-                " ORDER BY at, id LIMIT ?", (float(start), float(end), limit)).fetchall()
+                " ORDER BY at, id LIMIT ?", (start, end, limit)).fetchall()
             return [{"user": r["user"], "at": r["at"], "kind": r["kind"]} for r in rows]
         rows = self._run_read("event_marks_between", op, [])
         if len(rows) == limit:
@@ -715,19 +881,27 @@ class SharedStore:
         (nobody flushed in between) gets both halves written atomically in
         one flush instead of being silently dropped.
 
+        The whole batch is validated *before* ``BEGIN`` — a malformed item
+        raises ``ValueError`` having touched nothing, rather than raising
+        from partway through the transaction (which, if not every failure
+        path rolled back correctly, could leave the writer connection
+        sitting mid-transaction: later writes would then silently queue
+        into a transaction nobody ever commits).
+
         Returns a list of results parallel to ``ops`` (the new span id for
         ``"open"``, a bool for ``"touch"``/``"close"``), or ``None`` if the
         whole batch failed — nothing in it was applied, so the caller
         should treat every item as still pending.
         """
         batch = list(ops)[:MAX_HISTORY * 3]   # bounded; callers cap far below this
+        _validate_presence_batch(batch)
 
         def op(c: sqlite3.Connection) -> List[Any]:
             c.execute("BEGIN IMMEDIATE")
             results: List[Any] = []
             try:
                 for item in batch:
-                    kind = item.get("op")
+                    kind = item["op"]
                     if kind == "open":
                         cur = c.execute(
                             "INSERT INTO presence (user, started_at, last_seen)"
@@ -741,10 +915,8 @@ class SharedStore:
                             "UPDATE presence SET last_seen=? WHERE id=? AND ended_at IS NULL",
                             (float(item["last_seen"]), span_id))
                         results.append(cur.rowcount == 1)
-                    elif kind == "close":
+                    else:   # "close" — validated to be one of the three above
                         reason = item["reason"]
-                        _require(reason in SPAN_END_REASONS,
-                                f"unknown end reason {reason!r}")
                         span_id = self._resolve_span_id(item["span_id"], results)
                         cur = c.execute(
                             "UPDATE presence SET last_seen=MAX(last_seen, ?),"
@@ -753,10 +925,11 @@ class SharedStore:
                             (float(item["ended_at"]), float(item["ended_at"]), reason,
                              span_id))
                         results.append(cur.rowcount == 1)
-                    else:
-                        raise ValueError(f"unknown presence op {kind!r}")
                 c.execute("COMMIT")
-            except sqlite3.Error:
+            except BaseException:
+                # Not just sqlite3.Error — any failure here (even one this
+                # pre-validation pass didn't anticipate) must roll back so
+                # the connection isn't left mid-transaction.
                 try:
                     c.execute("ROLLBACK")
                 except sqlite3.Error:
@@ -768,13 +941,18 @@ class SharedStore:
     @staticmethod
     def _resolve_span_id(raw: Any, results: List[Any]) -> int:
         if raw == "$prev":
-            _require(bool(results) and isinstance(results[-1], int),
-                     "'$prev' span_id with no preceding open in this batch")
-            return int(results[-1])
-        return int(raw)
+            prev = results[-1] if results else None
+            _require(isinstance(prev, int) and not isinstance(prev, bool),
+                     "'$prev' span_id must reference a preceding 'open' in this batch")
+            return prev
+        _require(isinstance(raw, int) and not isinstance(raw, bool),
+                 f"span_id must be an int, got {raw!r}")
+        return raw
 
     def spans_between(self, start: float, end: float,
                       limit: int = MAX_RANGE_ROWS) -> List[dict]:
+        start = _require_float(start, "start")
+        end = _require_float(end, "end")
         limit = max(1, min(int(limit), MAX_RANGE_ROWS))
 
         def op(c: sqlite3.Connection) -> List[dict]:
@@ -782,8 +960,7 @@ class SharedStore:
                 "SELECT * FROM presence WHERE started_at >= ? AND started_at < ?"
                 " AND COALESCE(ended_at, last_seen) >= ?"
                 " ORDER BY started_at, id LIMIT ?",
-                (float(start) - MAX_SPAN_SECONDS, float(end), float(start),
-                 limit)).fetchall()
+                (start - MAX_SPAN_SECONDS, end, start, limit)).fetchall()
             return [{"id": r["id"], "user": r["user"], "start": r["started_at"],
                      "end": r["ended_at"] if r["ended_at"] is not None else r["last_seen"],
                      "open": r["ended_at"] is None, "end_reason": r["end_reason"]}

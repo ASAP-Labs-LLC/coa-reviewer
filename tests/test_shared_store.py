@@ -5,6 +5,7 @@ import logging
 import sqlite3
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -298,6 +299,8 @@ def test_apply_mark_is_atomic_on_failure(store):
     assert result is None
     v = store.verdicts_for(["A"])["A"]["tests"]
     assert v["outcome"] == "good" and v["by"] == "x"   # unchanged: rolled back
+    conn = store._connection()
+    assert conn is not None and conn.in_transaction is False  # N2: rolled back cleanly
 
 
 # ── lock / corruption handling ──────────────────────────────────────────────
@@ -411,3 +414,173 @@ def test_performance_budget(store):
     load_ms = (time.perf_counter() - t1) * 1000
     assert per_mark_ms < 50, per_mark_ms
     assert load_ms < 250, load_ms
+
+
+# ── N1: reader pool must not leak on a non-sqlite exception ────────────────
+
+def test_run_read_does_not_leak_reader_on_non_sqlite_exception(store):
+    def boom(c):
+        raise TypeError("boom")
+    for _ in range(READER_POOL_SIZE + 2):
+        with pytest.raises(TypeError):
+            store._run_read("boom", boom, None)
+    # the pool must have recovered: a normal read works right away, not
+    # after waiting out READER_ACQUIRE_TIMEOUT_SECONDS for an exhausted pool
+    t0 = time.perf_counter()
+    assert store.history("A") == []
+    assert (time.perf_counter() - t0) < 1.0
+
+
+@pytest.mark.parametrize("method,args", [
+    ("events_between", ("not-a-number", 100)),
+    ("event_marks_between", (0, "not-a-number")),
+    ("spans_between", ("nope", 100)),
+])
+def test_reads_validate_numeric_args_before_touching_the_reader_pool(store, method, args):
+    with pytest.raises(ValueError):
+        getattr(store, method)(*args)
+    assert store._readers._created == 0   # never even tried to acquire one
+
+
+# ── N2: a malformed batch must never leave the writer mid-transaction ──────
+
+def test_apply_presence_invalid_op_never_begins_a_transaction(store):
+    with pytest.raises(ValueError):
+        store.apply_presence([{"op": "bogus"}])
+    conn = store._connection()
+    assert conn is not None and conn.in_transaction is False
+
+
+def test_apply_presence_invalid_op_leaves_earlier_valid_ops_unapplied(store):
+    """The whole batch is validated before BEGIN, so one bad op means
+    nothing in the batch lands — not even the valid ones ahead of it."""
+    ops = [{"op": "open", "user": "u", "started": 1.0, "last_seen": 1.0},
+          {"op": "bogus"}]
+    with pytest.raises(ValueError):
+        store.apply_presence(ops)
+    assert store.spans_between(0, 1e12) == []
+    conn = store._connection()
+    assert conn is not None and conn.in_transaction is False
+
+
+def test_apply_mark_invalid_outcome_never_begins_a_transaction(store):
+    with pytest.raises(ValueError):
+        store.apply_mark("A", "tests", "not-a-real-outcome", by="x")
+    conn = store._connection()
+    assert conn is not None and conn.in_transaction is False
+
+
+# ── minors: $prev must never resolve to a bool result ───────────────────────
+
+def test_prev_span_id_must_follow_an_open(store):
+    ops = [{"op": "touch", "span_id": 999999, "last_seen": 1.0},
+          {"op": "close", "span_id": "$prev", "ended_at": 2.0, "reason": "logout"}]
+    with pytest.raises(ValueError):
+        store.apply_presence(ops)
+
+
+def test_resolve_span_id_rejects_bool():
+    with pytest.raises(ValueError):
+        SharedStore._resolve_span_id("$prev", [True])
+    with pytest.raises(ValueError):
+        SharedStore._resolve_span_id(True, [])
+
+
+# ── N5: quarantine must drop handles first and not loop on a bad rename ────
+
+def test_quarantine_bumps_reader_generation_and_recovers(tmp_path, caplog):
+    """The connection that first notices corruption is a *fresh* one — a
+    live connection's cached schema/page state won't necessarily notice
+    bytes rewritten underneath it, same as in production where the process
+    that finds the corruption is usually one that just (re)opened."""
+    caplog.set_level(logging.ERROR)
+    path = tmp_path / "coa_shared.db"
+    s = SharedStore(path)
+    s.set_verdict("A", "tests", "good", by="x")
+    s.close()
+    with open(path, "r+b") as f:
+        f.write(b"not a sqlite database, definitely not" * 50)
+    s2 = SharedStore(path)
+    gen_before = s2._readers._generation
+    assert s2.set_verdict("B", "tests", "good", by="y") is True
+    assert s2._readers._generation > gen_before
+    quarantined = list(tmp_path.glob("coa_shared.db.corrupt-*"))
+    assert len(quarantined) == 1
+    got = s2.verdicts_for(["A", "B"])
+    assert "A" not in got              # old data gone with the corrupt file
+    assert got["B"]["tests"]["by"] == "y"
+    s2.close()
+
+
+def test_quarantine_disabled_after_rename_failure_does_not_loop(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.ERROR)
+    path = tmp_path / "coa_shared.db"
+    s = SharedStore(path)
+    s.set_verdict("A", "tests", "good", by="x")
+    s.close()
+    path.write_bytes(b"not a sqlite database, definitely not" * 50)
+
+    calls = {"n": 0}
+
+    def failing_rename(self, target):
+        calls["n"] += 1
+        raise OSError(32, "simulated WinError 32: file in use")
+
+    monkeypatch.setattr(Path, "rename", failing_rename)
+
+    s2 = SharedStore(path)
+    assert s2.set_verdict("B", "tests", "good", by="y") is False
+    first_attempts = calls["n"]
+    assert first_attempts >= 1
+    assert s2._quarantine_disabled is True
+
+    assert s2.set_verdict("C", "tests", "good", by="z") is False
+    assert calls["n"] == first_attempts   # no retry loop on the failing rename
+    s2.close()
+
+
+# ── minors: error classification keeps the connection for non-fatal errors ──
+
+def test_classify_recognizes_numeric_primary_code(store):
+    """A real sqlite3.Error carries a genuine ``sqlite_errorcode`` set by
+    the C extension; a syntax error is SQLITE_ERROR (1), which must
+    classify as "keep" (bad query, not damage or contention)."""
+    from shared_store import _classify
+    conn = store._connection()
+    try:
+        conn.execute("THIS IS NOT VALID SQL")
+    except sqlite3.Error as exc:
+        assert _classify(exc) == "keep"
+    else:
+        pytest.fail("expected a sqlite3.Error")
+
+
+def test_constraint_style_errors_keep_the_connection_no_backoff(store):
+    """CONSTRAINT/MISUSE/RANGE/a plain SQLITE_ERROR is a bad query, not
+    file damage or contention: the connection is kept and no backoff is
+    engaged, unlike a real I/O error."""
+    conn_before = store._connection()
+
+    def boom(c):
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: verdicts.lab_id")
+    assert store._run("t", boom, False) is False
+    assert store._conn is conn_before      # connection kept, not dropped
+    assert store._backoff_until is None    # no backoff engaged
+
+
+def test_no_such_table_still_drops_the_connection(store):
+    """"no such table" means the schema is missing — unlike a generic bad
+    query, that connection really is no good, so it still drops."""
+    def boom(c):
+        raise sqlite3.OperationalError("no such table: bogus")
+    assert store._run("t", boom, False) is False
+    assert store._conn is None
+
+
+def test_readers_share_writer_backoff(tmp_path):
+    s = SharedStore(tmp_path / "db")
+    s.set_verdict("A", "tests", "good", by="x")   # establish schema
+    s._backoff_until = time.monotonic() + 10       # force writer backoff
+    assert s.history("A") == []
+    assert s._readers._created == 0                 # skipped opening, didn't try
+    s.close()
