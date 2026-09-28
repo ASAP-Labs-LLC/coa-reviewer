@@ -239,9 +239,9 @@ def test_a_failed_write_keeps_the_previous_login(tmp_path, monkeypatch):
 
     def boom(*a, **k):
         raise OSError("disk full")
-    monkeypatch.setattr(qbench_login.os, "replace", boom)
-    assert store.save("new@example.com", "new-pass") is False
-    monkeypatch.undo()
+    with monkeypatch.context() as mp:
+        mp.setattr(qbench_login.os, "replace", boom)
+        assert store.save("new@example.com", "new-pass") is False
     assert store.load() == (USER, SECRET)
     leftovers = [p.name for p in store.path.parent.iterdir() if p != store.path]
     assert leftovers == []
@@ -334,10 +334,10 @@ def test_a_save_that_fails_in_the_chosen_place_tries_the_other(tmp_path, monkeyp
         if path == store.primary:
             raise OSError("share went away")
         return real(path, data)
-    monkeypatch.setattr(qbench_login, "_write_atomic", flaky)
-    assert store.save(USER, SECRET) is True
-    assert store.fallback.is_file()
-    monkeypatch.undo()
+    with monkeypatch.context() as mp:
+        mp.setattr(qbench_login, "_write_atomic", flaky)
+        assert store.save(USER, SECRET) is True
+        assert store.fallback.is_file()
     assert store.load() == (USER, SECRET)
 
 
@@ -539,9 +539,9 @@ def test_a_briefly_locked_file_is_retried(tmp_path, monkeypatch):
         if calls["n"] <= 2:
             raise PermissionError(13, "The process cannot access the file")
         return real(src, dst)
-    monkeypatch.setattr(qbench_login.os, "replace", locked_twice)
-    assert store.save(USER, SECRET) is True
-    monkeypatch.undo()
+    with monkeypatch.context() as mp:
+        mp.setattr(qbench_login.os, "replace", locked_twice)
+        assert store.save(USER, SECRET) is True
     assert store.primary.is_file() and not store.fallback.exists(), (
         "a moment's lock is retried in place, not treated as an unusable folder"
     )
@@ -582,3 +582,24 @@ def test_the_username_is_only_logged_at_debug(tmp_path, caplog):
                if r.levelno == logging.DEBUG)
     assert not any(USER in r.getMessage() for r in caplog.records
                    if r.levelno > logging.DEBUG)
+
+
+def test_load_entry_reports_when_the_login_was_saved(tmp_path):
+    import time
+    store = _store(tmp_path)
+    assert store.load_entry() is None
+    before = time.time()
+    store.save(USER, SECRET)
+    entry = store.load_entry()
+    assert (entry.username, entry.password) == (USER, SECRET)
+    assert before - 1 <= entry.saved_at <= time.time() + 1
+
+
+def test_load_entry_tolerates_a_missing_or_bad_saved_at(tmp_path):
+    store = _store(tmp_path)
+    store.save(USER, SECRET)
+    doc = json.loads(store.path.read_text())
+    doc["saved_at"] = "not a time"
+    store.path.write_text(json.dumps(doc))
+    entry = store.load_entry()
+    assert entry.password == SECRET and entry.saved_at is None

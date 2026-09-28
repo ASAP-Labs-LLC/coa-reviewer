@@ -83,9 +83,9 @@ def test_save_config_is_atomic(isolated_app_paths, monkeypatch) -> None:
 
     def boom(*a, **k):
         raise OSError("disk full")
-    monkeypatch.setattr(app.os, "replace", boom)
-    assert app.save_config({"qbench_username": "carol"}) is False
-    monkeypatch.undo()
+    with monkeypatch.context() as mp:
+        mp.setattr(app.os, "replace", boom)
+        assert app.save_config({"qbench_username": "carol"}) is False
 
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_username"] == "bob"
     assert [p.name for p in cfg_path.parent.iterdir()] == [cfg_path.name]
@@ -119,15 +119,18 @@ def test_a_good_load_lifts_the_overwrite_guard(isolated_app_paths) -> None:
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_username"] == "bob"
 
 
-def test_a_config_repaired_since_the_failed_read_may_be_written(isolated_app_paths) -> None:
-    """The guard re-checks the file before refusing, so a transient read
-    failure at startup doesn't block every save until the next restart."""
+def test_a_config_repaired_since_the_failed_read_is_reloaded_not_overwritten(
+        isolated_app_paths) -> None:
+    """The dict handed to save_config was built while the file was unreadable
+    (from defaults), so it must not be written even once the file parses
+    again; the re-read clears the guard for the next, fresh save."""
     cfg_path, _ = isolated_app_paths
     cfg_path.write_text("not json{", encoding="utf-8")
     app.load_config()
     cfg_path.write_text(json.dumps({"qbench_username": "alice"}), encoding="utf-8")
+    assert app.save_config({"qbench_username": "bob"}) is False
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_username"] == "alice"
     assert app.save_config({"qbench_username": "bob"}) is True
-    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_username"] == "bob"
 
 
 def test_an_unreadable_file_that_has_gone_may_be_written(isolated_app_paths) -> None:

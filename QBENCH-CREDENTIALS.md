@@ -83,10 +83,12 @@ the browser never sees paths or storage errors.
 - **Moving off `web_app_config.json`** — older releases kept the password in
   plain text in `web_app_config.json`. On first start the app moves it into the
   store and blanks `qbench_password` there (the username stays, for display) —
-  only once the store has actually kept it. A release with the store always
-  blanks it, so a password found in the config later was written by an older
-  release (a rollback) and is the **newer** one: it is used first, and moved
-  over any stored login at the next start.
+  only once the store has actually kept it. If a config password and a stored
+  login both exist, the app decides by evidence which is newer: the config
+  wins only if the file was modified more than 2 s after the stored login's
+  `saved_at` (an older release wrote it after a rollback) and is then moved
+  over the stored login; otherwise the stored login wins and the old config
+  password is ignored until the next successful save removes it.
 - **Reset** — "Forget saved login" under the QBench login form (shown when a
   login is saved) clears every copy. By hand: stop the app and delete both
   files above (and blank `qbench_password` in `web_app_config.json` if it still

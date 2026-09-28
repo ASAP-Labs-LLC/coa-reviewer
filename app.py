@@ -372,10 +372,16 @@ def save_config(cfg: dict) -> bool:
     cleared up (a share that blinked) doesn't block saves until a restart."""
     try:
         if _config_unreadable and CONFIG_FILE.exists():
-            load_config()                       # clears the flag if it parses now
-        if _config_unreadable and CONFIG_FILE.exists():
-            logger.error("Not saving %s: it could not be read at startup, and "
-                         "writing now would replace it with defaults", CONFIG_FILE)
+            # ``cfg`` was built while the file couldn't be read — on top of
+            # defaults — so it is never written, even if the file parses now.
+            # Re-read it instead so the next change starts from the real one.
+            fresh = load_config()
+            if not _config_unreadable:
+                _refresh_state_config(fresh)
+            logger.error("Not saving %s: this change was made while the file could "
+                         "not be read and may be built on defaults (%s)", CONFIG_FILE,
+                         "it has been re-read; make the change again"
+                         if not _config_unreadable else "it is still unreadable")
             return False
         data = json.dumps(cfg, indent=2).encode("utf-8")
     except (OSError, TypeError, ValueError) as exc:
@@ -393,6 +399,39 @@ def save_config(cfg: dict) -> bool:
             pass
         return False
     return True
+
+
+def _refresh_state_config(cfg: dict) -> None:
+    st = globals().get("state")          # absent only while app.py is importing
+    if st is not None:
+        st.config = cfg
+
+
+_config_update_lock = threading.RLock()
+
+
+def update_config(changes: dict) -> bool:
+    """Change some keys of web_app_config.json and nothing else.
+
+    Always applied on top of a *fresh* read of the file, never on top of
+    ``state.config``, which may hold defaults from a startup read that failed
+    (writing those back would wipe report_config_id, labcore_url, ...). If the
+    file can't be read now, nothing is written and False is returned. On a
+    good read ``state.config`` becomes the file plus the change, even if the
+    write then fails (the change holds for this run). True once the file has
+    the change.
+    """
+    with _config_update_lock:
+        fresh = load_config()
+        if _config_unreadable and CONFIG_FILE.exists():
+            logger.error("Not changing %s (%s): it can't be read right now",
+                         CONFIG_FILE, ", ".join(sorted(changes)))
+            return False
+        merged = {**fresh, **changes}
+        _refresh_state_config(merged)
+        if all(fresh.get(k) == v for k, v in changes.items()) and CONFIG_FILE.exists():
+            return True                    # already so on disk; nothing to write
+        return save_config(merged)
 
 
 # ── QBench web login (username/password for COASession) ─────────────────────
@@ -417,20 +456,15 @@ login_store = _new_login_store(DATA_DIR)
 
 
 # Manual and automatic QBench logins can overlap: "Enter credentials manually"
-# is offered while a saved-login auto-login is still running. Every manual
-# login bumps this generation; an auto-login installs its session only if the
-# generation is unchanged since it started, and otherwise leaves shared state
-# (and every browser) alone — a stale saved password failing late must not
-# tear down, or a late success replace, the session a reviewer just made.
+# is offered while a saved-login auto-login is still running. A manual login
+# that *succeeds* bumps this generation when it installs its session; an
+# auto-login installs its own only if no manual login has succeeded since it
+# started, and otherwise leaves shared state (and every browser) alone — a
+# stale saved password failing late must not tear down, or a late success
+# replace, the session a reviewer just made. A manual attempt that fails
+# changes nothing, so it can't discard an auto-login that works.
 _login_lock = threading.Lock()
 _login_generation = 0
-
-
-def _begin_manual_login() -> int:
-    global _login_generation
-    with _login_lock:
-        _login_generation += 1
-        return _login_generation
 
 
 def _current_login_generation() -> int:
@@ -438,12 +472,17 @@ def _current_login_generation() -> int:
         return _login_generation
 
 
-def _install_qbench_session(session: "COASession", generation: int) -> bool:
-    """Make ``session`` the shared one, unless a newer login has started
-    since ``generation`` was taken. True if installed."""
+def _install_qbench_session(session: "COASession", generation: Optional[int] = None) -> bool:
+    """Make ``session`` the shared one. A manual login passes no generation:
+    it always installs and supersedes any auto-login in flight. An auto-login
+    passes the generation it started under and installs only if that is
+    still current. True if installed."""
+    global _login_generation
     with _login_lock:
-        if generation != _login_generation:
+        if generation is not None and generation != _login_generation:
             return False
+        if generation is None:
+            _login_generation += 1
         state.coa_session = session
         state.logged_in = True
         state.upload_queue = _wire_upload_queue(UploadQueue(state.api_client))
@@ -465,12 +504,36 @@ def _config_login() -> Optional[Tuple[str, str]]:
     return (username, password) if username and password else None
 
 
-def _stored_login() -> Optional[Tuple[str, str]]:
+def _stored_entry():
     try:
-        return login_store.load()
+        return login_store.load_entry()
     except Exception:                       # the store never raises; belt and braces
         cred_log.exception("Could not read the saved QBench login")
         return None
+
+
+def _stored_login() -> Optional[Tuple[str, str]]:
+    entry = _stored_entry()
+    return (entry.username, entry.password) if entry else None
+
+
+# A config password wins over the stored login only if the config file was
+# written this much after the login was saved (clock granularity, slow shares).
+CONFIG_NEWER_SLACK_SECONDS = 2.0
+
+
+def _config_login_is_newer(entry) -> bool:
+    """Decide by evidence which saved login is newer: the config file's mtime
+    against the store's ``saved_at``. The config wins when there is no stored
+    login or the store has no usable timestamp; the store wins when the
+    config's mtime can't be read."""
+    if entry is None or entry.saved_at is None:
+        return True
+    try:
+        mtime = CONFIG_FILE.stat().st_mtime
+    except OSError:
+        return False
+    return mtime > entry.saved_at + CONFIG_NEWER_SLACK_SECONDS
 
 
 def _save_login(username: str, password: str) -> bool:
@@ -482,39 +545,46 @@ def _save_login(username: str, password: str) -> bool:
 
 
 def get_qbench_login() -> Optional[Tuple[str, str]]:
-    """The saved QBench login.
-
-    A password in web_app_config.json wins when there is one: this release
-    blanks it as soon as the store has kept it, so one still there was
-    written later — by an older release after a rollback — or could not be
-    moved. Otherwise the store.
-    """
-    return _config_login() or _stored_login()
+    """The saved QBench login: whichever of the config password (older
+    releases, or one written after a rollback) and the store is newer — see
+    ``_config_login_is_newer``."""
+    legacy = _config_login()
+    entry = _stored_entry()
+    if legacy and _config_login_is_newer(entry):
+        return legacy
+    return (entry.username, entry.password) if entry else None
 
 
 def _blank_config_password() -> bool:
-    """Remove a legacy password from web_app_config.json (username stays, for
-    display). True if the config no longer holds one."""
-    if not state.config.get("qbench_password"):
+    """Take the password out of web_app_config.json (the username stays, for
+    display). In memory always — this run must use the store's login — and on
+    disk via ``update_config``. True if the file no longer holds one."""
+    state.config = dict(state.config, qbench_password="")
+    if update_config({"qbench_password": ""}):
         return True
-    updated = dict(state.config, qbench_password="")
-    if not save_config(updated):
-        return False
-    state.config = updated
-    return True
+    cred_log.warning("Could not remove the old QBench password from "
+                     "web_app_config.json; it is ignored and will be removed "
+                     "on the next successful save")
+    return False
 
 
 def migrate_login_out_of_config() -> bool:
     """Move a login out of web_app_config.json into the store.
 
-    Whenever the config holds a username *and* password — also when the store
-    already has a login: this release blanks the config password once the
-    store has it, so one still there is newer (an older release wrote it after
-    a rollback) and replaces the stored one. The config's password is blanked
-    only once the store has actually kept it. True if a login was moved.
+    Only when the config's password is the newer one (``_config_login_is_newer``:
+    no stored login, or an older release wrote it after a rollback) — it then
+    replaces any stored login. An older config password is ignored for this
+    run and left for the next successful save to remove. The config's
+    password is blanked only once the store has actually kept it. True if a
+    login was moved.
     """
     legacy = _config_login()
     if legacy is None:
+        return False
+    if not _config_login_is_newer(_stored_entry()):
+        cred_log.info("Ignoring an older QBench password in web_app_config.json: "
+                      "the saved login is newer")
+        state.config = dict(state.config, qbench_password="")
         return False
     if not _save_login(*legacy):
         cred_log.warning("Kept the QBench login in web_app_config.json: it could "
@@ -523,9 +593,6 @@ def migrate_login_out_of_config() -> bool:
     if _blank_config_password():
         cred_log.info("moved saved QBench login out of web_app_config.json into %s",
                       login_store.path)
-    else:
-        cred_log.warning("Saved the QBench login in %s but could not remove it from "
-                         "web_app_config.json", login_store.path)
     return True
 
 
@@ -4337,8 +4404,6 @@ def login():
     if not username or not password:
         return jsonify({"error": "Username and password required"}), 400
 
-    # A manual login supersedes any auto-login still in flight.
-    generation = _begin_manual_login()
     session = COASession(
         username=username,
         password=password,
@@ -4351,9 +4416,8 @@ def login():
     except Exception as exc:
         ustate.emit_status(f"Login failed: {exc}")
         return jsonify({"error": str(exc)}), 401
-    if not _install_qbench_session(session, generation):
-        # Another manual login started after this one; it owns the session.
-        cred_log.info("manual QBench login superseded by a newer one")
+    # Supersedes any auto-login still in flight (see _login_generation).
+    _install_qbench_session(session)
     ustate.emit_status("Logged in successfully.")
 
     # Remember it only once QBench has accepted it, so a typo never becomes
@@ -4380,11 +4444,11 @@ def forget_qbench_login():
     # The store is where a login lives now; if it cleared, the login is
     # forgotten. A config that can't be written only matters if it still
     # holds a legacy password, and save_config has already logged why.
-    updated = dict(state.config, qbench_username="", qbench_password="")
-    if not save_config(updated):
+    if not update_config({"qbench_username": "", "qbench_password": ""}):
         cred_log.warning("Forgot the saved QBench login, but could not blank it in "
                          "web_app_config.json")
-    state.config = updated                  # forgotten for this run either way
+        # Forgotten for this run either way (in memory only).
+        state.config = dict(state.config, qbench_username="", qbench_password="")
     cred_log.info("Saved QBench login forgotten by %s (%s)",
                   getattr(get_user_state(), "name", "?"),
                   "done" if cleared else "incomplete")

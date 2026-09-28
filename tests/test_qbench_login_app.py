@@ -96,12 +96,30 @@ def test_the_store_is_used_when_the_config_has_no_password(env):
     assert app_module.get_qbench_login() == (USER, SECRET)
 
 
-def test_a_config_password_is_newer_than_the_stored_one(env):
-    """Only an older release (after a rollback) writes a password into the
-    config, so if migration could not move it, it is still the one to use."""
+def _age(path, seconds):
+    """Set a file's mtime ``seconds`` from now (negative = in the past)."""
+    import os
+    import time
+    t = time.time() + seconds
+    os.utime(path, (t, t))
+
+
+def test_a_config_written_after_the_store_wins(env):
+    """Rollback case: an older release wrote a newer password into the config."""
     _, store, cfg_path = env
     store.save("old@example.com", "old-pass")
     _legacy_config(cfg_path)
+    _age(cfg_path, +30)
+    assert app_module.get_qbench_login() == (USER, SECRET)
+
+
+def test_a_store_saved_after_the_config_wins(env):
+    """Blank-failed case: the config write failed after a newer login was
+    stored. The old config password must not be used."""
+    _, store, cfg_path = env
+    _legacy_config(cfg_path, "old@example.com", "old-pass")
+    _age(cfg_path, -300)
+    store.save(USER, SECRET)
     assert app_module.get_qbench_login() == (USER, SECRET)
 
 
@@ -169,24 +187,32 @@ def test_migration_uses_the_fallback_when_appdata_is_unusable(env):
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_password"] == ""
 
 
-def test_a_config_password_is_newer_than_the_store_and_wins(env):
-    """A release with the login store always blanks the config password once
-    it has saved it, so a password still in the config was written later —
-    by an older release after a rollback. On roll-forward it must replace the
-    store's (older) login and leave the config, not linger there in plain
-    text while the stale stored one is used."""
+def test_migration_moves_a_newer_config_password_over_the_store(env):
     _, store, cfg_path = env
     store.save("stored@example.com", "stored-pass")
     _legacy_config(cfg_path, USER, SECRET)
+    _age(cfg_path, +30)
     assert app_module.migrate_login_out_of_config() is True
     assert store.load() == (USER, SECRET)
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_password"] == ""
+
+
+def test_migration_never_replaces_a_newer_stored_login_with_an_older_config(env):
+    _, store, cfg_path = env
+    _legacy_config(cfg_path, "old@example.com", "old-pass")
+    _age(cfg_path, -300)
+    store.save(USER, SECRET)
+    assert app_module.migrate_login_out_of_config() is False
+    assert store.load() == (USER, SECRET)
+    # Left on disk (ignored); the next successful save blanks it.
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_password"] == "old-pass"
 
 
 def test_a_failed_overwrite_keeps_both_as_they_were(env, monkeypatch):
     _, store, cfg_path = env
     store.save("stored@example.com", "stored-pass")
     _legacy_config(cfg_path, USER, SECRET)
+    _age(cfg_path, +30)
     monkeypatch.setattr(store, "save", lambda *a: False)
     assert app_module.migrate_login_out_of_config() is False
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_password"] == SECRET
@@ -453,3 +479,110 @@ def test_an_auto_login_failure_on_its_own_is_reported(env, monkeypatch):
     assert done and done[-1]["ok"] is False
     assert app_module.state.coa_session is None
     assert app_module.state.logged_in is False
+
+
+# ── a config that recovers must never be overwritten with defaults ───────
+
+REAL_CONFIG = {"report_config_id": "42", "labcore_host": "labpc",
+               "change_log_dir": "/share/changelog", "qbench_username": USER,
+               "qbench_password": "old-pass"}
+
+
+def _recovered_after_a_bad_startup_read(cfg_path):
+    """Startup read a truncated file (state.config = defaults), then the file
+    came back whole — a share that blinked."""
+    cfg_path.write_text('{"report_config_id": "4', encoding="utf-8")
+    app_module.state.config = app_module.load_config()
+    assert app_module.state.config == app_module.DEFAULT_CONFIG
+    cfg_path.write_text(json.dumps(REAL_CONFIG), encoding="utf-8")
+    _age(cfg_path, -300)
+
+
+def _real_keys_survived(cfg_path):
+    on_disk = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert on_disk["report_config_id"] == "42"
+    assert on_disk["labcore_host"] == "labpc"
+    assert on_disk["change_log_dir"] == "/share/changelog"
+    return on_disk
+
+
+def test_forget_after_a_recovered_config_keeps_its_real_keys(env):
+    client, _, cfg_path = env
+    _recovered_after_a_bad_startup_read(cfg_path)
+    assert client.post("/api/qbench-login/forget").get_json() == {"ok": True}
+    on_disk = _real_keys_survived(cfg_path)
+    assert on_disk["qbench_password"] == "" and on_disk["qbench_username"] == ""
+    assert app_module.state.config["report_config_id"] == "42"
+
+
+def test_a_saved_login_after_a_recovered_config_keeps_its_real_keys(env):
+    client, store, cfg_path = env
+    _recovered_after_a_bad_startup_read(cfg_path)
+    body = client.post("/api/login", json={"username": USER, "password": SECRET,
+                                           "save": True}).get_json()
+    assert body == {"ok": True, "saved": True}
+    on_disk = _real_keys_survived(cfg_path)
+    assert on_disk["qbench_password"] == ""
+    assert store.load() == (USER, SECRET)
+
+
+def test_save_config_refuses_a_dict_built_while_the_file_was_unreadable(env):
+    _, _, cfg_path = env
+    _recovered_after_a_bad_startup_read(cfg_path)
+    assert app_module.save_config(dict(app_module.state.config)) is False
+    _real_keys_survived(cfg_path)
+    # ...but it refreshed state.config from the recovered file.
+    assert app_module.state.config["report_config_id"] == "42"
+
+
+# ── a new login beats an old config password it couldn't blank ──────────
+
+def test_a_login_whose_config_blank_fails_is_still_the_one_used(env, monkeypatch):
+    client, store, cfg_path = env
+    _legacy_config(cfg_path, "old@example.com", "old-pass")
+    _age(cfg_path, -300)
+    # context(), not undo(): undo would also revert the fixture's fake
+    # COASession, and the next login would reach the real QBench.
+    with monkeypatch.context() as mp:
+        mp.setattr(app_module, "save_config", lambda cfg: False)
+        body = client.post("/api/login", json={"username": USER, "password": SECRET,
+                                               "save": True}).get_json()
+        assert body == {"ok": True, "saved": True}
+        assert app_module.state.config["qbench_password"] == ""       # in memory
+        assert app_module.get_qbench_login() == (USER, SECRET)
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_password"] == "old-pass"
+    # The next successful save blanks the stale one on disk.
+    client.post("/api/login", json={"username": USER, "password": SECRET, "save": True})
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_password"] == ""
+
+
+# ── only a manual login that works supersedes the automatic one ──────────
+
+def test_a_failed_manual_login_does_not_discard_a_working_auto_login(env, monkeypatch):
+    client, store, _ = env
+    store.save(BlockingSession.auto_user, "saved-pass")
+    BlockingSession.entered = threading.Event()
+    BlockingSession.release = threading.Event()
+    BlockingSession.auto_fails = False
+
+    class ManualFails(BlockingSession):
+        def login(self, headless=True):
+            if self.username != BlockingSession.auto_user:
+                raise RuntimeError("typo")
+            return super().login(headless)
+
+    monkeypatch.setattr(app_module, "COASession", ManualFails)
+    events = []
+    monkeypatch.setattr(app_module.state, "broadcast_sse", events.append)
+    auto = threading.Thread(target=app_module.auto_login_from_saved_creds)
+    auto.start()
+    assert BlockingSession.entered.wait(5)
+    resp = client.post("/api/login", json={"username": USER, "password": "typo",
+                                           "save": False})
+    assert resp.status_code == 401
+    BlockingSession.release.set()
+    auto.join(5)
+    assert app_module.state.logged_in is True
+    assert app_module.state.coa_session.username == BlockingSession.auto_user
+    done = [e for e in events if e.get("type") == "auto_login_done"]
+    assert done == [{"type": "auto_login_done", "ok": True}]

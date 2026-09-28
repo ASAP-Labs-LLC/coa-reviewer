@@ -47,7 +47,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Optional, Protocol, Tuple, Union
+from typing import Iterator, NamedTuple, Optional, Protocol, Tuple, Union
 
 __all__ = [
     "CryptoError",
@@ -74,6 +74,19 @@ CRYPTPROTECT_UI_FORBIDDEN = 0x1
 PathLike = Union[str, os.PathLike]
 
 _plain_notice_logged = False
+
+
+class SavedLogin(NamedTuple):
+    username: str
+    password: str
+    saved_at: Optional[float]       # epoch seconds; None if unrecorded/unparseable
+
+
+def _parse_saved_at(value) -> Optional[float]:
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 class CryptoError(RuntimeError):
@@ -386,6 +399,13 @@ class LoginStore:
     def load(self) -> Optional[Tuple[str, str]]:
         """``(username, password)`` from the first place that has a readable
         login, else ``None``. Never raises."""
+        entry = self.load_entry()
+        return (entry.username, entry.password) if entry else None
+
+    @_locked
+    def load_entry(self) -> Optional[SavedLogin]:
+        """The login plus when it was saved (``saved_at``, epoch seconds), so a
+        caller can tell it from an older or newer copy elsewhere. Never raises."""
         for path in self._locations():
             try:
                 found = self._load_one(path)
@@ -397,7 +417,7 @@ class LoginStore:
                 return found
         return None
 
-    def _load_one(self, path: Path) -> Optional[Tuple[str, str]]:
+    def _load_one(self, path: Path) -> Optional[SavedLogin]:
         try:
             raw = _read_bounded(path)
         except (OSError, ValueError) as exc:
@@ -417,7 +437,7 @@ class LoginStore:
                             "(%s); ignoring it", path, type(exc).__name__)
         return None
 
-    def _decode(self, raw: bytes) -> Tuple[str, str]:
+    def _decode(self, raw: bytes) -> SavedLogin:
         doc = json.loads(raw.decode("utf-8"))
         if not isinstance(doc, dict) or doc.get("version") != FILE_VERSION:
             raise ValueError("unsupported file version")
@@ -443,7 +463,7 @@ class LoginStore:
         password = secret.decode("utf-8")
         if not username.strip() or not password.strip():
             raise ValueError("blank login")
-        return username, password
+        return SavedLogin(username, password, _parse_saved_at(doc.get("saved_at")))
 
     # ── save ─────────────────────────────────────────────────────────────
 
@@ -477,7 +497,7 @@ class LoginStore:
         if field is None:
             return False
         doc = {"version": FILE_VERSION, "username": username, "password": field,
-               "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+               "saved_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
         try:
             _write_atomic(path, json.dumps(doc, indent=2).encode("utf-8"))
         except OSError as exc:
