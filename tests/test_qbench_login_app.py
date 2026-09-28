@@ -337,3 +337,85 @@ def test_a_credential_problem_never_crashes_boot(env, monkeypatch):
     app_module._start_login_store()                    # does not raise
     assert app_module.get_qbench_login() is None
     app_module.auto_login_from_saved_creds()            # does not raise
+
+
+# ── manual and automatic logins must not undo each other ───────────────
+
+import threading  # noqa: E402
+
+
+class BlockingSession(FakeSession):
+    """The saved login's session: login() waits until the test releases it,
+    so a manual login can finish first. Other usernames sign in at once."""
+
+    entered = None
+    release = None
+    auto_user = "stale@example.com"
+    auto_fails = True
+
+    def login(self, headless=True):
+        if self.username != BlockingSession.auto_user:
+            return
+        BlockingSession.entered.set()
+        assert BlockingSession.release.wait(5), "test never released the auto-login"
+        if BlockingSession.auto_fails:
+            raise RuntimeError("Invalid password")
+
+
+def _race(env, monkeypatch, *, auto_fails: bool):
+    client, store, _ = env
+    store.save(BlockingSession.auto_user, "old-pass")
+    BlockingSession.entered = threading.Event()
+    BlockingSession.release = threading.Event()
+    BlockingSession.auto_fails = auto_fails
+    monkeypatch.setattr(app_module, "COASession", BlockingSession)
+    events = []
+    monkeypatch.setattr(app_module.state, "broadcast_sse", events.append)
+
+    auto = threading.Thread(target=app_module.auto_login_from_saved_creds)
+    auto.start()
+    assert BlockingSession.entered.wait(5)
+    body = client.post("/api/login", json={"username": USER, "password": SECRET,
+                                           "save": False}).get_json()
+    assert body["ok"] is True
+    manual = app_module.state.coa_session
+    assert manual is not None and manual.username == USER
+
+    BlockingSession.release.set()
+    auto.join(5)
+    assert not auto.is_alive()
+    return manual, [e for e in events if e.get("type") == "auto_login_done"]
+
+
+def test_a_late_auto_login_failure_leaves_the_manual_login_alone(env, monkeypatch):
+    manual, done = _race(env, monkeypatch, auto_fails=True)
+    assert app_module.state.coa_session is manual
+    assert app_module.state.logged_in is True
+    assert done == [], "a superseded auto-login must not tell browsers it failed"
+
+
+def test_a_late_auto_login_success_does_not_replace_the_manual_session(env, monkeypatch):
+    manual, done = _race(env, monkeypatch, auto_fails=False)
+    assert app_module.state.coa_session is manual
+    assert app_module.state.logged_in is True
+    assert done == []
+
+
+def test_a_superseded_auto_login_says_so_in_the_log(env, monkeypatch, caplog):
+    with caplog.at_level(logging.INFO):
+        _race(env, monkeypatch, auto_fails=True)
+    assert any("auto-login superseded by a manual login" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_an_auto_login_failure_on_its_own_is_reported(env, monkeypatch):
+    _, store, _ = env
+    store.save(USER, SECRET)
+    FakeSession.fail_with = "Invalid password"
+    events = []
+    monkeypatch.setattr(app_module.state, "broadcast_sse", events.append)
+    app_module.auto_login_from_saved_creds()
+    done = [e for e in events if e.get("type") == "auto_login_done"]
+    assert done and done[-1]["ok"] is False
+    assert app_module.state.coa_session is None
+    assert app_module.state.logged_in is False

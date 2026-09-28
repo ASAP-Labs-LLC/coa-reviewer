@@ -411,6 +411,40 @@ def _new_login_store(data_dir: Path) -> LoginStore:
 login_store = _new_login_store(DATA_DIR)
 
 
+# Manual and automatic QBench logins can overlap: "Enter credentials manually"
+# is offered while a saved-login auto-login is still running. Every manual
+# login bumps this generation; an auto-login installs its session only if the
+# generation is unchanged since it started, and otherwise leaves shared state
+# (and every browser) alone — a stale saved password failing late must not
+# tear down, or a late success replace, the session a reviewer just made.
+_login_lock = threading.Lock()
+_login_generation = 0
+
+
+def _begin_manual_login() -> int:
+    global _login_generation
+    with _login_lock:
+        _login_generation += 1
+        return _login_generation
+
+
+def _current_login_generation() -> int:
+    with _login_lock:
+        return _login_generation
+
+
+def _install_qbench_session(session: "COASession", generation: int) -> bool:
+    """Make ``session`` the shared one, unless a newer login has started
+    since ``generation`` was taken. True if installed."""
+    with _login_lock:
+        if generation != _login_generation:
+            return False
+        state.coa_session = session
+        state.logged_in = True
+        state.upload_queue = _wire_upload_queue(UploadQueue(state.api_client))
+        return True
+
+
 def _is_health_check() -> bool:
     """True when the updater is starting this release on a scratch port just
     to prove it boots (``COA_HEALTH_CHECK``). Such a process must not sign in
@@ -4289,7 +4323,9 @@ def login():
     if not username or not password:
         return jsonify({"error": "Username and password required"}), 400
 
-    state.coa_session = COASession(
+    # A manual login supersedes any auto-login still in flight.
+    generation = _begin_manual_login()
+    session = COASession(
         username=username,
         password=password,
         report_config_id=state.config.get("report_config_id", REPORT_CONFIG_ID),
@@ -4297,13 +4333,14 @@ def login():
 
     try:
         ustate.emit_status("Logging in to QBench…")
-        state.coa_session.login(headless=True)
-        state.logged_in = True
-        state.upload_queue = _wire_upload_queue(UploadQueue(state.api_client))
-        ustate.emit_status("Logged in successfully.")
+        session.login(headless=True)
     except Exception as exc:
         ustate.emit_status(f"Login failed: {exc}")
         return jsonify({"error": str(exc)}), 401
+    if not _install_qbench_session(session, generation):
+        # Another manual login started after this one; it owns the session.
+        cred_log.info("manual QBench login superseded by a newer one")
+    ustate.emit_status("Logged in successfully.")
 
     # Remember it only once QBench has accepted it, so a typo never becomes
     # the login every later start tries. Not saving leaves an existing saved
@@ -6942,25 +6979,33 @@ def auto_login_from_saved_creds() -> None:
         logger.info(msg)
         state.broadcast_sse({"type": "status", "message": msg})
 
+    # Built in a local and installed only if no manual login has started
+    # meanwhile (see _login_generation). It never touches shared state until
+    # then, so a failure has nothing to undo.
+    generation = _current_login_generation()
     _status(f"Connecting to QBench as {username}…")
-    state.coa_session = COASession(
+    session = COASession(
         username=username,
         password=password,
         report_config_id=cfg.get("report_config_id", REPORT_CONFIG_ID),
     )
     try:
         _status("Launching headless browser…")
-        state.coa_session.login(headless=True)
-        state.logged_in = True
-        state.upload_queue = _wire_upload_queue(UploadQueue(state.api_client))
-        _status("QBench login successful!")
-        state.broadcast_sse({"type": "auto_login_done", "ok": True})
+        session.login(headless=True)
     except Exception as exc:
+        if generation != _current_login_generation():
+            logger.info("auto-login superseded by a manual login (it failed: %s)", exc)
+            return
         logger.error("Auto-login failed: %s", exc, exc_info=True)
-        state.coa_session = None
         err = str(exc)
         _status(f"Login failed: {err}")
         state.broadcast_sse({"type": "auto_login_done", "ok": False, "error": err})
+        return
+    if not _install_qbench_session(session, generation):
+        logger.info("auto-login superseded by a manual login; keeping the manual session")
+        return
+    _status("QBench login successful!")
+    state.broadcast_sse({"type": "auto_login_done", "ok": True})
 
 
 def _port_has_listener(port: int, probe_timeout: float = 0.5) -> bool:

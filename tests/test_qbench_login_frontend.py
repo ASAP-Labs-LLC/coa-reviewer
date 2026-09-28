@@ -82,7 +82,7 @@ def test_no_ninety_second_gate_on_the_button():
 def test_auto_login_success_closes_the_manual_login_form():
     sse = _fn("handleSSE")
     case = sse[sse.index('case "auto_login_done"'):]
-    case = case[:case.index("break;")]
+    case = case[:case.index("\n            break;")]   # the case's own final break
     ok_branch = case[case.index("if (data.ok)"):case.index("} else {")]
     assert 'hideModal("login-modal")' in ok_branch
 
@@ -134,3 +134,13 @@ def test_unsaved_login_note_is_plain_english_and_conditional():
 def test_ui_never_mentions_storage_details():
     for word in ("APPDATA", "DPAPI", "qbench_login.json", "coa-qbench-login"):
         assert word not in APP_JS and word not in INDEX, word
+
+
+def test_a_late_auto_login_failure_never_covers_a_working_app():
+    sse = _fn("handleSSE")
+    case = sse[sse.index('case "auto_login_done"'):]
+    case = case[:case.index("\n            break;")]   # the case's own final break
+    guard = case.index('!$("#app").classList.contains("hidden")')
+    assert guard < case.index('showModal("login-modal")'), (
+        "ok:false must be ignored once the app is on screen (a manual login won)"
+    )

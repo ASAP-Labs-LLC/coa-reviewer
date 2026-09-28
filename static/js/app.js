@@ -1083,6 +1083,9 @@ function handleSSE(data) {
             break;
         case "auto_login_done":
             stopAutoLoginPoll();
+            // A manual login already put the app on screen: an automatic
+            // one that failed later is old news, never a reason to cover it.
+            if (!data.ok && !$("#app").classList.contains("hidden")) break;
             hideModal("boot-splash");
             if (data.ok) {
                 // The reviewer may have opened the manual form meanwhile;
