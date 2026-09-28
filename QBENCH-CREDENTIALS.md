@@ -41,6 +41,51 @@ Create the file with `0600` permissions. Nothing in any repo writes it.
 the store path. It never returns `None` — a `None` secret would surface much
 later as a confusing auth failure.
 
+## COA Reviewer's QBench web login
+
+Separate from the OAuth client above: COA Reviewer also signs in to QBench's
+**website** (Playwright, for COA previews) with a person's username and
+password. When a reviewer ticks "Save credentials", that login is kept by
+`qbench_login.py` — outside the release, so it survives every update.
+
+**The app picks the location itself. Nobody needs to create, copy or fix
+anything.** At startup and before every save it tries, in order:
+
+| Where | When |
+|---|---|
+| `%APPDATA%\ASAPLabs\coa-qbench-login.json` (next to `qbench.json`) | the app can create the folder, write, read and delete there, **and** Windows DPAPI works for this account |
+| `qbench_login.json` in the app's data folder (`C:\ASAPApps\coa\data` when deployed) | the first place can't be used |
+
+Loading looks in both (chosen place first), so a login saved in either is found
+after an update. A successful save removes any older copy in the other place.
+`app.log` records which place was chosen and why (logger `coa.credentials`);
+the browser never sees paths or storage errors.
+
+- **Encryption** — on Windows the password is encrypted with DPAPI
+  (`CryptProtectData`, current-user scope, fixed entropy). Only the **same
+  Windows account on the same machine** can decrypt it. If DPAPI fails on the
+  account, the fallback file is written base64-only (logged as a WARNING). On
+  macOS/Linux (dev boxes) it is base64-only with file mode `0600`.
+- **Same-user caveat** — the app runs as whichever Windows account launched it
+  (under the updater: the account its scheduled task runs as). A login saved by
+  a different account can't be decrypted; the app logs "saved by a different
+  Windows account?" and simply shows the manual login. Signing in again with
+  "Save credentials" ticked replaces it.
+- **If nothing can be saved** — the login still works for that session and the
+  form says, in plain words, that it will be asked for again after a restart.
+- **Moving off `web_app_config.json`** — older releases kept the password in
+  plain text in `web_app_config.json`. On first start the app moves it into the
+  store and blanks `qbench_password` there (the username stays, for display) —
+  only once the store has actually kept it. If the store already has a login,
+  the config is left alone.
+- **Reset** — "Forget saved login" under the QBench login form (shown when a
+  login is saved) clears every copy. By hand: stop the app and delete both
+  files above (and blank `qbench_password` in `web_app_config.json` if it still
+  has one). `COA_QBENCH_LOGIN_PATH` overrides the first location (the tests
+  point it at a temp file).
+- **Health checks never sign in** — the updater starts each staged release with
+  `COA_HEALTH_CHECK=1`, and the app skips the automatic QBench login then.
+
 ## Guard
 
 `tests/test_no_hardcoded_credentials.py` fails if any `CLIENT_ID` /

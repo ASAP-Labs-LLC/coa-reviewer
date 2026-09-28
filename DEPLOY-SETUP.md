@@ -42,6 +42,12 @@ deployed by a coa-reviewer release tag — `updater.py` lives outside the
 `C:\ASAPApps\updater\updater.py` and restart the updater's scheduled task so
 it picks up the new file.
 
+The same copy step also brings in `COA_HEALTH_CHECK=1` for the staging health
+check (`launch_env(..., for_health_check=True)`): with it, the throwaway copy a
+release is health-checked on no longer signs in to QBench with the saved login.
+Until the new `updater.py` is in place, a health check still does sign in (as
+it always has) — harmless, just a second short-lived Playwright session.
+
 **Until that is done**, Restart still works — it just falls back to a normal
 restart (same version, no switch) after `restart_update.PICKUP_SECONDS`
 (~60 s), because the old `updater.py` never claims the `switch-requested`
@@ -116,7 +122,16 @@ Shape, with four named OAuth client pairs:
 }
 ```
 
-**If this file is missing, the apps will not start** — they raise
+COA Reviewer's QBench **web** login (the username/password a reviewer saves at
+the "QBench Login" form) is a separate, self-managing store — see
+`QBENCH-CREDENTIALS.md`. No setup is needed: the app keeps it in
+`%APPDATA%\ASAPLabs\coa-qbench-login.json`, DPAPI-encrypted, or falls back to
+`C:\ASAPApps\coa\data\qbench_login.json` by itself. It is **per Windows
+user**: DPAPI ties it to the account the app runs as — under the updater, the
+account its scheduled task runs as. Changing that account means the reviewer
+signs in once more; nothing breaks.
+
+**If `qbench.json` is missing, the apps will not start** — they raise
 `QBenchSecretMissing` naming the key and path. See `QBENCH-CREDENTIALS.md` in
 either repo. Ask the human for the values; do not invent them and do not commit
 them anywhere.
