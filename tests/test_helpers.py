@@ -119,6 +119,17 @@ def test_a_good_load_lifts_the_overwrite_guard(isolated_app_paths) -> None:
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_username"] == "bob"
 
 
+def test_a_config_repaired_since_the_failed_read_may_be_written(isolated_app_paths) -> None:
+    """The guard re-checks the file before refusing, so a transient read
+    failure at startup doesn't block every save until the next restart."""
+    cfg_path, _ = isolated_app_paths
+    cfg_path.write_text("not json{", encoding="utf-8")
+    app.load_config()
+    cfg_path.write_text(json.dumps({"qbench_username": "alice"}), encoding="utf-8")
+    assert app.save_config({"qbench_username": "bob"}) is True
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_username"] == "bob"
+
+
 def test_an_unreadable_file_that_has_gone_may_be_written(isolated_app_paths) -> None:
     cfg_path, _ = isolated_app_paths
     cfg_path.write_text("not json{", encoding="utf-8")

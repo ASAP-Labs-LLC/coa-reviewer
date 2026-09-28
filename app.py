@@ -367,8 +367,12 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> bool:
     """Write the config atomically. False (and nothing written) on failure,
-    or while an existing file is unreadable — see ``_config_unreadable``."""
+    or while an existing file is unreadable — see ``_config_unreadable``.
+    The file is re-read before refusing, so a read failure that has since
+    cleared up (a share that blinked) doesn't block saves until a restart."""
     try:
+        if _config_unreadable and CONFIG_FILE.exists():
+            load_config()                       # clears the flag if it parses now
         if _config_unreadable and CONFIG_FILE.exists():
             logger.error("Not saving %s: it could not be read at startup, and "
                          "writing now would replace it with defaults", CONFIG_FILE)
@@ -4373,11 +4377,14 @@ def forget_qbench_login():
     except Exception:
         cred_log.exception("Could not forget the saved QBench login")
         cleared = False
+    # The store is where a login lives now; if it cleared, the login is
+    # forgotten. A config that can't be written only matters if it still
+    # holds a legacy password, and save_config has already logged why.
     updated = dict(state.config, qbench_username="", qbench_password="")
-    if save_config(updated):
-        state.config = updated
-    else:
-        cleared = False
+    if not save_config(updated):
+        cred_log.warning("Forgot the saved QBench login, but could not blank it in "
+                         "web_app_config.json")
+    state.config = updated                  # forgotten for this run either way
     cred_log.info("Saved QBench login forgotten by %s (%s)",
                   getattr(get_user_state(), "name", "?"),
                   "done" if cleared else "incomplete")

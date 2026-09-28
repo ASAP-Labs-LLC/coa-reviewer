@@ -272,6 +272,18 @@ def test_forget_clears_both_locations_and_the_config(env):
     assert app_module.get_qbench_login() is None
 
 
+def test_forget_succeeds_when_the_store_clears_even_if_the_config_write_fails(
+        env, monkeypatch, caplog):
+    client, store, _ = env
+    store.save(USER, SECRET)
+    monkeypatch.setattr(app_module, "save_config", lambda cfg: False)
+    with caplog.at_level(logging.WARNING, logger="coa.credentials"):
+        body = client.post("/api/qbench-login/forget").get_json()
+    assert body == {"ok": True}
+    assert store.load() is None
+    assert any("web_app_config.json" in r.getMessage() for r in caplog.records)
+
+
 def test_forget_requires_a_portal_session(env):
     anon = app_module.app.test_client()
     assert anon.post("/api/qbench-login/forget").status_code == 401
