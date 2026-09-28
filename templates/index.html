@@ -165,10 +165,12 @@
             <p id="boot-msg" style="color:#666; margin:16px 0;">Logging in to QBench...</p>
             <div class="spinner"></div>
             <div id="boot-status-log" class="boot-status-log"></div>
-            <div id="boot-slow-notice" class="hidden" style="margin-top:16px;">
-                <p style="color:var(--text-muted);font-size:12px;margin-bottom:8px;">Taking longer than expected.</p>
-                <button id="boot-show-login" class="btn btn-sm">Enter Credentials Manually</button>
-            </div>
+            <!-- Always offered, from the first moment: signing in by hand
+                 never has to wait for a slow automatic login to give up.
+                 The automatic one keeps going behind it; whichever finishes
+                 first wins. -->
+            <p id="boot-slow-notice" class="boot-slow-notice hidden">Taking longer than expected.</p>
+            <button id="boot-show-login" class="btn btn-sm boot-manual-login">Enter credentials manually</button>
         </div>
     </div>
 
@@ -208,6 +210,8 @@
                 <button id="login-btn" class="btn btn-primary">Login & Start</button>
             </div>
             <div id="login-error" class="error-text"></div>
+            <p id="login-note" class="login-note hidden"></p>
+            <button type="button" id="login-forget" class="portal-switch-link hidden">Forget saved login</button>
         </div>
     </div>
 

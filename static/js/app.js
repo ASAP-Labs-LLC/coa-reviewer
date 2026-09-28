@@ -36,7 +36,17 @@ const INACTIVITY_MS = 10 * 60 * 1000;  // 10 minutes
 // settles into, short enough that an abandoned browser still times out.
 const PULL_STALL_MS = 90 * 1000;
 let _lastPullProgress = 0;
-const SLOW_LOGIN_MS = 90 * 1000;        // 90 seconds before showing manual login option
+// After this long on the boot splash a muted "Taking longer than expected."
+// note appears. It gates nothing: "Enter credentials manually" is offered from
+// the first moment.
+const SLOW_LOGIN_MS = 90 * 1000;
+// While a saved-login auto-login runs, /api/config is polled in case the
+// auto_login_done SSE was broadcast before this page connected. Bounded:
+// 200 × 3 s is 10 minutes, far past any real login.
+const AUTO_LOGIN_POLL_MS = 3000;
+const AUTO_LOGIN_POLL_MAX = 200;
+// Shown only when a login worked but could not be remembered on this computer.
+const UNSAVED_LOGIN_NOTE = "Signed in, but this computer couldn’t remember your login — you’ll be asked again after a restart.";
 
 // ── DOM refs ─────────────────────────────────────────────────────────
 const $ = (sel) => document.querySelector(sel);
@@ -68,6 +78,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     initAntigravity();
     initReviewModeModal();
     initDoubleCheckLink();
+    // The boot splash can go up on several paths (server still starting,
+    // saved-login auto-login); its manual-login button works on all of them.
+    initBootManualLogin();
 
     // Step 1: Check portal session (POST so Cloudflare never caches the result).
     // The try/catch here is strictly for NETWORK errors — its reload-in-3s
@@ -429,7 +442,7 @@ async function initQBenchApp() {
         const cfg = await resp.json();
         setAppVersion(cfg.version);
         if (cfg.username) $("#login-username").value = cfg.username;
-        if (cfg.has_password) $("#login-password").placeholder = "(saved)";
+        setSavedLoginUi(cfg.has_password);
 
         if (cfg.logged_in) {
             hideModal("boot-splash");
@@ -439,39 +452,17 @@ async function initQBenchApp() {
                 await restoreAllTabs();
             }
         } else if (cfg.has_password) {
-            // Saved creds — auto-login in progress
+            // Saved login — auto-login in progress. "Enter credentials
+            // manually" is already on the splash; it does not stop this.
             $("#boot-msg").textContent = "Logging in to QBench...";
             appendBootStatus("Connecting to QBench...");
             connectSSE();
-            // Poll /api/config every 3 s in case the SSE auto_login_done event
-            // was broadcast before this connection was established (race condition).
-            const pollTimer = setInterval(async () => {
-                if ($("#boot-splash").classList.contains("hidden")) {
-                    clearInterval(pollTimer);
-                    return;
-                }
-                try {
-                    const pr = await fetch("/api/config");
-                    if (pr.status === 401) { clearInterval(pollTimer); triggerTimeout(); return; }
-                    const pd = await pr.json();
-                    if (pd.logged_in) {
-                        clearInterval(pollTimer);
-                        hideModal("boot-splash");
-                        $("#app").classList.remove("hidden");
-                        if (pd.has_data) await restoreAllTabs();
-                    }
-                } catch(e) { /* ignore — will retry */ }
-            }, 3000);
-            // If still waiting after SLOW_LOGIN_MS, show manual option
+            startAutoLoginPoll();
             setTimeout(() => {
                 if ($("#boot-splash") && !$("#boot-splash").classList.contains("hidden")) {
                     $("#boot-slow-notice").classList.remove("hidden");
                 }
             }, SLOW_LOGIN_MS);
-            $("#boot-show-login").addEventListener("click", () => {
-                hideModal("boot-splash");
-                showModal("login-modal");
-            });
         } else {
             hideModal("boot-splash");
             showModal("login-modal");
@@ -480,6 +471,87 @@ async function initQBenchApp() {
         hideModal("boot-splash");
         showModal("login-modal");
         $("#login-error").textContent = "Could not connect to server: " + e.message;
+    }
+}
+
+// "Enter credentials manually" on the boot splash. Wired once, from the
+// DOMContentLoaded preamble, so it works whichever path put the splash up.
+// It only swaps the splash for the login form: a saved-login auto-login keeps
+// running, and if it finishes first it closes the form (auto_login_done /
+// startAutoLoginPoll).
+let _bootManualLoginWired = false;
+function initBootManualLogin() {
+    const btn = $("#boot-show-login");
+    if (!btn || _bootManualLoginWired) return;
+    _bootManualLoginWired = true;
+    btn.addEventListener("click", () => {
+        hideModal("boot-splash");
+        showModal("login-modal");
+        $("#login-username")?.focus();
+    });
+}
+
+// Poll /api/config while an auto-login runs. Stops when the app is on screen
+// (by either route), on auto_login_done, or after AUTO_LOGIN_POLL_MAX tries —
+// never on the splash being hidden, since the manual-login button hides it
+// while the auto-login is still going.
+let _autoLoginPoll = null;
+function stopAutoLoginPoll() {
+    if (_autoLoginPoll) clearInterval(_autoLoginPoll);
+    _autoLoginPoll = null;
+}
+function startAutoLoginPoll() {
+    stopAutoLoginPoll();
+    let attempts = 0;
+    _autoLoginPoll = setInterval(async () => {
+        attempts += 1;
+        if (!$("#app").classList.contains("hidden") || attempts > AUTO_LOGIN_POLL_MAX) {
+            stopAutoLoginPoll();
+            return;
+        }
+        try {
+            const pr = await fetch("/api/config");
+            if (pr.status === 401) { stopAutoLoginPoll(); triggerTimeout(); return; }
+            const pd = await pr.json();
+            if (pd.logged_in) {
+                stopAutoLoginPoll();
+                hideModal("boot-splash");
+                hideModal("login-modal");
+                $("#app").classList.remove("hidden");
+                if (pd.has_data) await restoreAllTabs();
+            }
+        } catch (e) { /* ignore — will retry */ }
+    }, AUTO_LOGIN_POLL_MS);
+}
+
+// The login form's saved-login affordances: the "(saved)" placeholder and
+// the "Forget saved login" link. Nothing about where or how it is kept.
+function setSavedLoginUi(hasSaved) {
+    const pw = $("#login-password");
+    if (pw) pw.placeholder = hasSaved ? "(saved)" : "Password";
+    $("#login-forget")?.classList.toggle("hidden", !hasSaved);
+}
+
+function showLoginNote(text) {
+    const note = $("#login-note");
+    if (!note) return;
+    note.textContent = text || "";
+    note.classList.toggle("hidden", !text);
+}
+
+async function forgetSavedLogin() {
+    try {
+        const resp = await fetch("/api/qbench-login/forget", { method: "POST" });
+        if (resp.status === 401) { triggerTimeout(); return; }
+        const data = await resp.json();
+        if (data.ok) {
+            setSavedLoginUi(false);
+            showLoginNote("Saved login forgotten.");
+        } else {
+            showLoginNote("Couldn’t forget the saved login. Please try again.");
+        }
+    } catch (e) {
+        showLoginNote("Couldn’t reach the server. Please try again.");
     }
 }
 
@@ -500,6 +572,7 @@ function appendBootStatus(msg) {
 function setupAppHandlers() {
     // Login (QBench)
     $("#login-btn").addEventListener("click", handleLogin);
+    $("#login-forget")?.addEventListener("click", forgetSavedLogin);
     $("#login-password").addEventListener("keydown", (e) => {
         if (e.key === "Enter") handleLogin();
     });
@@ -846,9 +919,16 @@ function startHeartbeat() {
 
 async function handleLogin() {
     const btn = $("#login-btn");
+    // After a login that worked but couldn't be remembered, the button reads
+    // "Continue" so the reviewer sees the note before the form goes away.
+    if (btn.dataset.mode === "continue") {
+        closeLoginForm();
+        return;
+    }
     btn.disabled = true;
     btn.textContent = "Logging in...";
     $("#login-error").textContent = "";
+    showLoginNote("");
 
     const username = $("#login-username").value.trim();
     const password = $("#login-password").value.trim();
@@ -873,10 +953,19 @@ async function handleLogin() {
             return;
         }
         if (data.ok) {
-            hideModal("login-modal");
+            stopAutoLoginPoll();
             $("#app").classList.remove("hidden");
             connectSSE();
             handleStart();
+            if (save && data.saved === false) {
+                showLoginNote(UNSAVED_LOGIN_NOTE);
+                btn.dataset.mode = "continue";
+                btn.disabled = false;
+                btn.textContent = "Continue";
+                return;
+            }
+            if (save) setSavedLoginUi(true);
+            closeLoginForm();
         } else {
             $("#login-error").textContent = data.error || "Login failed.";
         }
@@ -884,6 +973,15 @@ async function handleLogin() {
         $("#login-error").textContent = "Connection error: " + e.message;
     }
 
+    btn.disabled = false;
+    btn.textContent = "Login & Start";
+}
+
+function closeLoginForm() {
+    const btn = $("#login-btn");
+    hideModal("login-modal");
+    showLoginNote("");
+    btn.dataset.mode = "";
     btn.disabled = false;
     btn.textContent = "Login & Start";
 }
@@ -984,8 +1082,12 @@ function handleSSE(data) {
             }
             break;
         case "auto_login_done":
+            stopAutoLoginPoll();
             hideModal("boot-splash");
             if (data.ok) {
+                // The reviewer may have opened the manual form meanwhile;
+                // the automatic login got there first, so close it.
+                hideModal("login-modal");
                 $("#app").classList.remove("hidden");
             } else {
                 showModal("login-modal");

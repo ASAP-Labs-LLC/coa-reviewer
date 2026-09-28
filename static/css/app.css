@@ -2298,6 +2298,21 @@ body.dark .cc-listing { background: rgba(255, 255, 255, 0.04); }
 }
 .portal-switch-link:hover { color: var(--text); }
 
+/* Boot splash: the manual QBench login is always offered; the "taking
+   longer" line is a separate, later, muted note. */
+.boot-slow-notice {
+    margin: 16px 0 0;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.boot-manual-login { margin-top: 16px; }
+/* Plain-English notes under the QBench login form. */
+.login-note {
+    margin: 10px 0 0;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
 /* ══════════════════════════════════════════════════════════════════════
    Sample multi-select + context menu
    ══════════════════════════════════════════════════════════════════════ */
