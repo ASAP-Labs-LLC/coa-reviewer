@@ -93,6 +93,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         portalData = await portalResp.json();
     } catch (e) {
         showModal("boot-splash");
+        // Nothing behind "Enter credentials manually" is wired yet, and the
+        // page reloads in 3 s anyway — don't offer it here.
+        $("#boot-show-login")?.classList.add("hidden");
         $("#boot-msg").textContent = "Waiting for server to start...";
         setTimeout(() => location.reload(), 3000);
         return;
@@ -409,6 +412,7 @@ function chooseReviewMode() {
 // ══════════════════════════════════════════════════════════════════════
 
 async function initQBenchApp() {
+    $("#boot-show-login")?.classList.remove("hidden");
     showModal("boot-splash");
     $("#boot-msg").textContent = "Checking QBench connection...";
 
@@ -978,12 +982,20 @@ async function handleLogin() {
 }
 
 function closeLoginForm() {
+    hideModal("login-modal");     // also leaves "Continue" mode
+}
+
+// The login button reads "Continue" only while the "couldn't remember your
+// login" note is on screen. Opening or closing the form by any route ends
+// that, so it never greets the next login as "Continue". Only that mode is
+// reset: a login still in flight keeps its "Logging in..." state.
+function resetLoginContinue() {
     const btn = $("#login-btn");
-    hideModal("login-modal");
-    showLoginNote("");
+    if (!btn || btn.dataset.mode !== "continue") return;
     btn.dataset.mode = "";
     btn.disabled = false;
     btn.textContent = "Login & Start";
+    showLoginNote("");
 }
 
 
@@ -4968,9 +4980,11 @@ function setStatus(msg) {
 }
 
 function showModal(id) {
+    if (id === "login-modal") resetLoginContinue();
     document.getElementById(id).classList.remove("hidden");
 }
 
 function hideModal(id) {
+    if (id === "login-modal") resetLoginContinue();
     document.getElementById(id).classList.add("hidden");
 }

@@ -56,11 +56,14 @@ def test_manual_login_label_is_sentence_case():
 
 
 def test_manual_login_is_wired_once_outside_the_saved_login_branch():
-    wiring = [m.start() for m in re.finditer(r'#boot-show-login"\)', APP_JS)]
-    assert len(wiring) == 1, "wire #boot-show-login exactly once"
-    assert "boot-show-login" not in _fn("initQBenchApp")
-    assert "initBootManualLogin" in _fn("setupAppHandlers") or \
-        "initBootManualLogin()" in APP_JS[:APP_JS.index("async function initQBenchApp")]
+    wired = re.findall(r'boot-show-login"\)[^;]*addEventListener', APP_JS)
+    assert wired == [], "wire it through initBootManualLogin only"
+    assert '$("#boot-show-login")' in _fn("initBootManualLogin")
+    assert "btn.addEventListener" in _fn("initBootManualLogin")
+    assert "addEventListener" not in "".join(
+        line for line in _fn("initQBenchApp").splitlines() if "boot-show-login" in line)
+    preamble = APP_JS[:APP_JS.index("async function initQBenchApp")]
+    assert preamble.count("initBootManualLogin();") == 1
 
 
 def test_manual_login_hides_the_splash_and_opens_the_login_modal():
@@ -72,9 +75,10 @@ def test_manual_login_hides_the_splash_and_opens_the_login_modal():
 def test_no_ninety_second_gate_on_the_button():
     """The muted "taking longer" note may still appear after 90 s, on its own;
     nothing waits on a timer before offering the manual login."""
-    for m in re.finditer(r"setTimeout\((.*?)\}, SLOW_LOGIN_MS\)", APP_JS, re.S):
-        assert "boot-show-login" not in m.group(1)
-        assert "boot-slow-notice" in m.group(1)
+    for m in re.finditer(r"\}, SLOW_LOGIN_MS\)", APP_JS):
+        timer = APP_JS[APP_JS.rindex("setTimeout(", 0, m.start()):m.end()]
+        assert "boot-show-login" not in timer
+        assert "boot-slow-notice" in timer
 
 
 # ── auto-login keeps going behind the manual form ────────────────────────
@@ -144,3 +148,19 @@ def test_a_late_auto_login_failure_never_covers_a_working_app():
     assert guard < case.index('showModal("login-modal")'), (
         "ok:false must be ignored once the app is on screen (a manual login won)"
     )
+
+
+def test_waiting_for_server_splash_hides_the_manual_login_button():
+    """Before the server answers, nothing behind the button is wired."""
+    i = APP_JS.index('"Waiting for server to start..."')
+    block = APP_JS[APP_JS.rindex("catch (e) {", 0, i):APP_JS.index("return;", i)]
+    assert '$("#boot-show-login")?.classList.add("hidden")' in block
+    assert '$("#boot-show-login")?.classList.remove("hidden")' in _fn("initQBenchApp")
+
+
+def test_login_button_leaves_continue_mode_whenever_the_form_opens_or_closes():
+    for name in ("showModal", "hideModal"):
+        assert 'id === "login-modal"' in _fn(name) and "resetLoginContinue()" in _fn(name)
+    reset = _fn("resetLoginContinue")
+    assert 'dataset.mode !== "continue") return' in reset   # only that mode
+    assert '"Login & Start"' in reset and 'showLoginNote("")' in reset
