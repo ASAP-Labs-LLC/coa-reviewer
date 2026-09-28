@@ -483,6 +483,38 @@ class TestLaunchEnv:
         assert "PORT" not in env
 
 
+class TestHealthCheckEnv:
+    """The staging health check starts a real copy of the release. It must not
+    sign in to QBench (a second Playwright session on the real account), so it
+    — and only it — carries COA_HEALTH_CHECK=1."""
+
+    def test_health_check_launch_is_flagged(self):
+        env = updater.launch_env(_app(data_env="COA_DATA_DIR"), port=15559,
+                                 data_dir="D:/probe", base={},
+                                 for_health_check=True)
+        assert env["COA_HEALTH_CHECK"] == "1"
+
+    def test_live_launch_is_not_flagged(self):
+        env = updater.launch_env(_app(data_env="COA_DATA_DIR"), port=5559,
+                                 data_dir="D:/state", base={})
+        assert "COA_HEALTH_CHECK" not in env
+
+    def test_a_stray_flag_in_the_updaters_own_environment_never_reaches_the_live_app(self):
+        env = updater.launch_env(_app(data_env="COA_DATA_DIR"), port=5559,
+                                 data_dir="D:/state", base={"COA_HEALTH_CHECK": "1"},
+                                 for_health_check=False)
+        assert "COA_HEALTH_CHECK" not in env
+
+    def test_stage_flags_the_health_check_and_start_app_does_not(self):
+        import inspect
+        import re
+        call = re.compile(r"launch_env\((?:[^()]|\([^()]*\))*\)")   # one nesting level
+        stage_env_call = call.search(inspect.getsource(updater.stage)).group(0)
+        start_env_call = call.search(inspect.getsource(updater._start_app)).group(0)
+        assert "for_health_check=True" in stage_env_call
+        assert "for_health_check" not in start_env_call
+
+
 # ── supervisor contract ─────────────────────────────────────────────────────
 
 def test_kill_callable_matches_supervisor_contract():

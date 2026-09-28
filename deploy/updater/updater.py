@@ -1067,15 +1067,28 @@ def launch_args(app: App, *, port: int, for_health_check: bool) -> list:
     return argv
 
 
-def launch_env(app: App, *, port: int, data_dir: str, base: dict) -> dict:
+HEALTH_CHECK_ENV = "COA_HEALTH_CHECK"
+
+
+def launch_env(app: App, *, port: int, data_dir: str, base: dict,
+               for_health_check: bool = False) -> dict:
     """Environment for starting ``app``.
 
     ``PORT`` is set only when the port is *not* passed on the command line.
     Setting both invites them to disagree, and the flag wins — leaving a stale
     PORT sitting in a live app's environment saying something untrue.
+
+    ``COA_HEALTH_CHECK=1`` marks the staging health check's throwaway copy, so
+    it proves the release boots without signing in to QBench (a second
+    Playwright session on the real account). The live launch never carries
+    it, even if the updater's own environment somehow does.
     """
     env = dict(base)
     env[app.data_env] = str(data_dir)
+    if for_health_check:
+        env[HEALTH_CHECK_ENV] = "1"
+    else:
+        env.pop(HEALTH_CHECK_ENV, None)
     if app.port_arg:
         env.pop("PORT", None)
     else:
@@ -1131,7 +1144,7 @@ def stage(app: App, release: dict, token: Optional[str]) -> None:
         argv=launch_args(app, port=app.scratch_port, for_health_check=True),
         port=app.scratch_port, data_dir=probe_data,
         env_extra=launch_env(app, port=app.scratch_port, data_dir=str(probe_data),
-                             base=os.environ),
+                             base=os.environ, for_health_check=True),
         expected_version=tag, browsers_path=app.browsers_path,
     )
     shutil.rmtree(probe_data, ignore_errors=True)
