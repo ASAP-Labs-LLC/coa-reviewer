@@ -332,18 +332,62 @@ DEFAULT_CONFIG = {
 }
 
 
+# Set when web_app_config.json exists but could not be read. While it is set,
+# save_config refuses to write: the defaults load_config handed back are not
+# the file's contents, and saving them would wipe the real config (a transient
+# read failure followed by any save used to do exactly that). A later
+# successful load clears it.
+_config_unreadable = False
+
+MAX_CONFIG_BYTES = 1024 * 1024
+
+
 def load_config() -> dict:
-    if CONFIG_FILE.exists():
+    global _config_unreadable
+    try:
+        if not CONFIG_FILE.exists():
+            _config_unreadable = False
+            return dict(DEFAULT_CONFIG)
+        with open(CONFIG_FILE, "rb") as fh:
+            raw = fh.read(MAX_CONFIG_BYTES + 1)
+        if len(raw) > MAX_CONFIG_BYTES:
+            raise ValueError(f"larger than {MAX_CONFIG_BYTES} bytes")
+        cfg = json.loads(raw.decode("utf-8"))
+        if not isinstance(cfg, dict):
+            raise ValueError(f"top level is {type(cfg).__name__}, not an object")
+    except (OSError, ValueError) as exc:     # JSON/Unicode errors are ValueErrors
+        _config_unreadable = True
+        logger.warning("Could not read %s (%s); using defaults and leaving the "
+                       "file untouched", CONFIG_FILE, exc)
+        return dict(DEFAULT_CONFIG)
+    _config_unreadable = False
+    return {**DEFAULT_CONFIG, **cfg}
+
+
+def save_config(cfg: dict) -> bool:
+    """Write the config atomically. False (and nothing written) on failure,
+    or while an existing file is unreadable — see ``_config_unreadable``."""
+    try:
+        if _config_unreadable and CONFIG_FILE.exists():
+            logger.error("Not saving %s: it could not be read at startup, and "
+                         "writing now would replace it with defaults", CONFIG_FILE)
+            return False
+        data = json.dumps(cfg, indent=2).encode("utf-8")
+    except (OSError, TypeError, ValueError) as exc:
+        logger.error("Not saving %s: %s", CONFIG_FILE, exc)
+        return False
+    tmp = CONFIG_FILE.with_name(f".{CONFIG_FILE.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, CONFIG_FILE)
+    except OSError as exc:
+        logger.error("Could not save %s: %s", CONFIG_FILE, exc)
         try:
-            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            return {**DEFAULT_CONFIG, **cfg}
-        except Exception:
+            tmp.unlink()
+        except OSError:
             pass
-    return dict(DEFAULT_CONFIG)
-
-
-def save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        return False
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -116,6 +116,8 @@ def isolated_app_paths(tmp_path, monkeypatch):
     state_path = tmp_path / "re_review_state.json"
     monkeypatch.setattr(app, "CONFIG_FILE", cfg_path)
     monkeypatch.setattr(app, "RE_REVIEW_STATE_FILE", state_path)
+    # A config another test found unreadable must not block this one's saves.
+    monkeypatch.setattr(app, "_config_unreadable", False)
     return cfg_path, state_path
 
 

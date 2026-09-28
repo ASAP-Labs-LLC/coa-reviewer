@@ -76,6 +76,57 @@ def test_save_config_writes_json_round_trip(isolated_app_paths) -> None:
     assert loaded["labcore_host"] == "labpc"
 
 
+def test_save_config_is_atomic(isolated_app_paths, monkeypatch) -> None:
+    """A failed write leaves the old config whole and no temp file behind."""
+    cfg_path, _ = isolated_app_paths
+    app.save_config({"qbench_username": "bob"})
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(app.os, "replace", boom)
+    assert app.save_config({"qbench_username": "carol"}) is False
+    monkeypatch.undo()
+
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_username"] == "bob"
+    assert [p.name for p in cfg_path.parent.iterdir()] == [cfg_path.name]
+
+
+@pytest.mark.parametrize("content", ["not json{", "[1, 2]", "\"a string\""])
+def test_an_unreadable_config_is_never_overwritten(isolated_app_paths, caplog,
+                                                   content) -> None:
+    """A read that failed must not be followed by a save of the defaults —
+    that is how a transient error used to wipe the real file."""
+    import logging
+    cfg_path, _ = isolated_app_paths
+    cfg_path.write_text(content, encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        assert app.load_config() == app.DEFAULT_CONFIG
+        assert app.save_config(dict(app.DEFAULT_CONFIG)) is False
+
+    assert cfg_path.read_text(encoding="utf-8") == content
+    levels = {r.levelname for r in caplog.records}
+    assert "WARNING" in levels and "ERROR" in levels
+
+
+def test_a_good_load_lifts_the_overwrite_guard(isolated_app_paths) -> None:
+    cfg_path, _ = isolated_app_paths
+    cfg_path.write_text("not json{", encoding="utf-8")
+    app.load_config()
+    cfg_path.write_text(json.dumps({"qbench_username": "alice"}), encoding="utf-8")
+    app.load_config()
+    assert app.save_config({"qbench_username": "bob"}) is True
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_username"] == "bob"
+
+
+def test_an_unreadable_file_that_has_gone_may_be_written(isolated_app_paths) -> None:
+    cfg_path, _ = isolated_app_paths
+    cfg_path.write_text("not json{", encoding="utf-8")
+    app.load_config()
+    cfg_path.unlink()
+    assert app.save_config({"qbench_username": "bob"}) is True
+
+
 # ── load_re_review_state / save_re_review_state ───────────────────────────
 
 
