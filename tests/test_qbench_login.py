@@ -376,13 +376,106 @@ def test_default_crypto_is_dpapi_only_on_windows():
         assert crypto is None
 
 
-def test_dpapi_binding_follows_the_contract():
-    src = open(qbench_login.__file__, encoding="utf-8").read()
-    for needed in ("CryptProtectData", "CryptUnprotectData", "LocalFree",
-                   "CRYPTPROTECT_UI_FORBIDDEN", "ENTROPY"):
-        assert needed in src, needed
-    assert qbench_login.CRYPTPROTECT_UI_FORBIDDEN == 0x1
-    assert isinstance(qbench_login.ENTROPY, bytes) and qbench_login.ENTROPY
+class FakeWinDLLs:
+    """crypt32 + kernel32 stand-ins for ``DpapiCrypto(loader=...)``.
+
+    Real ctypes function pointers (CFUNCTYPE callbacks) with real C memory
+    (libc malloc/free), so the production binding's structures, byref
+    marshalling, argtypes, string_at and LocalFree all run for real on any
+    OS. Ciphertext is bound to ``user``; the entropy and flags DpapiCrypto
+    passes are recorded so the test can check them.
+    """
+
+    def __init__(self, user: bytes = b"alice") -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class Blob(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        self.ctypes, self.Blob, self.user = ctypes, Blob, user
+        self.libc = ctypes.CDLL(None)
+        self.libc.malloc.restype = ctypes.c_void_p
+        self.libc.malloc.argtypes = [ctypes.c_size_t]
+        self.libc.free.argtypes = [ctypes.c_void_p]
+        self.allocated, self.freed, self.calls = set(), set(), []
+        vp = ctypes.c_void_p
+        crypt = ctypes.CFUNCTYPE(wintypes.BOOL, vp, vp, vp, vp, vp, wintypes.DWORD, vp)
+        free = ctypes.CFUNCTYPE(vp, vp)
+        # Keep the callback objects alive as long as this fake.
+        self._protect = crypt(lambda *a: self._crypt("protect", *a))
+        self._unprotect = crypt(lambda *a: self._crypt("unprotect", *a))
+        self._free = free(self._local_free)
+
+    def __call__(self, name: str):
+        from types import SimpleNamespace
+        if name == "crypt32":
+            return SimpleNamespace(CryptProtectData=self._protect,
+                                   CryptUnprotectData=self._unprotect)
+        assert name == "kernel32", name
+        return SimpleNamespace(LocalFree=self._free)
+
+    def _bytes(self, addr) -> bytes:
+        blob = self.Blob.from_address(addr)
+        return self.ctypes.string_at(blob.pbData, blob.cbData)
+
+    def _crypt(self, kind, data_in, descr, entropy, reserved, prompt, flags, data_out):
+        data = self._bytes(data_in)
+        self.calls.append((kind, self._bytes(entropy) if entropy else None, flags,
+                           descr, prompt))
+        tag = b"DPAPI:" + self.user + b":"
+        if kind == "protect":
+            out = tag + bytes(b ^ 0x5A for b in data)
+        elif data.startswith(tag):
+            out = bytes(b ^ 0x5A for b in data[len(tag):])
+        else:
+            return 0                       # FALSE: another user's blob
+        ptr = self.libc.malloc(max(len(out), 1))
+        self.ctypes.memmove(ptr, out, len(out))
+        self.allocated.add(ptr)
+        blob = self.Blob.from_address(data_out)
+        blob.cbData = len(out)
+        blob.pbData = self.ctypes.cast(ptr, self.ctypes.POINTER(self.ctypes.c_ubyte))
+        return 1
+
+    def _local_free(self, ptr):
+        self.freed.add(ptr)
+        self.libc.free(ptr)
+        return None
+
+
+def test_dpapi_binding_round_trips_through_real_ctypes():
+    dlls = FakeWinDLLs()
+    crypto = qbench_login.DpapiCrypto(loader=dlls)
+    blob = crypto.protect(SECRET.encode())
+    assert blob.startswith(b"DPAPI:alice:") and SECRET.encode() not in blob
+    assert crypto.unprotect(blob) == SECRET.encode()
+    for kind, entropy, flags, descr, prompt in dlls.calls:
+        assert entropy == qbench_login.ENTROPY
+        assert flags == qbench_login.CRYPTPROTECT_UI_FORBIDDEN == 0x1
+        assert descr is None and prompt is None
+    assert dlls.allocated and dlls.freed == dlls.allocated, "every output buffer LocalFree'd"
+
+
+def test_dpapi_binding_reports_another_users_blob_as_crypto_error():
+    blob = qbench_login.DpapiCrypto(loader=FakeWinDLLs(b"alice")).protect(b"x")
+    bob = qbench_login.DpapiCrypto(loader=FakeWinDLLs(b"bob"))
+    with pytest.raises(CryptoError):
+        bob.unprotect(blob)
+
+
+def test_the_store_runs_on_the_real_dpapi_binding(tmp_path, caplog):
+    alice = qbench_login.DpapiCrypto(loader=FakeWinDLLs(b"alice"))
+    store = _store(tmp_path, alice)
+    assert store.select() == store.primary
+    assert store.save(USER, SECRET)
+    assert json.loads(store.primary.read_text())["password"]["scheme"] == "dpapi"
+    assert store.load() == (USER, SECRET)
+    caplog.set_level(logging.WARNING, logger="coa.credentials")
+    bob = _store(tmp_path, qbench_login.DpapiCrypto(loader=FakeWinDLLs(b"bob")))
+    assert bob.load() is None
+    assert "different Windows account" in caplog.text
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real DPAPI needs Windows")
@@ -465,3 +558,27 @@ def test_a_file_that_stays_locked_gives_up_in_bounded_time(tmp_path, monkeypatch
     started = time.monotonic()
     assert store.save(USER, SECRET) is False
     assert time.monotonic() - started < 2.0
+
+
+def test_unencrypted_fallback_on_windows_warns_once(tmp_path, caplog):
+    """No DPAPI for the app's account on Windows: the fallback copy is only
+    base64. Say so once, loudly enough to be found, not on every save."""
+    store = _store(tmp_path, None, require_encryption=True)
+    caplog.set_level(logging.WARNING, logger="coa.credentials")
+    assert store.save(USER, SECRET) and store.save(USER, SECRET + "2")
+    warned = [r for r in caplog.records
+              if "Keeping QBench login unencrypted" in r.getMessage()]
+    assert len(warned) == 1
+    assert json.loads(store.fallback.read_text())["password"]["scheme"] == "plain"
+
+
+def test_the_username_is_only_logged_at_debug(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="coa.credentials")
+    store = _store(tmp_path)
+    store.save(USER, SECRET)
+    store.load()
+    store.save("", "")
+    assert any(USER in r.getMessage() for r in caplog.records
+               if r.levelno == logging.DEBUG)
+    assert not any(USER in r.getMessage() for r in caplog.records
+                   if r.levelno > logging.DEBUG)

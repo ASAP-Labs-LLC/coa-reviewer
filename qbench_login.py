@@ -113,9 +113,17 @@ class DpapiCrypto:
 
     scheme = "dpapi"
 
-    def __init__(self, entropy: bytes = ENTROPY) -> None:
+    def __init__(self, entropy: bytes = ENTROPY, loader=None) -> None:
+        """``loader(name)`` returns the DLL named ``crypt32``/``kernel32``;
+        the default is ``ctypes.WinDLL(name, use_last_error=True)``. Tests
+        inject stand-ins built from real ctypes callbacks, so this binding
+        runs for real on every OS."""
         import ctypes
         from ctypes import wintypes
+
+        if loader is None:
+            def loader(name):
+                return ctypes.WinDLL(name, use_last_error=True)
 
         class DataBlob(ctypes.Structure):
             _fields_ = [("cbData", wintypes.DWORD),
@@ -124,8 +132,8 @@ class DpapiCrypto:
         self._ctypes = ctypes
         self._DataBlob = DataBlob
         self._entropy = entropy
-        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        crypt32 = loader("crypt32")
+        kernel32 = loader("kernel32")
         blob_p = ctypes.POINTER(DataBlob)
         self._protect = crypt32.CryptProtectData
         self._protect.argtypes = [blob_p, wintypes.LPCWSTR, blob_p, ctypes.c_void_p,
@@ -153,7 +161,8 @@ class DpapiCrypto:
         ok = fn(ctypes.byref(data_in), None, ctypes.byref(entropy), None, None,
                 CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out))
         if not ok:
-            raise CryptoError(f"{name} failed (Windows error {ctypes.get_last_error()})")
+            last_error = getattr(ctypes, "get_last_error", lambda: 0)()   # Windows-only
+            raise CryptoError(f"{name} failed (Windows error {last_error})")
         try:
             return ctypes.string_at(out.pbData, out.cbData)
         finally:
@@ -296,6 +305,7 @@ class LoginStore:
         self._selected = False          # has select() run (and logged) yet?
         self._warned: set = set()
         self._lock = threading.RLock()
+        self._unencrypted_warned = False
 
     @classmethod
     def for_this_machine(cls, fallback: PathLike) -> "LoginStore":
@@ -455,10 +465,11 @@ class LoginStore:
                 saved = False
             if saved:
                 self._drop_other_copies(path)
-                log.info("Saved QBench login for %s in %s", username, path)
+                log.info("Saved QBench login in %s", path)
+                log.debug("Saved QBench login is for %s", username)
                 return True
-        log.warning("QBench login for %s could not be saved anywhere; it is used "
-                    "for this session only", username)
+        log.warning("QBench login could not be saved anywhere; it is used for "
+                    "this session only")
         return False
 
     def _save_one(self, path: Path, username: str, password: str) -> bool:
@@ -494,7 +505,7 @@ class LoginStore:
             if path == self.primary:
                 log.warning("Not saving QBench login in %s: %s", path, why)
                 return None
-            log.warning("Keeping QBench login unencrypted in %s (%s)", path, why)
+            self._warn_unencrypted_once(path, why)
         else:
             _note_plain_once()
         return {"scheme": "plain", "data": base64.b64encode(secret).decode("ascii")}
@@ -520,6 +531,16 @@ class LoginStore:
         return gone
 
     # ── logging helpers ──────────────────────────────────────────────────
+
+    def _warn_unencrypted_once(self, path: Path, why: str) -> None:
+        """Windows without working DPAPI for this account: the fallback copy is
+        only base64 and protected by nothing but the data folder's
+        permissions. Said once per process, not on every save."""
+        if self._unencrypted_warned:
+            return
+        self._unencrypted_warned = True
+        log.warning("Keeping QBench login unencrypted (base64 only) in %s — %s; "
+                    "only the folder's permissions protect it", path, why)
 
     def _warn_once(self, path: Path, kind: str, msg: str, *args) -> None:
         """WARNING the first time this (path, problem, file version) shows up;
