@@ -395,8 +395,9 @@ def save_config(cfg: dict) -> bool:
 # Kept by qbench_login.LoginStore outside the release so it survives updates:
 # %APPDATA%\ASAPLabs (DPAPI) when the app can use it, else DATA_DIR. The store
 # picks the place itself — no reviewer or admin ever sets anything up. Older
-# installs kept the login in web_app_config.json; that is still read as a
-# fallback, and moved out once at startup (migrate_login_out_of_config).
+# installs kept the login in web_app_config.json; a password found there is
+# newer than the store's by construction (see migrate_login_out_of_config), so
+# it is used first and moved into the store at startup.
 
 cred_log = logging.getLogger("coa.credentials")
 LOGIN_FALLBACK_NAME = "qbench_login.json"
@@ -477,8 +478,14 @@ def _save_login(username: str, password: str) -> bool:
 
 
 def get_qbench_login() -> Optional[Tuple[str, str]]:
-    """The saved QBench login: the store first, then (legacy) the config."""
-    return _stored_login() or _config_login()
+    """The saved QBench login.
+
+    A password in web_app_config.json wins when there is one: this release
+    blanks it as soon as the store has kept it, so one still there was
+    written later — by an older release after a rollback — or could not be
+    moved. Otherwise the store.
+    """
+    return _config_login() or _stored_login()
 
 
 def _blank_config_password() -> bool:
@@ -494,13 +501,16 @@ def _blank_config_password() -> bool:
 
 
 def migrate_login_out_of_config() -> bool:
-    """Move a login saved by an older release out of web_app_config.json.
+    """Move a login out of web_app_config.json into the store.
 
-    Only when the store has none, and the config's password is blanked only
-    once the store has actually kept it. True if a login was moved.
+    Whenever the config holds a username *and* password — also when the store
+    already has a login: this release blanks the config password once the
+    store has it, so one still there is newer (an older release wrote it after
+    a rollback) and replaces the stored one. The config's password is blanked
+    only once the store has actually kept it. True if a login was moved.
     """
     legacy = _config_login()
-    if legacy is None or _stored_login() is not None:
+    if legacy is None:
         return False
     if not _save_login(*legacy):
         cred_log.warning("Kept the QBench login in web_app_config.json: it could "

@@ -89,10 +89,19 @@ def _legacy_config(cfg_path: Path, username=USER, password=SECRET) -> None:
 
 # ── where the login comes from ───────────────────────────────────────────
 
-def test_the_store_wins_over_the_config(env):
+def test_the_store_is_used_when_the_config_has_no_password(env):
     _, store, cfg_path = env
-    _legacy_config(cfg_path, "old@example.com", "old-pass")
+    _legacy_config(cfg_path, USER, "")
     store.save(USER, SECRET)
+    assert app_module.get_qbench_login() == (USER, SECRET)
+
+
+def test_a_config_password_is_newer_than_the_stored_one(env):
+    """Only an older release (after a rollback) writes a password into the
+    config, so if migration could not move it, it is still the one to use."""
+    _, store, cfg_path = env
+    store.save("old@example.com", "old-pass")
+    _legacy_config(cfg_path)
     assert app_module.get_qbench_login() == (USER, SECRET)
 
 
@@ -160,14 +169,27 @@ def test_migration_uses_the_fallback_when_appdata_is_unusable(env):
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_password"] == ""
 
 
-def test_migration_does_nothing_when_the_store_already_has_a_login(env):
+def test_a_config_password_is_newer_than_the_store_and_wins(env):
+    """A release with the login store always blanks the config password once
+    it has saved it, so a password still in the config was written later —
+    by an older release after a rollback. On roll-forward it must replace the
+    store's (older) login and leave the config, not linger there in plain
+    text while the stale stored one is used."""
     _, store, cfg_path = env
     store.save("stored@example.com", "stored-pass")
-    _legacy_config(cfg_path)
-    before = cfg_path.read_text(encoding="utf-8")
+    _legacy_config(cfg_path, USER, SECRET)
+    assert app_module.migrate_login_out_of_config() is True
+    assert store.load() == (USER, SECRET)
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_password"] == ""
+
+
+def test_a_failed_overwrite_keeps_both_as_they_were(env, monkeypatch):
+    _, store, cfg_path = env
+    store.save("stored@example.com", "stored-pass")
+    _legacy_config(cfg_path, USER, SECRET)
+    monkeypatch.setattr(store, "save", lambda *a: False)
     assert app_module.migrate_login_out_of_config() is False
-    assert cfg_path.read_text(encoding="utf-8") == before
-    assert store.load() == ("stored@example.com", "stored-pass")
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["qbench_password"] == SECRET
 
 
 def test_migration_does_nothing_without_config_creds(env):
