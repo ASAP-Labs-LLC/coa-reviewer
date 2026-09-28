@@ -408,3 +408,60 @@ def test_an_unexpected_crypto_fault_never_escapes(tmp_path):
     doc = json.loads(faulty.fallback.read_text(encoding="utf-8"))
     assert doc["password"]["scheme"] == "plain"
     assert faulty.load() == (USER, SECRET)
+
+
+# ── concurrency ──────────────────────────────────────────────────────────
+
+def test_concurrent_saves_all_succeed_without_bogus_fallbacks(tmp_path, caplog):
+    import threading
+    store = _store(tmp_path)
+    caplog.set_level(logging.WARNING, logger="coa.credentials")
+    results = []
+
+    def worker(n):
+        for i in range(60):
+            results.append(store.save(f"user{n}@example.com", f"pass-{n}-{i}"))
+            store.load()
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert len(results) == 240 and all(results)
+    assert [r.getMessage() for r in caplog.records] == []
+    assert not store.fallback.exists()
+    leftovers = [p.name for p in store.primary.parent.iterdir() if p != store.primary]
+    assert leftovers == []
+
+
+def test_a_briefly_locked_file_is_retried(tmp_path, monkeypatch):
+    """Windows refuses os.replace while another handle has the file open."""
+    store = _store(tmp_path)
+    real = os.replace
+    calls = {"n": 0}
+
+    def locked_twice(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(13, "The process cannot access the file")
+        return real(src, dst)
+    monkeypatch.setattr(qbench_login.os, "replace", locked_twice)
+    assert store.save(USER, SECRET) is True
+    monkeypatch.undo()
+    assert store.primary.is_file() and not store.fallback.exists(), (
+        "a moment's lock is retried in place, not treated as an unusable folder"
+    )
+    assert store.load() == (USER, SECRET)
+
+
+def test_a_file_that_stays_locked_gives_up_in_bounded_time(tmp_path, monkeypatch):
+    import time
+    store = _store(tmp_path)
+
+    def always_locked(src, dst):
+        raise PermissionError(13, "locked")
+    monkeypatch.setattr(qbench_login.os, "replace", always_locked)
+    started = time.monotonic()
+    assert store.save(USER, SECRET) is False
+    assert time.monotonic() - started < 2.0

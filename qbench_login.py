@@ -38,9 +38,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import json
 import logging
 import os
+import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional, Protocol, Tuple, Union
@@ -59,6 +63,8 @@ MAX_FILE_BYTES = 64 * 1024          # a login is ~1 KB; anything bigger is not o
 MAX_FIELD_CHARS = 1024              # username / password length ceiling
 MAX_WARNINGS_REMEMBERED = 64        # bound on the warn-once memory
 PROBE_BYTES = b"coa-reviewer probe\n"
+LOCK_RETRIES = 5                    # PermissionError retries (Windows file locks)
+LOCK_RETRY_SECONDS = 0.05
 
 # DPAPI parameters. The entropy is not a secret — it scopes our blobs so that
 # another program running as the same user can't unprotect them by accident.
@@ -179,25 +185,60 @@ def default_crypto() -> Optional[Crypto]:
 
 # ── file primitives ──────────────────────────────────────────────────────
 
-def _write_atomic(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` via a temp file in the same folder.
+def _retry_locked(action, *args):
+    """Run ``action(*args)``, retrying briefly on ``PermissionError``.
 
-    Readers see the old file or the new one, never half of either. The temp
-    file is created 0600 (a no-op on Windows, where the folder's ACL rules).
+    Windows refuses to replace or delete a file while any handle has it open
+    (a reader, an antivirus scan). That is a moment's wait, not an unusable
+    folder. Bounded: LOCK_RETRIES attempts, LOCK_RETRY_SECONDS apart.
+    """
+    for attempt in range(1, LOCK_RETRIES + 1):
+        try:
+            return action(*args)
+        except PermissionError:
+            if attempt == LOCK_RETRIES:
+                raise
+            time.sleep(LOCK_RETRY_SECONDS)
+    return None                                     # unreachable
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` via a uniquely named temp file in the same
+    folder (``mkstemp``: 0600, safe across threads and processes).
+
+    Readers see the old file or the new one, never half of either.
     Raises ``OSError``; the caller decides what a failure means.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.",
+                                    suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(str(tmp), str(path))
+        _retry_locked(os.replace, str(tmp), str(path))
     except BaseException:
         _unlink_quietly(tmp)
         raise
+
+
+def _probe_folder(path: Path) -> None:
+    """Prove the folder ``path`` would live in can be created, written, read
+    and cleaned up — with a uniquely named file, never ``path`` itself.
+    Raises ``OSError``/``ValueError``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, probe_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.",
+                                      suffix=".probe")
+    probe = Path(probe_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(PROBE_BYTES)
+        if _read_bounded(probe) != PROBE_BYTES:
+            raise ValueError("probe file read back wrong")
+    finally:
+        _unlink_quietly(probe)
 
 
 def _read_bounded(path: Path) -> Optional[bytes]:
@@ -216,7 +257,7 @@ def _read_bounded(path: Path) -> Optional[bytes]:
 def _unlink_quietly(path: Path) -> bool:
     """Remove ``path``; True if it is gone afterwards."""
     try:
-        path.unlink()
+        _retry_locked(path.unlink)
     except (FileNotFoundError, NotADirectoryError):   # never existed
         return True
     except OSError as exc:
@@ -226,6 +267,17 @@ def _unlink_quietly(path: Path) -> bool:
 
 
 # ── the store ────────────────────────────────────────────────────────────
+
+def _locked(method):
+    """Serialise a public LoginStore method on the store's re-entrant lock:
+    Flask serves requests on threads, and a save racing a load or another
+    save would otherwise see half a probe or replace a file mid-read."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
 
 class LoginStore:
     """One QBench web login, kept in whichever of two places works."""
@@ -243,6 +295,7 @@ class LoginStore:
         self._chosen: Optional[Path] = None
         self._selected = False          # has select() run (and logged) yet?
         self._warned: set = set()
+        self._lock = threading.RLock()
 
     @classmethod
     def for_this_machine(cls, fallback: PathLike) -> "LoginStore":
@@ -258,6 +311,7 @@ class LoginStore:
 
     # ── choosing a location ──────────────────────────────────────────────
 
+    @_locked
     def select(self) -> Optional[Path]:
         """Probe and pick the location to save to. Never raises.
 
@@ -291,15 +345,10 @@ class LoginStore:
         return None, f"{self.primary}: {why}; {self.fallback}: {why2}"
 
     def _probe(self, path: Path, *, need_crypto: bool) -> Tuple[bool, str]:
-        probe = path.with_name(f".{path.name}.probe-{os.getpid()}")
         try:
-            _write_atomic(probe, PROBE_BYTES)
-            if _read_bounded(probe) != PROBE_BYTES:
-                return False, "probe file read back wrong"
+            _probe_folder(path)
         except (OSError, ValueError) as exc:
-            return False, f"folder not writable: {exc}"
-        finally:
-            _unlink_quietly(probe)
+            return False, f"folder not usable: {exc}"
         if need_crypto:
             return self._probe_crypto()
         return True, "ok"
@@ -323,6 +372,7 @@ class LoginStore:
 
     # ── load ─────────────────────────────────────────────────────────────
 
+    @_locked
     def load(self) -> Optional[Tuple[str, str]]:
         """``(username, password)`` from the first place that has a readable
         login, else ``None``. Never raises."""
@@ -387,6 +437,7 @@ class LoginStore:
 
     # ── save ─────────────────────────────────────────────────────────────
 
+    @_locked
     def save(self, username: str, password: str) -> bool:
         """Remember the login. True once one location holds it. Never raises."""
         username = (username or "").strip()
@@ -456,6 +507,7 @@ class LoginStore:
 
     # ── clear ────────────────────────────────────────────────────────────
 
+    @_locked
     def clear(self) -> bool:
         """Forget the login everywhere. True if no copy is left."""
         gone = True
