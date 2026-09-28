@@ -64,8 +64,15 @@ the browser never sees paths or storage errors.
 - **Encryption** — on Windows the password is encrypted with DPAPI
   (`CryptProtectData`, current-user scope, fixed entropy). Only the **same
   Windows account on the same machine** can decrypt it. If DPAPI fails on the
-  account, the fallback file is written base64-only (logged as a WARNING). On
-  macOS/Linux (dev boxes) it is base64-only with file mode `0600`.
+  account, the fallback file is written base64-only (logged as a WARNING,
+  once per run). On macOS/Linux (dev boxes) it is base64-only with file mode
+  `0600`.
+- **What "base64-only" means on Windows** — if DPAPI is unavailable for the
+  account the app runs as, the copy in the data folder is **not encrypted**:
+  base64 is an encoding, not protection. It is exactly as private as
+  `C:\ASAPApps\coa\data` itself — anyone who can read that folder can read
+  the password, as they could when it sat in `web_app_config.json`. Look for
+  "Keeping QBench login unencrypted" in `app.log`.
 - **Same-user caveat** — the app runs as whichever Windows account launched it
   (under the updater: the account its scheduled task runs as). A login saved by
   a different account can't be decrypted; the app logs "saved by a different
@@ -76,8 +83,10 @@ the browser never sees paths or storage errors.
 - **Moving off `web_app_config.json`** — older releases kept the password in
   plain text in `web_app_config.json`. On first start the app moves it into the
   store and blanks `qbench_password` there (the username stays, for display) —
-  only once the store has actually kept it. If the store already has a login,
-  the config is left alone.
+  only once the store has actually kept it. A release with the store always
+  blanks it, so a password found in the config later was written by an older
+  release (a rollback) and is the **newer** one: it is used first, and moved
+  over any stored login at the next start.
 - **Reset** — "Forget saved login" under the QBench login form (shown when a
   login is saved) clears every copy. By hand: stop the app and delete both
   files above (and blank `qbench_password` in `web_app_config.json` if it still

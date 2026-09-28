@@ -129,7 +129,10 @@ the "QBench Login" form) is a separate, self-managing store — see
 `C:\ASAPApps\coa\data\qbench_login.json` by itself. It is **per Windows
 user**: DPAPI ties it to the account the app runs as — under the updater, the
 account its scheduled task runs as. Changing that account means the reviewer
-signs in once more; nothing breaks.
+signs in once more; nothing breaks. If DPAPI is unavailable for that account the
+fallback copy in `C:\ASAPApps\coa\data` is base64 only — not encrypted, and
+only as private as that folder's permissions (`app.log`: "Keeping QBench login
+unencrypted").
 
 **If `qbench.json` is missing, the apps will not start** — they raise
 `QBenchSecretMissing` naming the key and path. See `QBENCH-CREDENTIALS.md` in
