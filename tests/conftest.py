@@ -37,6 +37,15 @@ _os.environ.setdefault("QBENCH_STORE_PATH", _store)
 # ``setdefault`` so tests/test_data_dir.py can still probe both branches.
 _os.environ.setdefault("COA_DATA_DIR", _tempfile.mkdtemp(prefix="coa-test-data-"))
 
+# And the QBench web login store (qbench_login.py), which otherwise lives in the
+# real %APPDATA%\ASAPLabs or ~/.config/asaplabs. A test run must never read a
+# developer's saved login or overwrite it. Per-test isolation is on top of this
+# (_isolated_shared_store below swaps in a fresh store for every test).
+_os.environ.setdefault(
+    "COA_QBENCH_LOGIN_PATH",
+    _os.path.join(_tempfile.mkdtemp(prefix="coa-test-login-"), "coa-qbench-login.json"),
+)
+
 import socket
 import sys
 import threading
@@ -135,6 +144,7 @@ def _isolated_shared_store(request, tmp_path_factory, monkeypatch):
         return
     try:
         import app as app_module
+        from qbench_login import LoginStore
         from shared_store import SharedStore
     except ImportError:          # flask missing: the app tests skip themselves
         yield
@@ -147,5 +157,10 @@ def _isolated_shared_store(request, tmp_path_factory, monkeypatch):
     monkeypatch.setattr(app_module, "OBSERVE_QUEUE", app_module.ObserveQueue())
     monkeypatch.setattr(app_module, "PRE_READS", app_module.PreReads())
     monkeypatch.setattr(app_module, "_last_snapshot_prune", None)
+    # The QBench web login store: one per test, like the shared store.
+    login_dir = tmp_path_factory.mktemp("qbench-login")
+    monkeypatch.setattr(app_module, "login_store", LoginStore(
+        login_dir / "appdata" / "coa-qbench-login.json",
+        login_dir / "data" / "qbench_login.json"))
     yield
     store.close()

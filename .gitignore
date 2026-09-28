@@ -69,6 +69,12 @@ install.log
 
 # QBench credential store (must live outside the repo)
 qbench.json
+# QBench web login (qbench_login.py). Normally in %APPDATA%; the fallback lands
+# in DATA_DIR, which is the project root on a dev box without COA_DATA_DIR.
+qbench_login.json
+coa-qbench-login.json
+.qbench_login.json.*
+.web_app_config.json.*
 .env
 
 # Written into a release by CI (see .github/workflows/release.yml). A working

@@ -48,6 +48,8 @@ STATE_PATHS = [
     "switch-accepted",
     "switch-refused",
     "held-tags.json",
+    # The QBench web login's DATA_DIR fallback (qbench_login.py) — a password.
+    "qbench_login.json",
 ]
 
 

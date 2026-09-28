@@ -55,7 +55,11 @@ jobs:
             --exclude 'switch-requested' \
             --exclude 'switch-accepted' \
             --exclude 'switch-refused' \
-            --exclude 'held-tags.json'
+            --exclude 'held-tags.json' \
+            --exclude 'qbench_login.json' \
+            --exclude 'coa-qbench-login.json' \
+            --exclude '.qbench_login.json.*' \
+            --exclude '.web_app_config.json.*'
 
       - name: Stamp VERSION from the tag
         env:
@@ -77,7 +81,8 @@ jobs:
           leaked=0
           for f in web_app_config.json re_review_state.json .secret_key login.log install.log \
                    pending_verdicts.json switch-requested switch-accepted switch-refused \
-                   held-tags.json coa_shared.db coa_shared.db-wal coa_shared.db-shm; do
+                   held-tags.json coa_shared.db coa_shared.db-wal coa_shared.db-shm \
+                   qbench_login.json coa-qbench-login.json; do
             if [ -e "$f" ]; then echo "LEAKED: $f"; leaked=1; fi
           done
           for d in archive changelog review_state .venv venv __pycache__; do

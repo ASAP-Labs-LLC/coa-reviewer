@@ -43,6 +43,7 @@ import requests as _requests
 from flask import Flask, Response, jsonify, render_template, request, send_file, session
 
 from qbench_client import QBenchAPIClient, QBenchAPIError
+from qbench_login import LoginStore
 from labcore_client import LabCoreClient, LabCoreUnavailable
 from change_log import ChangeLog
 from presence import PresenceTracker
@@ -388,6 +389,110 @@ def save_config(cfg: dict) -> bool:
             pass
         return False
     return True
+
+
+# ── QBench web login (username/password for COASession) ─────────────────────
+# Kept by qbench_login.LoginStore outside the release so it survives updates:
+# %APPDATA%\ASAPLabs (DPAPI) when the app can use it, else DATA_DIR. The store
+# picks the place itself — no reviewer or admin ever sets anything up. Older
+# installs kept the login in web_app_config.json; that is still read as a
+# fallback, and moved out once at startup (migrate_login_out_of_config).
+
+cred_log = logging.getLogger("coa.credentials")
+LOGIN_FALLBACK_NAME = "qbench_login.json"
+
+
+def _new_login_store(data_dir: Path) -> LoginStore:
+    """The machine's login store, falling back into ``data_dir``. Touches no
+    disk until it is used."""
+    return LoginStore.for_this_machine(data_dir / LOGIN_FALLBACK_NAME)
+
+
+login_store = _new_login_store(DATA_DIR)
+
+
+def _is_health_check() -> bool:
+    """True when the updater is starting this release on a scratch port just
+    to prove it boots (``COA_HEALTH_CHECK``). Such a process must not sign in
+    to QBench: it would be a second Playwright session on the real account."""
+    value = os.environ.get("COA_HEALTH_CHECK", "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _config_login() -> Optional[Tuple[str, str]]:
+    cfg = state.config
+    username = str(cfg.get("qbench_username") or "").strip()
+    password = str(cfg.get("qbench_password") or "").strip()
+    return (username, password) if username and password else None
+
+
+def _stored_login() -> Optional[Tuple[str, str]]:
+    try:
+        return login_store.load()
+    except Exception:                       # the store never raises; belt and braces
+        cred_log.exception("Could not read the saved QBench login")
+        return None
+
+
+def _save_login(username: str, password: str) -> bool:
+    try:
+        return login_store.save(username, password)
+    except Exception:                       # the store never raises; belt and braces
+        cred_log.exception("Could not save the QBench login")
+        return False
+
+
+def get_qbench_login() -> Optional[Tuple[str, str]]:
+    """The saved QBench login: the store first, then (legacy) the config."""
+    return _stored_login() or _config_login()
+
+
+def _blank_config_password() -> bool:
+    """Remove a legacy password from web_app_config.json (username stays, for
+    display). True if the config no longer holds one."""
+    if not state.config.get("qbench_password"):
+        return True
+    updated = dict(state.config, qbench_password="")
+    if not save_config(updated):
+        return False
+    state.config = updated
+    return True
+
+
+def migrate_login_out_of_config() -> bool:
+    """Move a login saved by an older release out of web_app_config.json.
+
+    Only when the store has none, and the config's password is blanked only
+    once the store has actually kept it. True if a login was moved.
+    """
+    legacy = _config_login()
+    if legacy is None or _stored_login() is not None:
+        return False
+    if not _save_login(*legacy):
+        cred_log.warning("Kept the QBench login in web_app_config.json: it could "
+                         "not be saved anywhere else on this computer")
+        return False
+    if _blank_config_password():
+        cred_log.info("moved saved QBench login out of web_app_config.json into %s",
+                      login_store.path)
+    else:
+        cred_log.warning("Saved the QBench login in %s but could not remove it from "
+                         "web_app_config.json", login_store.path)
+    return True
+
+
+def _start_login_store() -> None:
+    """At startup, after the port guard: pick where the login lives and move a
+    legacy one there. A credential problem must never stop the app — the
+    worst case is that the reviewer signs in by hand."""
+    try:
+        login_store.select()
+    except Exception:
+        cred_log.exception("Could not choose where to keep the QBench login")
+    try:
+        migrate_login_out_of_config()
+    except Exception:
+        cred_log.exception("Could not move the QBench login out of the config")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4151,10 +4256,12 @@ def server_info():
 @require_portal
 def get_config():
     ustate = get_user_state()
-    cfg = state.config
+    saved = get_qbench_login()
     return jsonify({
-        "username": cfg.get("qbench_username", ""),
-        "has_password": bool(cfg.get("qbench_password")),
+        # Never where or how it is stored — the browser only needs to know
+        # whether there is one.
+        "username": saved[0] if saved else state.config.get("qbench_username", ""),
+        "has_password": saved is not None,
         "logged_in": state.logged_in,
         "has_data": len(ustate.records) > 0,
         # Which build is this? A self-deploying app makes that a question
@@ -4182,11 +4289,6 @@ def login():
     if not username or not password:
         return jsonify({"error": "Username and password required"}), 400
 
-    if save_creds:
-        state.config["qbench_username"] = username
-        state.config["qbench_password"] = password
-        save_config(state.config)
-
     state.coa_session = COASession(
         username=username,
         password=password,
@@ -4199,10 +4301,40 @@ def login():
         state.logged_in = True
         state.upload_queue = _wire_upload_queue(UploadQueue(state.api_client))
         ustate.emit_status("Logged in successfully.")
-        return jsonify({"ok": True})
     except Exception as exc:
         ustate.emit_status(f"Login failed: {exc}")
         return jsonify({"error": str(exc)}), 401
+
+    # Remember it only once QBench has accepted it, so a typo never becomes
+    # the login every later start tries. Not saving leaves an existing saved
+    # login alone. ``saved`` false with save requested means "works now,
+    # will be asked again after a restart" — the page says so in plain words.
+    saved = False
+    if save_creds:
+        saved = _save_login(username, password)
+        if saved:
+            _blank_config_password()
+    return jsonify({"ok": True, "saved": saved})
+
+
+@app.route("/api/qbench-login/forget", methods=["POST"])
+@require_portal
+def forget_qbench_login():
+    """Forget the saved QBench login everywhere it might be kept."""
+    try:
+        cleared = login_store.clear()
+    except Exception:
+        cred_log.exception("Could not forget the saved QBench login")
+        cleared = False
+    updated = dict(state.config, qbench_username="", qbench_password="")
+    if save_config(updated):
+        state.config = updated
+    else:
+        cleared = False
+    cred_log.info("Saved QBench login forgotten by %s (%s)",
+                  getattr(get_user_state(), "name", "?"),
+                  "done" if cleared else "incomplete")
+    return jsonify({"ok": cleared})
 
 
 # ── Tab / Sample Data ────────────────────────────────────────────────────────
@@ -6790,13 +6922,16 @@ def get_local_ip() -> str:
 
 
 def auto_login_from_saved_creds() -> None:
-    """If credentials are saved in config, log in to QBench automatically."""
-    cfg = state.config
-    username = cfg.get("qbench_username", "").strip()
-    password = cfg.get("qbench_password", "").strip()
-    if not username or not password:
+    """If a QBench login is saved, sign in to QBench automatically."""
+    if _is_health_check():
+        logger.info("health check — not signing in to QBench")
+        return
+    saved = get_qbench_login()
+    if saved is None:
         logger.info("No saved credentials — waiting for browser login.")
         return
+    username, password = saved
+    cfg = state.config
     if not PLAYWRIGHT_AVAILABLE:
         msg = f"Playwright not available: {_playwright_error}" if _playwright_error else "Playwright not installed"
         logger.error("Cannot auto-login — %s", msg)
@@ -6937,8 +7072,13 @@ if __name__ == "__main__":
         print(f"  WARNING: Playwright unavailable — {_playwright_error}")
         print("  Run: pip install playwright && playwright install chromium")
 
-    cfg = state.config
-    if cfg.get("qbench_username") and cfg.get("qbench_password"):
+    # Where the QBench login lives, and moving an old one out of the config.
+    # After the port guard, so a duplicate launch never writes either.
+    _start_login_store()
+    if _is_health_check():
+        logger.info("health check — not signing in to QBench")
+        print("  Health check — not signing in to QBench.")
+    elif get_qbench_login():
         print("  Saved credentials found — will auto-login in background.")
         threading.Thread(target=auto_login_from_saved_creds, daemon=True).start()
     else:
