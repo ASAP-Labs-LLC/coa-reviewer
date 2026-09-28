@@ -341,8 +341,14 @@ def test_a_failed_comment_write_is_recorded_as_failed(env):
 def test_every_upload_queue_is_wired_for_history():
     import inspect
     import app as app_module
+    import re
     src = inspect.getsource(app_module)
-    assert src.count("_wire_upload_queue(UploadQueue(") >= 2
+    # Every place a queue is built wraps it. (Manual and automatic logins
+    # now share one installer, _install_qbench_session, so there may be a
+    # single construction site rather than one per login path.)
+    built = re.findall(r"(?<!class )UploadQueue\(state\.api_client\)", src)
+    wired = src.count("_wire_upload_queue(UploadQueue(state.api_client))")
+    assert built and wired == len(built)
     assert "on_comment_saved" not in src
 
 
