@@ -497,21 +497,24 @@ def test_a_pending_sample_still_renders_the_old_way(lab, monkeypatch) -> None:
     assert seen == ["loading", "ready"]
 
 
-# ── regenerate is a new document ─────────────────────────────────────────
+# ── regenerate re-renders; it never touches a mark ───────────────────────
 
-def test_regenerate_un_judges_the_sample_everywhere(lab) -> None:
-    """The list already showed a regenerated sample as unjudged; the export
-    row and the remembered verdict must agree with it."""
+def test_regenerate_keeps_the_mark(lab) -> None:
+    """Only an explicit Uncheck removes a mark. Regenerate re-renders the COA
+    and leaves the verdict, the export row and the remembered mark alone."""
     lab.pull()
     lab.mark("good", LABS[0])
 
     resp = lab.client.post("/api/regenerate", json={"tab": TAB, "lab_id": LABS[0]})
     assert resp.status_code == 200
-    assert (TAB, LABS[0]) not in lab.results()
+    rec = lab.ustate.records[(TAB, LABS[0])]
+    assert rec.status == "good"
+    assert rec.preview_url is None, "the COA is still re-rendered"
+    assert (TAB, LABS[0]) in lab.results()
 
     lab.start()
     lab.pull()
-    assert lab.tab()[LABS[0]]["status"] == "pending"
+    assert lab.tab()[LABS[0]]["status"] == "good"
 
 
 # ── the client loads the COA when the render says it is there ────────────

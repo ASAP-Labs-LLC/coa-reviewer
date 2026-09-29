@@ -2542,20 +2542,6 @@ def _share_verdict(actor: "UserState", rec: SampleRecord, outcome: str, mode: st
     return tags
 
 
-def _share_regenerate(actor: "UserState", recs: List[SampleRecord], cause: str,
-                      at: float) -> None:
-    """A regenerated COA is a new document, so neither review of the old one
-    stands: clear BOTH modes' shared verdicts for each lab id — only where
-    one exists (``when="if_judged"``: nothing to clear writes no history) —
-    in bounded batches, with the cause in the history row. Never raises."""
-    firsts = list({r.lab_id: r for r in recs}.values())
-    if not firsts:
-        return
-    items = [_mark_item(actor, r, "uncheck", m, at, when="if_judged", cause=cause)
-             for r in firsts for m in REVIEW_MODES]
-    _share_marks(actor, items, {(r.tab, r.lab_id) for r in recs})
-
-
 def _retry_pending_verdicts(limit: int = MAX_PENDING_RETRY_PER_CYCLE) -> int:
     """Cleanup-worker step: retry failed shared-verdict writes, oldest first,
     at most ``limit``. Each retry carries its original time, so it never
@@ -6669,18 +6655,15 @@ def sync_sample_info(lab_id: str):
 
     # Sample info feeds the COA, so the rendered preview is stale the moment
     # this lands. Re-render the one sample that changed.
+    # Marks are untouched: only an explicit Uncheck removes one.
     regenerated = False
-    at = _mark_clock()
     synced = [rec for (tab, lid), rec in list(ustate.records.items()) if lid == lab_id]
     for rec in synced:
-        _reset_for_regenerate(ustate, rec, at=at)
-        ustate.emit_sse({"type": "sample_status", "tab": rec.tab,
-                         "lab_id": lab_id, "status": STATUS_LOADING})
+        _reset_for_regenerate(ustate, rec)
+        ustate.emit_sse(_regenerating_status(rec))
         if state.coa_session and state.logged_in:
             PREVIEW_POOL.submit(generate_preview_for_sample, rec.tab, lab_id, ustate)
         regenerated = True
-    # New sample information is a new document for every reviewer.
-    _share_regenerate(ustate, synced, "labvision_sync", at)
 
     return jsonify({
         "ok": True, "updated": fields, "regenerated": regenerated,
@@ -6713,44 +6696,38 @@ def regenerate_preview():
     # An explicit regenerate submits its own render; one already waiting in
     # the window for the same sample would make it render twice.
     _drop_queued(ustate, key)
-    at = _mark_clock()
-    _reset_for_regenerate(ustate, rec, at=at)
-    ustate.emit_sse({"type": "sample_status", "tab": tab, "lab_id": lab_id, "status": STATUS_LOADING})
-    _share_regenerate(ustate, [rec], "regenerate", at)
+    # Re-renders only; the mark (and everyone's tags) stay as they are.
+    _reset_for_regenerate(ustate, rec)
+    ustate.emit_sse(_regenerating_status(rec))
     PREVIEW_POOL.submit(generate_preview_for_sample, tab, lab_id, ustate)
     return jsonify({"ok": True})
 
 
 def _reset_for_regenerate(ustate: UserState, rec: SampleRecord, *,
-                          at: Optional[float] = None, all_modes: bool = True,
                           persist: bool = True) -> bool:
     """Clear every cached artefact for one sample so it re-renders from scratch.
 
-    A regenerated COA is a new document, so the verdict goes with the old
-    render: from the list (it always did), from the export rows — every
-    mode's, since neither review of the old document stands — and from the
-    remembered marks a re-pull would otherwise bring back. The shared store
-    is the caller's job (_share_regenerate, batched), made at ``at``.
-    ``all_modes=False`` is Regenerate Pending's refresh of unjudged samples:
-    only this mode's leftovers, as before. Returns whether anything a
-    snapshot holds changed; ``persist=False`` leaves writing it to a caller
+    Re-rendering never touches a mark: only an explicit Uncheck removes one,
+    and only in the reviewer's current mode. A judged sample keeps its verdict,
+    reason, listing, export row and remembered mark, and renders the way a
+    judged sample that came back without a COA always has (_render_preview
+    keeps the verdict through the render). An unjudged one goes to `loading`
+    and loses any leftover export row for this mode. Returns whether anything
+    a snapshot holds changed; ``persist=False`` leaves writing it to a caller
     resetting many samples at once.
     """
     with ustate.records_lock:
         judged = rec.status in (STATUS_GOOD, STATUS_BAD)
-        rec.status = STATUS_LOADING
         rec.preview_url = None
         rec.render_failed = False
-        rec.reason = ""
-        rec.cc_task_id = None
-        rec.verdict_mode = None
-        if at is not None:
-            rec.shared_at = max(rec.shared_at, at)
         removed = False
-        if judged or all_modes:
-            removed = ustate.clear_result(rec.tab, rec.lab_id, all_modes=all_modes)
-            removed = ustate.verdicts.pop((rec.tab, rec.lab_id), None) is not None or removed
-    if (judged or removed) and persist:
+        if not judged:
+            rec.status = STATUS_LOADING
+            rec.reason = ""
+            rec.cc_task_id = None
+            rec.verdict_mode = None
+            removed = ustate.clear_result(rec.tab, rec.lab_id, all_modes=False)
+    if removed and persist:
         ustate.persist()
     rec.attachments = None
     rec.tests_data = None
@@ -6767,7 +6744,17 @@ def _reset_for_regenerate(ustate: UserState, rec: SampleRecord, *,
         with state._sif_cache_lock:
             state.sif_order_cache.pop(int(rec.order_id), None)
             state.sif_absence_cache.pop(int(rec.order_id), None)
-    return judged or removed
+    return removed
+
+
+def _regenerating_status(rec: SampleRecord) -> dict:
+    """What the browser is told when a sample starts re-rendering: a judged
+    sample keeps showing its mark (without a COA yet); an unjudged one shows
+    `loading`. The render's own completion event carries has_preview."""
+    with_verdict = rec.status in (STATUS_GOOD, STATUS_BAD)
+    return {"type": "sample_status", "tab": rec.tab, "lab_id": rec.lab_id,
+            "status": rec.status if with_verdict else STATUS_LOADING,
+            "has_preview": False}
 
 
 @app.route("/api/regenerate-pending", methods=["POST"])
@@ -6801,7 +6788,7 @@ def regenerate_pending():
     for rec in stale:
         # Refreshing expired previews of unjudged samples: nobody's verdict
         # is touched, here or in the shared store.
-        _reset_for_regenerate(ustate, rec, all_modes=False)
+        _reset_for_regenerate(ustate, rec)
         rec.status = STATUS_PENDING
         ustate.emit_sse({
             "type": "sample_status", "tab": tab,
@@ -6839,19 +6826,13 @@ def regenerate_selected():
         if rec is not None:
             picked.append(rec)
 
-    at = _mark_clock()
     changed = False
     for rec in picked:
         _drop_queued(ustate, (rec.tab, rec.lab_id))
-        changed = _reset_for_regenerate(ustate, rec, at=at, persist=False) or changed
-        ustate.emit_sse({
-            "type": "sample_status", "tab": tab,
-            "lab_id": rec.lab_id, "status": STATUS_LOADING,
-        })
+        changed = _reset_for_regenerate(ustate, rec, persist=False) or changed
+        ustate.emit_sse(_regenerating_status(rec))
     if changed:
         ustate.persist()        # once, not once per sample
-    # One batched store write for all of them, not one per sample.
-    _share_regenerate(ustate, picked, "regenerate", at)
 
     if picked and state.coa_session and state.logged_in:
         for rec in picked:

@@ -563,9 +563,9 @@ def test_late_retry_never_overwrites_newer_work(lab, monkeypatch):
     assert dana.tab(mode="tests")[LAB]["status"] == "bad"
 
 
-# ── regenerate is a new document, for everyone ───────────────────────────
+# ── regenerate re-renders; only Uncheck removes a mark ──────────────────
 
-def test_regenerate_clears_the_shared_verdict(lab, monkeypatch):
+def test_regenerate_keeps_the_shared_verdict_and_tags(lab, monkeypatch):
     app_module, reviewer = lab
     monkeypatch.setattr(app_module, "PREVIEW_POOL", MagicMock())
     a = reviewer("Dana P")
@@ -574,10 +574,27 @@ def test_regenerate_clears_the_shared_verdict(lab, monkeypatch):
     assert b.rec().status == "good"
     resp = a.client.post("/api/regenerate", json={"tab": TAB, "lab_id": LAB})
     assert resp.status_code == 200
-    assert app_module.state.shared.verdicts_for([LAB])[LAB]["tests"]["outcome"] == "cleared"
-    assert b.rec().status == "ready"
-    # the tab load must not bring the old verdict back
-    assert a.tab(mode="tests")[LAB]["status"] == "loading"
+    assert app_module.state.shared.verdicts_for([LAB])[LAB]["tests"]["outcome"] == "good"
+    assert b.rec().status == "good"
+    assert a.rec().status == "good"
+    sample = a.tab(mode="tests")[LAB]
+    assert sample["status"] == "good"
+    assert sample["tags"]["tests"]["by"] == "Dana P"
+    assert [e["kind"] for e in app_module.state.shared.history(LAB)] == ["mark"]
+
+
+def test_uncheck_clears_only_the_current_modes_tag(lab, monkeypatch):
+    app_module, reviewer = lab
+    store = app_module.state.shared
+    store.apply_mark(LAB, "info", "good", by="Cy L", at=time.time() - 60)
+    a = reviewer("Dana P")
+    a.mark("good")
+    a.mark("uncheck")
+    got = store.verdicts_for([LAB])[LAB]
+    assert got["tests"]["outcome"] == "cleared"
+    assert got["info"]["outcome"] == "good"
+    tags = a.tab(mode="tests")[LAB]["tags"]
+    assert tags["tests"] is None and tags["info"]["by"] == "Cy L"
 
 
 # ══ critic round: render, locking, actor, persistence, modes, retry ══════
@@ -746,7 +763,7 @@ def test_fan_out_of_a_pending_write_persists_at_once(lab, monkeypatch):
     assert calls == [1]
 
 
-def test_regenerate_selected_shares_its_unmarks_in_one_batch(lab, monkeypatch):
+def test_regenerate_selected_leaves_every_mark_alone(lab, monkeypatch):
     app_module, reviewer = lab
     monkeypatch.setattr(app_module, "PREVIEW_POOL", MagicMock())
     labs = [LAB, OTHER, "092526-50003"]
@@ -755,22 +772,18 @@ def test_regenerate_selected_shares_its_unmarks_in_one_batch(lab, monkeypatch):
     for x in labs:
         a.mark("good", lab=x)
     store = app_module.state.shared
-    batches, singles = [], []
-    real_many = store.apply_marks
-    monkeypatch.setattr(store, "apply_marks", lambda items: (batches.append(len(items)),
-                                                             real_many(items))[1])
-    monkeypatch.setattr(store, "apply_mark", lambda *a_, **k: singles.append(1))
-    calls = _count_persists(monkeypatch, b)
+    writes = []
+    monkeypatch.setattr(store, "apply_marks", lambda items: writes.append(items))
+    monkeypatch.setattr(store, "apply_mark", lambda *a_, **k: writes.append(1))
     resp = a.client.post("/api/regenerate-selected", json={"tab": TAB, "lab_ids": labs})
     assert resp.status_code == 200
-    assert len(batches) == 1 and singles == []
-    assert calls == []
-    assert all(b.rec(x).status == "ready" for x in labs)
-    ev = store.history(LAB)[0]
-    assert ev["kind"] == "unmark" and ev["detail"]["cause"] == "regenerate"
+    assert writes == [], "regenerate must not write to the shared store"
+    assert all(b.rec(x).status == "good" for x in labs)
+    assert all(a.rec(x).status == "good" for x in labs)
+    assert all(a.rec(x).preview_url is None for x in labs)
 
 
-def test_regenerate_clears_both_modes(lab, monkeypatch):
+def test_regenerate_keeps_both_modes(lab, monkeypatch):
     app_module, reviewer = lab
     monkeypatch.setattr(app_module, "PREVIEW_POOL", MagicMock())
     store = app_module.state.shared
@@ -779,7 +792,7 @@ def test_regenerate_clears_both_modes(lab, monkeypatch):
     a.mark("good")
     a.client.post("/api/regenerate", json={"tab": TAB, "lab_id": LAB})
     got = store.verdicts_for([LAB])[LAB]
-    assert got["tests"]["outcome"] == "cleared" and got["info"]["outcome"] == "cleared"
+    assert got["tests"]["outcome"] == "good" and got["info"]["outcome"] == "good"
 
 
 def test_regenerate_of_a_never_judged_sample_writes_no_history(lab, monkeypatch):

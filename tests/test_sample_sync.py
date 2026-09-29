@@ -338,6 +338,26 @@ def test_a_successful_sync_regenerates_the_preview(sync) -> None:
     assert ustate.records[("Yesterday", "073126-41552")].preview_url is None
 
 
+def test_a_sync_keeps_the_mark(sync) -> None:
+    """A sync re-renders the COA but, like Regenerate, never removes a mark:
+    only an explicit Uncheck does."""
+    import app as app_module
+    client, _, _, ustate = sync
+    key = ("Yesterday", "073126-41552")
+    resp = client.post("/api/mark", json={"tab": key[0], "lab_id": key[1],
+                                          "outcome": "good", "mode": "info"})
+    assert resp.status_code == 200
+    ustate.records[key].preview_url = "http://old"
+
+    client.post("/api/sync-sample-info/073126-41552", json={
+        "mappings": [{"source": "fuel_type", "target": "fuel_type"}]})
+
+    assert ustate.records[key].status == "good"
+    assert ustate.records[key].preview_url is None
+    got = app_module.state.shared.verdicts_for([key[1]])[key[1]]
+    assert got["info"]["outcome"] == "good"
+
+
 def test_an_unreachable_labcore_reports_itself(sync) -> None:
     from labcore_client import LabCoreUnavailable
     client, lc, _, _ = sync
